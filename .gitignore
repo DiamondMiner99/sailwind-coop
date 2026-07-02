@@ -1,0 +1,46 @@
+# Worktrees
+.worktrees/
+
+# Build outputs (generic bin/obj covers all projects; per-project entries kept for clarity)
+bin/
+obj/
+src/SailwindCoop/bin/
+src/SailwindCoop/obj/
+src/GameInspector/bin/
+src/GameInspector/obj/
+
+# Downloaded dependencies
+src/SailwindCoop/libs/
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# Abandoned hot reload experiments (ScriptEngine broken)
+src/AssemblyResolverPatcher/
+src/DebugLoader/
+src/TestPlugin/
+
+# Decompiled game code (IP belongs to game developer)
+decompiled/
+decomp_*/
+
+# Scratch probe scripts (throwaway ilspy/dump experiments)
+probe_tmp/
+
+# Claude Code config (contains personal settings)
+CLAUDE.md
+.claude/
+
+# Personal deploy script (use deploy.fish.example as template)
+src/deploy.fish
+
+# Release bundles and logs
+*.zip
+*.log
+LogOutput.log
+
+# OS cruft
+.DS_Store
+Thumbs.db

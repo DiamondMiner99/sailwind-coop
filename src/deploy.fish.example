@@ -1,0 +1,51 @@
+#!/usr/bin/env fish
+# deploy.fish - Deploy coop mod to target machines
+# Copy this to deploy.fish and edit paths/hostnames for your setup.
+# deploy.fish is gitignored.
+#
+# Usage: fish deploy.fish [targets...]
+# Targets: local, remote1, remote2 (default: local)
+
+set PROJECT_DIR (dirname (status -f))
+
+set COOP_DLL "$PROJECT_DIR/SailwindCoop/bin/Release/net472/SailwindCoop.dll"
+set INSPECTOR_DLL "$PROJECT_DIR/GameInspector/bin/Release/GameInspector.dll"
+set MONO_CSHARP "$PROJECT_DIR/GameInspector/bin/Release/Mono.CSharp.dll"
+set NEWTONSOFT "$PROJECT_DIR/GameInspector/bin/Release/Newtonsoft.Json.dll"
+set FACEPUNCH "$PROJECT_DIR/SailwindCoop/libs/lib/net46/Facepunch.Steamworks.Win64.dll"
+set STEAM_API "$PROJECT_DIR/SailwindCoop/libs/content/steam_api64.dll"
+
+# Edit these paths for your setup
+set LOCAL_GAME "$HOME/.local/share/Steam/steamapps/common/Sailwind"
+
+if not test -f "$COOP_DLL"
+    echo "SailwindCoop not built. Run 'fish build.fish' first."
+    exit 1
+end
+
+set targets $argv
+if test (count $targets) -eq 0
+    set targets local
+end
+
+for target in $targets
+    switch $target
+        case local
+            cp "$COOP_DLL" "$FACEPUNCH" "$LOCAL_GAME/BepInEx/plugins/"
+            # Optional: GameInspector (dev tool)
+            # cp "$INSPECTOR_DLL" "$MONO_CSHARP" "$NEWTONSOFT" "$LOCAL_GAME/BepInEx/plugins/"
+            # Optional: steam_api64.dll (only needed once for initial Facepunch setup)
+            # cp "$STEAM_API" "$LOCAL_GAME/"
+            and echo "local deployed"
+            or echo "local failed"
+
+        # Add your own remote targets here:
+        # case my-remote
+        #     scp "$COOP_DLL" "$FACEPUNCH" "my-ssh-host:/path/to/Sailwind/BepInEx/plugins/"
+        #     and echo "remote deployed"
+        #     or echo "remote failed"
+
+        case '*'
+            echo "Unknown target: $target"
+    end
+end

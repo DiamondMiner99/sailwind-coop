@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>SailwindCoop</AssemblyName>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx -->
+    <Reference Include="BepInEx">
+      <HintPath>$(GameDir)/BepInEx/core/BepInEx.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(GameDir)/BepInEx/core/0Harmony.dll</HintPath>
+    </Reference>
+
+    <!-- Unity -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.PhysicsModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.IMGUIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.TextRenderingModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.ImageConversionModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.AnimationModule.dll</HintPath>
+    </Reference>
+
+    <!-- Game -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/Assembly-CSharp.dll</HintPath>
+    </Reference>
+    <!-- GameInput / InputName (global types) live here - needed for the guest's sleep-interrupt click. -->
+    <Reference Include="Oculus.VR">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/Oculus.VR.dll</HintPath>
+    </Reference>
+    <Reference Include="Crest">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/Crest.dll</HintPath>
+    </Reference>
+
+    <!-- Steam Networking -->
+    <Reference Include="Facepunch.Steamworks.Win64">
+      <HintPath>libs/lib/net46/Facepunch.Steamworks.Win64.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Allows the net472 target to build on machines without the .NET Framework 4.7.2
+       targeting pack installed (private-fork build convenience). -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
