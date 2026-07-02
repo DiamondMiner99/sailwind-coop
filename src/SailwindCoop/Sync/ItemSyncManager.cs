@@ -749,6 +749,10 @@ namespace SailwindCoop.Sync
             // Update visual position of items held by remote player
             UpdateRemoteHeldItemVisuals();
 
+            // Send a one-shot reliable terminal for locally dropped items once they come to rest,
+            // so every machine converges on the dropper's resting pose.
+            SweepDropSettleTerminals();
+
             Plugin.Profiler?.EndMeasure("Items");
         }
 
@@ -1225,6 +1229,8 @@ namespace SailwindCoop.Sync
             _remoteUnsealingCrates.Clear();
             _pendingUnsealCrateIds.Clear();
             _unsealingCrateIds.Clear();
+            _pendingDropTerminals.Clear();
+            _skippedDropsWhileHeld.Clear();
         }
 
         /// <summary>
@@ -1405,7 +1411,171 @@ namespace SailwindCoop.Sync
             SendDropPacket(item, instanceId);
         }
 
-        private void SendDropPacket(ShipItem item, int instanceId)
+        // === Dropped-item settle terminal ===
+        //
+        // A drop is sent ONCE with the release pose; each machine then simulates the fall LOCALLY, so the
+        // remote rigidbody diverges (framerate dependent) and can sleep early, leaving the item's resting
+        // position/rotation different across machines until someone picks it up. Mirror the mooring-rope /
+        // regular-rope settle terminals in ControlSyncManager: the machine that made the LOCAL drop owns
+        // the trajectory, tracks the item until its rigidbody settles, then re-sends ONE reliable
+        // ItemDropped carrying the final pose. Receivers apply it through the normal OnRemoteItemDropped
+        // snap (dual-frame boat parenting, floating-origin offset, zero velocity), so everyone converges
+        // on the dropper's resting pose. Reuses the existing ItemDropped packet verbatim: no wire change,
+        // and the host relays the terminal to other guests exactly like any other drop.
+        private class DropSettleTracker
+        {
+            public ShipItem Item;
+            public int InstanceId;
+            public float DropTime;         // when the drop was sent; base for the hard timeout
+            public float QuietSince;       // when the current quiet window started
+            public bool SeenDynamic;       // the rigidbody has been observed non-kinematic since the drop
+            public bool HasRef;            // a reference pose has been captured
+            public Vector3 RefLocalPos;    // pose relative to the physics parent frame, so a moving boat
+            public Quaternion RefLocalRot; // or a floating-origin shift does not look like item motion
+        }
+        private readonly Dictionary<int, DropSettleTracker> _pendingDropTerminals = new Dictionary<int, DropSettleTracker>();
+        private readonly List<int> _dropTerminalRemovalScratch = new List<int>();
+        private readonly List<DropSettleTracker> _settledDropScratch = new List<DropSettleTracker>();
+        // Drops skipped because the LOCAL player appeared to hold the item, kept so a later
+        // ItemPickupDenied (a contested grab this player lost) can replay the authoritative pose
+        // instead of leaving this machine at its own diverged local pose.
+        private struct SkippedDrop { public ItemDroppedPacket Packet; public float Time; }
+        private readonly Dictionary<int, SkippedDrop> _skippedDropsWhileHeld = new Dictionary<int, SkippedDrop>();
+        private const float SkippedDropReplayWindow = 5f; // a stale skipped drop is never replayed
+        private const float DropSettleQuietTime = 0.4f;    // consecutive quiet seconds before the pose counts as settled
+        private const float DropSettleTimeout = 10f;       // stop tracking a never-settling item (e.g. rocking on a heeling boat)
+        private const float DropSettlePosEpsilonSq = 0.005f * 0.005f; // 5 mm of local movement resets the quiet window
+        private const float DropSettleAngEpsilon = 1f;     // 1 degree of local rotation resets the quiet window
+
+        /// <summary>
+        /// Sweeps items dropped by the LOCAL player until their rigidbody settles, then re-sends ONE
+        /// reliable ItemDropped with the final resting pose so receivers snap to the dropper's result
+        /// instead of keeping their own diverged simulation. Settled = the rigidbody sleeps, or its pose
+        /// relative to its physics parent stays within tiny epsilons for DropSettleQuietTime. The pose is
+        /// compared in the parent's LOCAL frame (walkCol on a boat, shifting world on land) so an item at
+        /// rest on a sailing boat's deck still settles, while a genuinely rocking item keeps resetting the
+        /// window and is dropped from tracking at the hard timeout WITHOUT a terminal. Entries are removed
+        /// on send, pickup, destroy/hide, remote drop for the same item, and timeout, and the dict is cleared in
+        /// Reset(), so it stays bounded by concurrently settling local drops. Only reachable from Update's
+        /// IsMultiplayer gate, and only armed by local drop sends, so solo play never runs any of this.
+        /// </summary>
+        private void SweepDropSettleTerminals()
+        {
+            if (_pendingDropTerminals.Count == 0) return;
+
+            float now = Time.time;
+            _dropTerminalRemovalScratch.Clear();
+            _settledDropScratch.Clear();
+
+            foreach (var kvp in _pendingDropTerminals)
+            {
+                var t = kvp.Value;
+                var item = t.Item;
+
+                // Item gone (destroyed/sold-away) or hidden (moved into an inventory): stop quietly.
+                if (item == null || !item.gameObject.activeInHierarchy)
+                {
+                    _dropTerminalRemovalScratch.Add(kvp.Key);
+                    continue;
+                }
+
+                // Item is held again (locally via vanilla held, by anyone per the holder map) or is being
+                // visually driven as a remote-held item: the drop trajectory no longer matters. Safe to
+                // check held here even though the drop patch is a PREFIX (held still set at arm time):
+                // vanilla DropItem finishes in the same call stack, so held is null before any Update runs.
+                if (item.held != null || _heldItems.ContainsKey(kvp.Key) || _remoteHeldItems.ContainsKey(kvp.Key))
+                {
+                    _dropTerminalRemovalScratch.Add(kvp.Key);
+                    continue;
+                }
+
+                // Hard timeout: a never-settling item is not tracked forever and gets no terminal.
+                if (now - t.DropTime > DropSettleTimeout)
+                {
+                    _dropTerminalRemovalScratch.Add(kvp.Key);
+                    continue;
+                }
+
+                var rb = item.itemRigidbodyC != null ? item.itemRigidbodyC.GetBody() : item.GetComponent<Rigidbody>();
+                if (rb == null)
+                {
+                    VerboseLogger.ItemLocal($"Drop settle cancelled for item {t.InstanceId}: no rigidbody");
+                    _dropTerminalRemovalScratch.Add(kvp.Key);
+                    continue;
+                }
+                if (rb.isKinematic)
+                {
+                    // A kinematic body right after the drop is NOT a capture: vanilla keeps the body
+                    // kinematic the whole time an item is held, and GoPointer.DropItem only clears the
+                    // held reference; ItemRigidbody restores dynamics on its NEXT update after that.
+                    // The drop patch is a prefix in that same call stack, so the first sweep frames can
+                    // legitimately see a still-kinematic body. Do not cancel until the body has been
+                    // observed dynamic at least once; the hard timeout above still bounds the entry.
+                    if (!t.SeenDynamic) continue;
+                    // Vanilla also flips a FREE item kinematic as housekeeping: a sleeping meshCol item
+                    // once its dynamic-collider timer expires, and ALL items while the game is paused
+                    // (sleep, recovery, shipyard). If the pose still matches the last dynamic sample,
+                    // the body was frozen at its rest pose, which IS the settled pose: send the
+                    // terminal now. Otherwise it was frozen mid-motion (global pause); keep the entry
+                    // so tracking resumes when dynamics return, still bounded by the hard timeout.
+                    if (t.HasRef)
+                    {
+                        var trKin = item.itemRigidbodyC != null ? item.itemRigidbodyC.transform : item.transform;
+                        if ((trKin.localPosition - t.RefLocalPos).sqrMagnitude <= DropSettlePosEpsilonSq
+                            && Quaternion.Angle(trKin.localRotation, t.RefLocalRot) <= DropSettleAngEpsilon)
+                        {
+                            VerboseLogger.ItemLocal($"Drop settle: item {t.InstanceId} went kinematic at its rest pose, sending terminal");
+                            _dropTerminalRemovalScratch.Add(kvp.Key);
+                            _settledDropScratch.Add(t);
+                            continue;
+                        }
+                    }
+                    continue;
+                }
+                t.SeenDynamic = true;
+
+                bool settled = rb.IsSleeping();
+                if (!settled)
+                {
+                    var tr = item.itemRigidbodyC != null ? item.itemRigidbodyC.transform : item.transform;
+                    var localPos = tr.localPosition;
+                    var localRot = tr.localRotation;
+                    if (!t.HasRef
+                        || (localPos - t.RefLocalPos).sqrMagnitude > DropSettlePosEpsilonSq
+                        || Quaternion.Angle(localRot, t.RefLocalRot) > DropSettleAngEpsilon)
+                    {
+                        // Still moving in its parent frame: restart the quiet window from this pose.
+                        t.HasRef = true;
+                        t.RefLocalPos = localPos;
+                        t.RefLocalRot = localRot;
+                        t.QuietSince = now;
+                        continue;
+                    }
+                    settled = now - t.QuietSince >= DropSettleQuietTime;
+                }
+
+                if (settled)
+                {
+                    _dropTerminalRemovalScratch.Add(kvp.Key);
+                    _settledDropScratch.Add(t);
+                }
+            }
+
+            foreach (var id in _dropTerminalRemovalScratch)
+                _pendingDropTerminals.Remove(id);
+
+            // Send AFTER the enumeration finishes. armSettleTerminal:false so the terminal send cannot
+            // re-arm the tracker and loop forever. SendDropPacket re-encodes the item's CURRENT frame, so
+            // an item that latched onto (or fell off) a boat after the drop goes out in the right frame.
+            foreach (var t in _settledDropScratch)
+            {
+                VerboseLogger.ItemLocal($"Drop settle terminal for item {t.InstanceId} after {Time.time - t.DropTime:F2}s");
+                SendDropPacket(t.Item, t.InstanceId, armSettleTerminal: false);
+            }
+            _settledDropScratch.Clear();
+        }
+
+        private void SendDropPacket(ShipItem item, int instanceId, bool armSettleTerminal = true)
         {
             // Determine parent boat if any
             string parentBoatName = "";
@@ -1474,6 +1644,21 @@ namespace SailwindCoop.Sync
 
             // Send drop packet
             SendItemDropped(instanceId, position, rotation, parentBoatName, isLocalPosition);
+
+            // Arm the settle-terminal tracker for this LOCAL drop, so a divergent remote fall converges
+            // once the item comes to rest here. Only real local drops arm it: remote applies never reach
+            // SendDropPacket (OnLocalDrop and the drop patch both bail on IsApplyingRemoteState), and the
+            // terminal send itself passes armSettleTerminal:false. Re-dropping the same item overwrites
+            // its entry, so the dict stays keyed one entry per in-flight item.
+            if (armSettleTerminal)
+            {
+                _pendingDropTerminals[instanceId] = new DropSettleTracker
+                {
+                    Item = item,
+                    InstanceId = instanceId,
+                    DropTime = Time.time
+                };
+            }
         }
 
         #endregion
@@ -1621,6 +1806,9 @@ namespace SailwindCoop.Sync
             // Record who is holding this item
             _heldItems[packet.ItemInstanceId] = new SteamId { Value = packet.PlayerSteamId };
 
+            // Any stashed skipped drop predates this pickup, so it must never be replayed.
+            _skippedDropsWhileHeld.Remove(packet.ItemInstanceId);
+
             // If it's the remote player holding it, track for visual following
             if (packet.PlayerSteamId != SteamClient.SteamId.Value)
             {
@@ -1689,7 +1877,7 @@ namespace SailwindCoop.Sync
                             col.enabled = false;
                     }
 
-                    // TRADER-CROSSWIRE fix: also disable the ShipItem's OWN trigger collider (ShipItem.Awake
+                    // Also disable the ShipItem's OWN trigger collider (ShipItem.Awake
                     // forces it isTrigger=true; it lives on the ShipItem object, NOT itemRigidbodyC). While the
                     // host drives a guest-held item along the remote avatar, that live trigger would enter a
                     // real land Shopkeeper's trigger and pop a SELL menu for the guest's item on the host.
@@ -1727,6 +1915,13 @@ namespace SailwindCoop.Sync
                     w => PacketSerializer.WriteItemDropped(w, packet));
             }
 
+            // An authoritative remote drop supersedes any local settle tracking for this item. Without
+            // this, a remote pickup AND drop applied in the same frame (packet backlog after a hitch)
+            // slips past the sweep's once-per-frame held checks and leaves a stale tracker that later
+            // emits a competing terminal. Placed after the host holder validation so a rejected stale
+            // drop cannot disarm a legitimate tracker.
+            _pendingDropTerminals.Remove(packet.ItemInstanceId);
+
             // Try to find item - check _remoteHeldItems first (item may be hidden with SetActive(false))
             var item = FindItemByInstanceId(packet.ItemInstanceId);
             if (item == null && _remoteHeldItems.TryGetValue(packet.ItemInstanceId, out var heldItem))
@@ -1752,6 +1947,31 @@ namespace SailwindCoop.Sync
                 ClearSyncedHeldItemById(packet.ItemInstanceId);
                 return;
             }
+
+            // Never yank an item out of the LOCAL player's hands. A drop (notably the settle terminal,
+            // which arrives up to several seconds after the release) can race a pickup: this player
+            // grabs the item, then the dropper's reliable drop lands. The host's holder validation
+            // above already rejects a drop once the new pickup is recorded, but the grab can still be
+            // in flight, so guard here too and skip repositioning entirely (held-state bookkeeping for
+            // this item stays intact; the pickup broadcast restores everyone else). The holder map
+            // covers a recorded local hold; the GoPointer check covers the just-grabbed window before
+            // the host's ItemPickedUp broadcast returns.
+            if (_heldItems.TryGetValue(packet.ItemInstanceId, out var localHolder) && localHolder == SteamClient.SteamId)
+            {
+                VerboseLogger.ItemApply($"Skipping ItemDropped for item {packet.ItemInstanceId} held by local player");
+                _skippedDropsWhileHeld[packet.ItemInstanceId] = new SkippedDrop { Packet = packet, Time = Time.time };
+                return;
+            }
+            var localPointer = Object.FindObjectOfType<GoPointer>();
+            if (localPointer != null && ReferenceEquals(localPointer.GetHeldItem(), item))
+            {
+                VerboseLogger.ItemApply($"Skipping ItemDropped for item {packet.ItemInstanceId} in local hand");
+                _skippedDropsWhileHeld[packet.ItemInstanceId] = new SkippedDrop { Packet = packet, Time = Time.time };
+                return;
+            }
+
+            // This drop is being applied, so any stashed skipped drop for the item is superseded.
+            _skippedDropsWhileHeld.Remove(packet.ItemInstanceId);
 
             // Mark as recently synced to prevent echo back of ItemDestroyed
             _recentlyRemoteSyncedItems[packet.ItemInstanceId] = Time.time;
@@ -2156,6 +2376,20 @@ namespace SailwindCoop.Sync
                     IsApplyingRemoteState = false;
                 }
             }
+
+            // Contested-grab loser convergence: if the winner's drop arrived while this player still
+            // appeared to hold the item, its apply was skipped. Replay it now that the deny released
+            // the optimistic local hold, so this machine snaps to the authoritative pose instead of
+            // keeping its own local one. Guests never relay, so the normal apply path is safe here.
+            if (_skippedDropsWhileHeld.TryGetValue(packet.ItemInstanceId, out var skipped))
+            {
+                _skippedDropsWhileHeld.Remove(packet.ItemInstanceId);
+                if (Time.time - skipped.Time <= SkippedDropReplayWindow)
+                {
+                    VerboseLogger.ItemApply($"Replaying skipped ItemDropped for denied item {packet.ItemInstanceId}");
+                    OnRemoteItemDropped(skipped.Packet);
+                }
+            }
         }
 
         #endregion
@@ -2173,6 +2407,32 @@ namespace SailwindCoop.Sync
             var prefab = item.GetComponent<SaveablePrefab>();
             if (prefab == null) return;
 
+            var packet = BuildItemSpawnedPacket(item, prefab);
+
+            VerboseLogger.ItemSend($"ItemSpawned, id={prefab.instanceId}, prefab={prefab.prefabIndex}, pos={packet.Position}, isLocal={packet.IsLocalPosition}, mission={packet.MissionIndex}");
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.ItemSpawned, w =>
+            {
+                PacketSerializer.WriteItemSpawned(w, packet);
+            });
+
+            // Mark as synced (host) and add to registry (both players for debug overlay).
+            // This ItemSpawned was a SendToAll broadcast, so every currently-connected peer
+            // now has it - record it in each peer's per-peer synced set.
+            if (Plugin.IsHost)
+            {
+                MarkSyncedForAllPeers(prefab.instanceId);
+            }
+            _itemRegistry[prefab.instanceId] = prefab.prefabIndex;
+        }
+
+        /// <summary>
+        /// Builds an ItemSpawnedPacket for an item: boat-relative or floating-origin-corrected position,
+        /// health, amount, and mission index. Shared by the local-spawn broadcast and the targeted
+        /// mission-cargo resync.
+        /// </summary>
+        private static ItemSpawnedPacket BuildItemSpawnedPacket(ShipItem item, SaveablePrefab prefab)
+        {
             // Determine parent boat
             string parentBoatName = "";
             bool isLocalPosition = false;
@@ -2201,7 +2461,7 @@ namespace SailwindCoop.Sync
             var good = item.GetComponent<Good>();
             int missionIndex = good != null ? good.GetMissionIndex() : -1;
 
-            var packet = new ItemSpawnedPacket
+            return new ItemSpawnedPacket
             {
                 ItemInstanceId = prefab.instanceId,
                 PrefabIndex = prefab.prefabIndex,
@@ -2213,22 +2473,60 @@ namespace SailwindCoop.Sync
                 Amount = item.amount,
                 MissionIndex = missionIndex
             };
+        }
 
-            VerboseLogger.ItemSend($"ItemSpawned, id={prefab.instanceId}, prefab={prefab.prefabIndex}, pos={position}, isLocal={isLocalPosition}, mission={missionIndex}");
+        /// <summary>
+        /// Host-only: resends an ItemSpawned for every live mission cargo item to ONE peer. Fired when
+        /// that peer reports GuestJoinComplete at the end of its join coroutine, so it repairs a join that
+        /// COMPLETED with per-item spawn losses on apply. It does NOT repair a join snapshot lost outright:
+        /// the guest never runs the join coroutine then and never sends the trigger. Because the request
+        /// arrives strictly AFTER the guest finished applying its snapshot, OnRemoteItemSpawned's duplicate
+        /// guard makes each resent spawn idempotent: already-present crates no-op, missing crates spawn
+        /// with their mission index so the receiver registers them to the mission.
+        /// Known limits: mission goods hidden inactive on the host (stashed in a remote player's inventory)
+        /// are invisible to FindObjectsOfType and are not resent; they heal when the holder drops them
+        /// (ItemDropped repositions by id). A good living inside a crate or currently held in a hand is
+        /// resent as a loose ItemSpawned (the packet carries no crate or holder association); on a joiner
+        /// genuinely missing it, the holder's own pickup/drop stream repositions it afterwards.
+        /// </summary>
+        public void ResyncMissionCargoTo(SteamId target)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
 
-            Plugin.NetworkManager.SendToAllReliable(PacketType.ItemSpawned, w =>
+            int sent = 0;
+            foreach (var good in Object.FindObjectsOfType<Good>())
             {
-                PacketSerializer.WriteItemSpawned(w, packet);
-            });
+                if (good.GetMissionIndex() < 0) continue;
 
-            // Mark as synced (host) and add to registry (both players for debug overlay).
-            // This ItemSpawned was a SendToAll broadcast, so every currently-connected peer
-            // now has it - record it in each peer's per-peer synced set.
-            if (Plugin.IsHost)
-            {
-                MarkSyncedForAllPeers(prefab.instanceId);
+                var item = good.GetComponent<ShipItem>();
+                var prefab = good.GetComponent<SaveablePrefab>();
+                if (item == null || prefab == null) continue;
+
+                // Never send id 0: on the receiver FindItemByInstanceId(0) matches an ARBITRARY scene item
+                // (unsold vendor items all share id 0), so the dedup either falsely no-ops against an
+                // unrelated item or the spawn creates an unaddressable id-0 duplicate. Matches the guard in
+                // ForceBroadcastItemDestroyed / OnLocalItemAmountChanged.
+                if (prefab.instanceId == 0) continue;
+
+                // Mirror the join-snapshot collector's filters (CollectWorldItems): personal pocket items
+                // (slot 0..99) and unsold shop stock are deliberately never serialized to a joiner, so
+                // resending one here would spawn a loose ghost copy carrying the host's instanceId.
+                int invSlot = item.GetCurrentInventorySlot();
+                if (invSlot >= 0 && invSlot < 100) continue;
+                if (!item.sold) continue;
+
+                var packet = BuildItemSpawnedPacket(item, prefab);
+
+                VerboseLogger.ItemSend($"ItemSpawned (mission resync), id={prefab.instanceId}, prefab={prefab.prefabIndex}, mission={packet.MissionIndex}, target={target}");
+
+                Plugin.NetworkManager.SendReliable(target, PacketType.ItemSpawned, w =>
+                {
+                    PacketSerializer.WriteItemSpawned(w, packet);
+                });
+                sent++;
             }
-            _itemRegistry[prefab.instanceId] = prefab.prefabIndex;
+
+            Plugin.Log.LogInfo($"[ITEMS] Mission cargo resync to {target}: {sent} item(s) resent");
         }
 
         /// <summary>
@@ -2400,10 +2698,17 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ItemSpawned, w =>
                     PacketSerializer.WriteItemSpawned(w, packet));
 
-            // Check if item already exists
-            if (FindItemByInstanceId(packet.ItemInstanceId) != null)
+            // Check if item already exists. Falls back to the inactive scan: an inventory-stashed copy is
+            // hidden via SetActive(false) and invisible to FindItemByInstanceId, and spawning over it
+            // creates a second item the moment the holder drops the original.
+            var existing = FindItemByInstanceId(packet.ItemInstanceId);
+            if (existing == null)
+                existing = FindInactiveItemByInstanceId(packet.ItemInstanceId);
+            if (existing != null)
             {
-                Plugin.Log.LogWarning($"OnRemoteItemSpawned: item {packet.ItemInstanceId} already exists");
+                // Info, not warning: this is the expected no-op on every healthy join, where the post-join
+                // mission-cargo resync resends crates the snapshot already applied and each one dedups here.
+                Plugin.Log.LogInfo($"OnRemoteItemSpawned: item {packet.ItemInstanceId} already exists, skipping");
                 return;
             }
 

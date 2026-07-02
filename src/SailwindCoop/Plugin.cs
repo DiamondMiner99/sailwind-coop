@@ -26,7 +26,7 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.19";
+        public const string PluginVersion = "0.2.20";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -1238,6 +1238,16 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadShopTradeResult(reader);
                 TradingSyncManager?.OnShopTradeResultReceived(packet);
+            });
+
+            // Guest -> host: guest's join coroutine finished; reply with a targeted mission-cargo
+            // resync so a partially-applied join snapshot cannot hide mission crates from the joiner.
+            // A snapshot lost outright never runs the join coroutine, so this request never arrives
+            // for that failure mode. Host-targeted request: no relay to other guests.
+            NetworkManager.RegisterHandler(PacketType.GuestJoinComplete, (sender, reader) =>
+            {
+                PacketSerializer.ReadGuestJoinComplete(reader);
+                ItemSyncManager?.ResyncMissionCargoTo(sender);
             });
 
             // Day Logs Full Sync

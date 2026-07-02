@@ -167,4 +167,17 @@ namespace SailwindCoop.Networking.Packets
         public int PipeInstanceId;
         public int TobaccoType;
     }
+
+    /// <summary>
+    /// Guest -> Host: the guest's join coroutine finished and all snapshot spawns are applied.
+    /// The host replies with a targeted mission-cargo resync (one ItemSpawned per live mission Good)
+    /// so a joiner whose join snapshot applied only partially (per-item spawn losses) still receives
+    /// every mission crate. A snapshot lost outright never starts the join coroutine, so this signal
+    /// does not fire and cannot repair that case.
+    /// No payload: the sender SteamId carries all the information the host needs.
+    /// </summary>
+    [Serializable]
+    public struct GuestJoinCompletePacket
+    {
+    }
 }

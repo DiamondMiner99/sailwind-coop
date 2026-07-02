@@ -2229,6 +2229,16 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteGuestJoinComplete(BinaryWriter writer, GuestJoinCompletePacket packet)
+        {
+            // No payload: the packet type plus the transport-level sender SteamId carry everything.
+        }
+
+        public static GuestJoinCompletePacket ReadGuestJoinComplete(BinaryReader reader)
+        {
+            return new GuestJoinCompletePacket();
+        }
+
         public static void WriteShopItemBought(BinaryWriter writer, ShopItemBoughtPacket packet)
         {
             writer.Write(packet.PrefabIndex);

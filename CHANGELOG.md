@@ -14,6 +14,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.20 - 2026-07-02
+
+> **All players must update** (network format changed).
+
+- **Fixed mission crates being invisible to a player who joined mid-session.** After a
+  guest finishes joining, the host now re-sends every mission crate directly to them;
+  crates that already arrived are simply skipped. A corrupted item in the join snapshot
+  also no longer aborts the rest of the join.
+- **Dropped items now come to rest in the same spot for everyone.** Previously each
+  machine simulated the fall on its own, so an item could settle in a different position
+  per player until the next pickup. The dropper now broadcasts the final resting
+  position once the item settles, and everyone else snaps to it.
+- Fixed a contested item grab being able to leave the losing player permanently out of
+  sync about where the item ended up.
+
 ## v0.2.19 - 2026-07-01
 
 > **All players must update** (network format changed). Thanks to our playtesters for

@@ -369,8 +369,18 @@ namespace SailwindCoop.Sync
 
                 // Wait briefly then spawn world items. Realtime so a paused host (timeScale 0) can't hang it.
                 yield return new WaitForSecondsRealtime(0.5f);
-                SpawnWorldItems(packet.WorldItems);
-                Plugin.Log.LogInfo($"[JOIN] Spawned {packet.WorldItems?.Length ?? 0} world items");
+                try
+                {
+                    SpawnWorldItems(packet.WorldItems);
+                    Plugin.Log.LogInfo($"[JOIN] Spawned {packet.WorldItems?.Length ?? 0} world items");
+                }
+                catch (System.Exception e)
+                {
+                    // A corrupt snapshot item must not abort the whole join: swallowing the throw lets the
+                    // coroutine reach the GuestJoinComplete send below, and the host's mission-cargo resync
+                    // re-sends what the failed apply lost.
+                    Plugin.Log.LogError($"[JOIN] World item spawn threw mid-apply: {e}");
+                }
             }
             finally
             {
@@ -388,6 +398,16 @@ namespace SailwindCoop.Sync
             Debug.VerboseLogger.RecoveryApply("Recovery resync complete; guest re-boarded on recovered boat, join phase ended");
             BoatSyncManager.IsJoinInProgress = false;
             Plugin.Log.LogInfo($"[JOIN] Join complete!");
+
+            // Tell the host the join coroutine is fully finished (every snapshot spawn applied or safely
+            // skipped). The host replies with a targeted mission-cargo resync, so a join whose item spawns
+            // were partially lost on apply cannot leave this joiner blind to mission crates the rest of the
+            // crew sees. Sent ONLY here, after every snapshot spawn above: any earlier trigger races the
+            // snapshot and would duplicate or drop crates. Not covered: a BoatWorldState packet lost
+            // outright (this coroutine never runs) or a throw above that aborts the coroutine before this
+            // line; those paths never send the signal.
+            Plugin.NetworkManager.SendReliable(Plugin.LobbyManager.HostSteamId, PacketType.GuestJoinComplete, w =>
+                PacketSerializer.WriteGuestJoinComplete(w, new GuestJoinCompletePacket()));
             }
             finally
             {

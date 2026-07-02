@@ -179,5 +179,8 @@ namespace SailwindCoop.Networking.Packets
 
         // Shop trade result (198): targeted host -> requester outcome of a stall trade
         ShopTradeResult = 198,           // Host -> requesting guest: stall buy accepted/rejected (reject => restore optimistic item + notify)
+
+        // Guest join completion (199): explicit end-of-join signal for targeted resyncs
+        GuestJoinComplete = 199,         // Guest -> Host: join coroutine finished; host replies with a targeted mission-cargo resync
     }
 }
