@@ -285,6 +285,22 @@ namespace SailwindCoop.Sync
                 // Skip shop inventory (not owned by player)
                 if (!shipItem.sold) continue;
 
+                // HELD-ITEM PHANTOM FIX (2026-07-02 playtest): skip items currently in someone's hand.
+                // An in-hand item is not boat-parented and reports inventory slot -1, so it passed every
+                // filter below and was serialized as a LOOSE world item at the holder's hand position,
+                // under the ORIGINAL's instanceId. The joiner then spawned a phantom copy on the ground
+                // "in front of" the players; picking the phantom up resolved by id to the REAL item on
+                // the host (by then back on the boat) and hijacked it out of the world. held is non-null
+                // both for the host's own vanilla hold and for the fake held reference the mod sets on
+                // remote-held items, so this covers any carrier. The item is NOT lost to the joiner:
+                // the holder's next drop spawn-syncs it first (per-peer AnyPeerMissingSyncedItem backfill
+                // in SendDropPacket / the OnRemoteItemDropped relay), mirroring the pickup path.
+                if (shipItem.held != null)
+                {
+                    Plugin.Log.LogInfo($"[ITEM:COLLECT] Skipping in-hand item {prefab.name} (id={prefab.instanceId}) - held items are backfilled on drop, not serialized to joiners");
+                    continue;
+                }
+
                 // POCKET-INHERIT FIX: skip items held in the HOST's personal inventory pockets.
                 // Host pocket items are sold AND parented to a UI pocket-slot transform (not a boat), so
                 // they pass both the sold and the IsParentedToBoat filters. ConvertToNetworkSaveData then

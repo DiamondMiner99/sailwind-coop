@@ -646,11 +646,11 @@ namespace SailwindCoop.Sync
                     var worldPos = packet.LocalPosition + offset;
                     var shiftingWorld = GameObject.Find("_shifting world");
 
-                    // Clear boat references
+                    // Clear boat references the vanilla way - see ClearBoatLatch (stale private
+                    // currentBoatCollider from a manual clear permanently blocked re-latching).
                     if (item != null)
                     {
-                        item.currentActualBoat = null;
-                        item.currentWalkCol = null;
+                        ClearBoatLatch(item);
                     }
 
                     go.transform.SetParent(shiftingWorld?.transform);
@@ -1598,25 +1598,25 @@ namespace SailwindCoop.Sync
             // the crate to the static "_shifting world"; the boat then sailed away in the floating-origin
             // frame, leaving the crate's mesh behind at a stale world spot (invisible to anyone following
             // the boat) while its deck collider remained => "crate disappears on the guest but you can still
-            // bump it". FALLBACK: when the item hasn't latched, use GameState.currentBoat - the boatModel of
-            // the boat the LOCAL player is standing on, set promptly by the PLAYER-embark machine
-            // (PlayerEmbarkerNew/PlayerEmbarkDisembarkTrigger) and cleared on disembark - so a deck drop is
-            // encoded boat-relative and the receiver parents it onto the moving deck. Solo: SendDropPacket is
-            // never reached (OnDropItemPrefix gates on IsMultiplayer), so this is a no-op in singleplayer.
-            // Only take the GameState.currentBoat fallback when the carried item is
-            // PHYSICALLY over a boat's deck right now - i.e. its own trigger is inside a BoatEmbarkCollider, so
-            // vanilla ShipItem set currentlyStayedEmbarkCol (private; read via Traverse). Without this gate,
-            // setting a crate down on a DOCK/LAND while merely standing aboard a moored boat would wrongly encode
-            // it boat-relative and the crate would ride the deck once the boat sailed. The common case this fix
-            // targets - a crate carried onto and set down ON the deck - has the item inside the embark volume, so
-            // currentlyStayedEmbarkCol is set and the fallback still applies.
+            // bump it". FALLBACK: when the item hasn't latched but its own trigger is inside a boat's
+            // EmbarkCol (vanilla ShipItem.currentlyStayedEmbarkCol, private; read via Traverse), derive the
+            // boat FROM THAT COLLIDER: embarkCol.transform.parent is exactly what vanilla EnterBoat assigns
+            // to currentActualBoat, so the drop is encoded in the frame of the boat the item is PHYSICALLY
+            // over. (v0.2.20 used GameState.currentBoat - the boat the local PLAYER stands on - here, which
+            // broke the SETTLE TERMINAL: it re-derives the frame seconds after the drop, by which time the
+            // player may have stepped off, so a deck drop was re-broadcast as a LAND drop at a stale world
+            // position and receivers pinned the crate to the static world inside the moving hull. Deriving
+            // from the item's own embark trigger is player-independent and stable across drop and settle.)
+            // An item on a DOCK/LAND has no stayedEmbarkCol, so it still encodes as a land drop even if the
+            // dropper stands aboard a moored boat. Solo: SendDropPacket is never reached (OnDropItemPrefix
+            // gates on IsMultiplayer), so this is a no-op in singleplayer.
             Transform dropBoatModel = item.currentActualBoat;
-            if (dropBoatModel == null && GameState.currentBoat != null)
+            if (dropBoatModel == null)
             {
                 Collider stayedEmbarkCol = null;
                 try { stayedEmbarkCol = HarmonyLib.Traverse.Create(item).Field("currentlyStayedEmbarkCol").GetValue<Collider>(); }
                 catch { }
-                if (stayedEmbarkCol != null) dropBoatModel = GameState.currentBoat;
+                if (stayedEmbarkCol != null) dropBoatModel = stayedEmbarkCol.transform.parent;
             }
             var boatSaveable = dropBoatModel != null ? dropBoatModel.parent?.GetComponent<SaveableObject>() : null;
             if (dropBoatModel != null && boatSaveable != null)
@@ -1625,7 +1625,7 @@ namespace SailwindCoop.Sync
                 position = dropBoatModel.InverseTransformPoint(dropWorldPos);
                 isLocalPosition = true;
                 if (item.currentActualBoat == null)
-                    VerboseLogger.ItemLocal($"Drop boat-frame fallback: item {instanceId} had no latched boat; using player's GameState.currentBoat ({parentBoatName})");
+                    VerboseLogger.ItemLocal($"Drop boat-frame fallback: item {instanceId} had no latched boat; using its embark-trigger boat ({parentBoatName})");
             }
             else
             {
@@ -1641,6 +1641,24 @@ namespace SailwindCoop.Sync
 
             // Remove from held tracking
             _heldItems.Remove(instanceId);
+
+            // HELD-ITEM PHANTOM FIX companion: held items are no longer serialized to joiners (join
+            // snapshot + mission resync), so a peer that joined while this item was in-hand has never
+            // seen its id - this drop is the first time the item surfaces for them, and a bare
+            // ItemDropped would silently no-op there ("item not found"), leaving the item invisible.
+            // Mirror OnLocalPickup's per-peer gate: spawn-sync first, then drop. Peers that already
+            // track the id ignore the duplicate ItemSpawned (OnRemoteItemSpawned dedups by id). Shop
+            // purchases keep using lazy id correlation, exactly like the pickup path.
+            if (Plugin.IsHost && !WasJustPurchased(instanceId) && AnyPeerMissingSyncedItem(instanceId))
+            {
+                var dropPrefab = item.GetComponent<SaveablePrefab>();
+                if (dropPrefab != null && dropPrefab.instanceId != 0)
+                {
+                    SendItemSpawnedForExisting(item, dropPrefab);
+                    MarkSyncedForAllPeers(instanceId);
+                    VerboseLogger.ItemSend($"Synced item {instanceId} to guest(s) before drop (a peer was missing it)");
+                }
+            }
 
             // Send drop packet
             SendItemDropped(instanceId, position, rotation, parentBoatName, isLocalPosition);
@@ -1891,6 +1909,46 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Called when receiving ItemDropped packet.
         /// </summary>
+        /// <summary>
+        /// Fully un-latch an item from its boat, the way vanilla does. The mod's land-drop/resync paths
+        /// used to null currentActualBoat/currentWalkCol by hand, which leaves TWO vanilla pieces stale:
+        /// (1) the PRIVATE ShipItem.currentBoatCollider - ShipItem.ExtraFixedUpdate's EnterBoat gate is
+        /// `currentlyStayedEmbarkCol != currentBoatCollider`, so a stale collider PERMANENTLY blocks the
+        /// item from ever re-latching onto that same boat. The item then sits on the deck as a world-frame
+        /// DYNAMIC rigidbody, and Unity depenetration between it and the bobbing hull shoves the boat -
+        /// confirmed to drive a moored brig underwater in ~10s (2026-07-02 playtest sink).
+        /// (2) ItemRigidbody.ExitBoat's cleanup (BoatMass.RemoveItem + onBoat=false), so the boat kept
+        /// phantom cargo mass and FixedUpdate kept using the boat frame mapping with null walkCol refs.
+        /// Route through the private vanilla ShipItem.ExitBoat when latched (it clears all three fields,
+        /// calls ItemRigidbody.ExitBoat, and detaches hangables); always also clear currentBoatCollider
+        /// afterwards to cover an item that carries a stale collider WITHOUT being latched (the state the
+        /// old manual clears left behind).
+        /// </summary>
+        internal static void ClearBoatLatch(ShipItem item)
+        {
+            if (item == null) return;
+            if (item.currentActualBoat != null)
+            {
+                try
+                {
+                    HarmonyLib.Traverse.Create(item).Method("ExitBoat").GetValue();
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] vanilla ExitBoat failed on {item.name}: {e.Message}; clearing fields manually");
+                    item.currentActualBoat = null;
+                    item.currentWalkCol = null;
+                    if (item.itemRigidbodyC != null)
+                    {
+                        try { HarmonyLib.Traverse.Create(item.itemRigidbodyC).Field("onBoat").SetValue(false); }
+                        catch { }
+                    }
+                }
+            }
+            try { HarmonyLib.Traverse.Create(item).Field("currentBoatCollider").SetValue(null); }
+            catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not clear currentBoatCollider on {item.name}: {e.Message}"); }
+        }
+
         public void OnRemoteItemDropped(ItemDroppedPacket packet, SteamId sender = default)
         {
             VerboseLogger.ItemRecv($"ItemDropped, id={packet.ItemInstanceId}, boat={packet.ParentBoatName}, pos={packet.Position}, isLocal={packet.IsLocalPosition}, from={sender}");
@@ -1911,6 +1969,26 @@ namespace SailwindCoop.Sync
             // whole crew sees the item released. At N=1 SendToAllExcept(sender) targets no one (no-op).
             if (Plugin.IsHost)
             {
+                // HELD-ITEM PHANTOM FIX companion: a peer that joined while a GUEST carried this item has
+                // never been sent its id (held items are excluded from the join snapshot / mission resync),
+                // so the relayed ItemDropped would no-op there and the item would stay invisible. Spawn-sync
+                // it BEFORE the relay, mirroring the OnLocalPickup/SendDropPacket per-peer backfill; peers
+                // that already track the id dedup the ItemSpawned to a no-op. The spawn goes out at the
+                // item's current (still-held) pose; the relayed drop right behind it sets the real pose.
+                if (AnyPeerMissingSyncedItem(packet.ItemInstanceId))
+                {
+                    var backfillItem = FindItemByInstanceId(packet.ItemInstanceId);
+                    if (backfillItem == null && _remoteHeldItems.TryGetValue(packet.ItemInstanceId, out var heldBackfill))
+                        backfillItem = heldBackfill;
+                    var backfillPrefab = backfillItem != null ? backfillItem.GetComponent<SaveablePrefab>() : null;
+                    if (backfillPrefab != null && backfillPrefab.instanceId != 0)
+                    {
+                        SendItemSpawnedForExisting(backfillItem, backfillPrefab);
+                        MarkSyncedForAllPeers(packet.ItemInstanceId);
+                        VerboseLogger.ItemSend($"Synced item {packet.ItemInstanceId} to guest(s) before relaying drop (a peer was missing it)");
+                    }
+                }
+
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ItemDropped,
                     w => PacketSerializer.WriteItemDropped(w, packet));
             }
@@ -2104,9 +2182,11 @@ namespace SailwindCoop.Sync
 
                     VerboseLogger.ItemApply($"Land drop: packetPos={packet.Position}, offset={offset}, worldPos={worldPos}");
 
-                    // Clear boat references
-                    item.currentActualBoat = null;
-                    item.currentWalkCol = null;
+                    // Clear boat references THE VANILLA WAY (ExitBoat: also clears the private
+                    // currentBoatCollider, removes BoatMass cargo weight, resets onBoat) - the old manual
+                    // null-out left currentBoatCollider stale, permanently blocking re-latch onto the same
+                    // boat (the 2026-07-02 moored-brig sink). Positioning below overrides ExitBoat's own.
+                    ClearBoatLatch(item);
 
                     // Parent to shifting world
                     var shiftingWorld = GameObject.Find("_shifting world")?.transform;
@@ -2269,6 +2349,33 @@ namespace SailwindCoop.Sync
             {
                 VerboseLogger.ItemApply($"Denying pickup - correlated crate {item.name} already held by {existingHolder} under a different id (contested grab)");
                 SendItemPickupDenied(packet.ItemInstanceId, 0, sender);
+                return;
+            }
+
+            // PHANTOM-GRAB GUARD (2026-07-02 hijack): deny ONLY the hijack signature - the requester
+            // claims the item sits on LAND (empty boat name) while the host's real item is latched on a
+            // boat. That is what a stale ground copy looks like (e.g. the pre-fix held-item join phantom):
+            // approving would silently yank the real item off a deck nobody is looking at. Deny and push
+            // the authoritative state so the requester's copy heals; their next grab then succeeds.
+            // Deliberately ONE-DIRECTIONAL and graced (review finding): vanilla EnterBoat/ExitBoat run
+            // per-machine on independent ~2-frame dwell counters, so the two ends legitimately disagree
+            // for short windows around any drop near a deck. The reverse direction (requester names a
+            // boat, host says land = host latch lag) and cross-boat naming differences are left approved,
+            // and the drop-settle window (_pendingDropTerminals, host's own drops) plus the 2s
+            // remote-sync window (IsRecentlySynced, fed by OnRemoteItemDropped for guest drops) exempt
+            // freshly moved items. Both ends name the boat the same way (item.currentActualBoat.name,
+            // see OnLocalPickup), so the comparison is like-for-like.
+            string hostFrameBoat = item.currentActualBoat != null ? item.currentActualBoat.name : "";
+            string requesterFrameBoat = packet.ParentBoatName ?? "";
+            if (hostFrameBoat != "" && requesterFrameBoat == ""
+                && !_pendingDropTerminals.ContainsKey(packet.ItemInstanceId)
+                && !IsRecentlySynced(packet.ItemInstanceId))
+            {
+                VerboseLogger.ItemApply($"Denying pickup - phantom-grab signature for item {item.name} id={packet.ItemInstanceId}: requester says land, host has it on boat '{hostFrameBoat}'; resyncing requester");
+                SendItemPickupDenied(packet.ItemInstanceId, 0, sender);
+                var mismatchPrefab = item.GetComponent<SaveablePrefab>();
+                if (mismatchPrefab != null && mismatchPrefab.instanceId != 0)
+                    SendItemResync(mismatchPrefab.instanceId, sender);
                 return;
             }
 
@@ -2485,9 +2592,10 @@ namespace SailwindCoop.Sync
         /// with their mission index so the receiver registers them to the mission.
         /// Known limits: mission goods hidden inactive on the host (stashed in a remote player's inventory)
         /// are invisible to FindObjectsOfType and are not resent; they heal when the holder drops them
-        /// (ItemDropped repositions by id). A good living inside a crate or currently held in a hand is
-        /// resent as a loose ItemSpawned (the packet carries no crate or holder association); on a joiner
-        /// genuinely missing it, the holder's own pickup/drop stream repositions it afterwards.
+        /// (ItemDropped repositions by id). An item currently held IN A HAND is deliberately skipped
+        /// (see the held check below): resending it as a loose ItemSpawned created a ground phantom under
+        /// the original's id (2026-07-02 playtest). Held items reach the joiner via the drop-time
+        /// spawn-sync backfill instead.
         /// </summary>
         public void ResyncMissionCargoTo(SteamId target)
         {
@@ -2514,6 +2622,13 @@ namespace SailwindCoop.Sync
                 int invSlot = item.GetCurrentInventorySlot();
                 if (invSlot >= 0 && invSlot < 100) continue;
                 if (!item.sold) continue;
+
+                // HELD-ITEM PHANTOM FIX (2026-07-02 playtest): never resend an item that is in someone's
+                // hand (vanilla hold or the mod's fake held on remote-held items). BuildItemSpawnedPacket
+                // would encode it as a LOOSE item at the carrier's hand position under the original's id -
+                // a ground phantom that can later hijack the real item via id correlation. The joiner gets
+                // it from the drop-time spawn-sync backfill when the carrier releases it.
+                if (item.held != null) continue;
 
                 var packet = BuildItemSpawnedPacket(item, prefab);
 
@@ -3819,6 +3934,23 @@ namespace SailwindCoop.Sync
                 // id from _heldItems/_remoteHeldItems (this holder's entries only).
                 DropItemAtPosition(item, instanceId, lastKnownPosition);
 
+                // HELD-ITEM PHANTOM FIX companion: a peer that joined while the LEAVER carried this item
+                // never received its id (held items are excluded from the join snapshot / mission resync),
+                // so the disconnect-drop broadcast below would no-op there and the item would stay
+                // invisible to that peer forever. Spawn-sync first, mirroring the SendDropPacket and
+                // relay backfills; peers that already track the id dedup the ItemSpawned to a no-op.
+                // Runs AFTER DropItemAtPosition so the spawn already carries the dropped (land) pose.
+                if (AnyPeerMissingSyncedItem(instanceId))
+                {
+                    var leaverPrefab = item.GetComponent<SaveablePrefab>();
+                    if (leaverPrefab != null && leaverPrefab.instanceId != 0)
+                    {
+                        SendItemSpawnedForExisting(item, leaverPrefab);
+                        MarkSyncedForAllPeers(instanceId);
+                        VerboseLogger.ItemSend($"Synced item {instanceId} to guest(s) before disconnect-drop (a peer was missing it)");
+                    }
+                }
+
                 // Disconnect-drop broadcast: the host (authoritative author) broadcasts the
                 // authoritative land-drop so the REMAINING guests un-orphan the item (they were only
                 // ever told the leaver picked it up). Position is offset-relative (lastKnownPosition -
@@ -3900,6 +4032,25 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void DropItemAtPosition(ShipItem item, int instanceId, Vector3 worldPos)
         {
+            // This is an authoritative teardown applied locally (disconnect force-drop), not a player
+            // action: raise the per-packet apply flag so patches triggered by the vanilla calls below
+            // (notably ClearBoatLatch -> ShipItem.ExitBoat -> HangableItem.DisconnectJoint ->
+            // OnLocalItemUnhung) don't echo packets mid-teardown (review finding). Both callers
+            // (OnPeerDisconnected / OnHostDisconnected) are plain event handlers, never already inside
+            // an apply window, so the finally can't clear an outer guard.
+            IsApplyingRemoteState = true;
+            try
+            {
+                DropItemAtPositionCore(item, instanceId, worldPos);
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+        }
+
+        private void DropItemAtPositionCore(ShipItem item, int instanceId, Vector3 worldPos)
+        {
             // Remove from held tracking
             _heldItems.Remove(instanceId);
             _remoteHeldItems.Remove(instanceId);
@@ -3915,9 +4066,9 @@ namespace SailwindCoop.Sync
             // TRADER-CROSSWIRE fix: restore the ShipItem's own trigger collider disabled while guest-held.
             SetShipItemOwnTriggers(item, true);
 
-            // Clear boat references - dropping on land
-            item.currentActualBoat = null;
-            item.currentWalkCol = null;
+            // Clear boat references the vanilla way - see ClearBoatLatch (stale private
+            // currentBoatCollider from a manual clear permanently blocked re-latching; 2026-07-02 sink).
+            ClearBoatLatch(item);
 
             // Parent to shifting world
             var shiftingWorld = GameObject.Find("_shifting world")?.transform;

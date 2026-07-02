@@ -26,7 +26,7 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.20";
+        public const string PluginVersion = "0.2.21";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }

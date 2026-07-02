@@ -14,6 +14,33 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.21 - 2026-07-02
+
+> Network-compatible with v0.2.20 (no wire change), but as always the whole crew should
+> update together.
+
+Fixes from a live 2-player session earlier today (thanks for the logs!):
+
+- **Fixed a crate set down on deck being able to drag a moored boat underwater.** An item
+  that went through a crewmate's hands could get stuck "un-latched" from the boat (a stale
+  internal boat reference blocked it from ever re-attaching to that boat), leaving it a
+  world-anchored physics body pressing on the hull - enough to shove the deck under and
+  flood a moored brig in seconds. Items now detach the way the vanilla game does, and the
+  stale reference is cleared.
+- **Fixed a phantom copy of a carried item appearing on the ground for a joining player.**
+  The join snapshot (and the v0.2.20 mission-cargo resync) serialized an item the host was
+  holding as a loose world item at the holder's hand position, under the real item's id -
+  and picking the phantom up hijacked the real item (it could be silently yanked off the
+  boat). In-hand items are no longer sent to joiners; they now sync automatically the
+  moment the carrier sets them down (including when a carrier disconnects).
+- **Dropped-item resting positions now stay in the right reference frame.** The v0.2.20
+  settle broadcast re-derived "on a boat vs. on land" from where the *player* was standing
+  seconds after the drop, so a deck drop could be re-sent as a land drop and pin the item
+  to the world on other machines. The frame now comes from the item's own position.
+- The host now denies a pickup that matches the "stale ground copy" signature (requester
+  says the item is on land while it is actually latched to a boat) and resyncs the
+  requester instead of letting the real item be grabbed through the stale copy.
+
 ## v0.2.20 - 2026-07-02
 
 > **All players must update** (network format changed).
