@@ -26,7 +26,7 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.22";
+        public const string PluginVersion = "0.2.23";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -34,6 +34,11 @@ namespace SailwindCoop
         // Crew cap (host + guests) for the Steam lobby. Default 8 (host + 7). Read by
         // SteamLobbyManager.MaxPlayers, which feeds Steam's lobby max-members argument.
         public static ConfigEntry<int> MaxPlayersConfig { get; private set; }
+        public static ConfigEntry<bool> AllowCrewInvitesConfig { get; private set; }
+        // Crew spending feed (UI.TradeFeed): receiver-side gates - turning them down/off changes only
+        // THIS machine's feed lines and quiet coin cue, never what the host broadcasts.
+        public static ConfigEntry<bool> SpendingFeedConfig { get; private set; }
+        public static ConfigEntry<float> SpendingFeedVolumeConfig { get; private set; }
 
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
@@ -52,7 +57,9 @@ namespace SailwindCoop
         public static EconomySyncManager EconomySyncManager { get; private set; }
         public static TradingSyncManager TradingSyncManager { get; private set; }
         public static FishingSyncManager FishingSyncManager { get; private set; }
+        public static ChipLogSyncManager ChipLogSyncManager { get; private set; }
         public static NavigationSyncManager NavigationSyncManager { get; private set; }
+        public static ChartKitGhostManager ChartKitGhostManager { get; private set; }
         public static CookingSyncManager CookingSyncManager { get; private set; }
         public static NPCBoatSyncManager NPCBoatSyncManager { get; private set; }
         public static PlayerSyncManager PlayerSyncManager { get; private set; }
@@ -115,6 +122,33 @@ namespace SailwindCoop
                     "Maximum crew on one shared boat, including the host (default 8 = host + 7 guests).",
                     new AcceptableValueRange<int>(2, 8)));
             Log.LogInfo($"Crew cap (MaxPlayers): {MaxPlayersConfig.Value}");
+
+            // ACCESS CONTROL (2026-07-02 report: a guest's Steam friend - a stranger to the HOST -
+            // walked into the crew): the lobby is now created PRIVATE (invite-only), and by default the
+            // host additionally refuses to admit anyone the HOST didn't personally invite (a guest can
+            // still fire Steam-overlay invites; those joiners are turned away at admission). Hosts who
+            // trust their crew to bring friends can flip this on.
+            AllowCrewInvitesConfig = Config.Bind(
+                "Coop",
+                "AllowCrewInvites",
+                false,
+                "When true, people invited by ANY crew member may join. When false (default), only players the HOST invited are admitted to the session.");
+            Log.LogInfo($"AllowCrewInvites: {AllowCrewInvitesConfig.Value}");
+
+            // Crew spending feed: bottom-right killfeed line (+ quiet coin cue for OTHER crew members'
+            // trades) whenever anyone in the crew buys or sells against the shared wallet.
+            SpendingFeedConfig = Config.Bind(
+                "Coop",
+                "SpendingFeed",
+                true,
+                "Show a bottom-right feed line (and play a quiet coin sound for other crew members' trades) whenever anyone in the crew buys or sells. Receiver-side: affects only this machine.");
+            SpendingFeedVolumeConfig = Config.Bind(
+                "Coop",
+                "SpendingFeedVolume",
+                0.35f,
+                new ConfigDescription(
+                    "Volume of the quiet coin sound played for OTHER crew members' trades (your own trades already play the vanilla gold sound at full volume).",
+                    new AcceptableValueRange<float>(0f, 1f)));
 
             try
             {
@@ -188,8 +222,12 @@ namespace SailwindCoop
                 Log.LogInfo("TradingSyncManager added");
                 FishingSyncManager = gameObject.AddComponent<FishingSyncManager>();
                 Log.LogInfo("FishingSyncManager added");
+                ChipLogSyncManager = gameObject.AddComponent<ChipLogSyncManager>();
+                Log.LogInfo("ChipLogSyncManager added");
                 NavigationSyncManager = gameObject.AddComponent<NavigationSyncManager>();
                 Log.LogInfo("NavigationSyncManager added");
+                ChartKitGhostManager = gameObject.AddComponent<ChartKitGhostManager>();
+                Log.LogInfo("ChartKitGhostManager added");
                 CookingSyncManager = gameObject.AddComponent<CookingSyncManager>();
                 Log.LogInfo("CookingSyncManager added");
                 NPCBoatSyncManager = gameObject.AddComponent<NPCBoatSyncManager>();
@@ -461,7 +499,9 @@ namespace SailwindCoop
                 Patches.EconomyPatches.ShopkeeperSellItemPatch.ResetPendingStallBuys(); // drain parked stall buys so a
                                                // stale entry can't mis-pair with the next session's first verdict
                 FishingSyncManager?.Reset();
+                ChipLogSyncManager?.Reset();
                 NavigationSyncManager?.Reset();
+                ChartKitGhostManager?.Reset();
                 CookingSyncManager?.Reset();
                 NPCBoatSyncManager?.Reset();
                 CleaningSyncManager?.Reset();
@@ -944,6 +984,13 @@ namespace SailwindCoop
                 ItemSyncManager?.OnRemotePipeFilled(packet, sender);
             });
 
+            // Nail state sync (hammer nail/un-nail)
+            NetworkManager.RegisterHandler(PacketType.NailState, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadNailState(reader);
+                ItemSyncManager?.OnRemoteNailState(packet, sender);
+            });
+
             NetworkManager.RegisterHandler(PacketType.ItemHung, (sender, reader) =>
             {
                 var packet = PacketSerializer.ReadItemHung(reader);
@@ -1244,6 +1291,14 @@ namespace SailwindCoop
                 TradingSyncManager?.OnShopTradeResultReceived(packet);
             });
 
+            // Host -> all guests: crew spending-feed line. Guests never send this (the host observes
+            // every trade), so no relay; pure UI/audio on the receiver.
+            NetworkManager.RegisterHandler(PacketType.TradeFeedEvent, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadTradeFeedEvent(reader);
+                TradeFeed.OnRemoteTradeFeedEvent(packet);
+            });
+
             // Guest -> host: guest's join coroutine finished; reply with a targeted mission-cargo
             // resync so a partially-applied join snapshot cannot hide mission crates from the joiner.
             // A snapshot lost outright never runs the join coroutine, so this request never arrives
@@ -1252,6 +1307,9 @@ namespace SailwindCoop
             {
                 PacketSerializer.ReadGuestJoinComplete(reader);
                 ItemSyncManager?.ResyncMissionCargoTo(sender);
+                // The join snapshot always applies items un-nailed (no nail flag on the 0.2.22 wire),
+                // so replay nailed state to the joiner as targeted NailState packets.
+                ItemSyncManager?.ResyncNailedStateTo(sender);
             });
 
             // Ping loop (F8 overlay diagnostics). Both legs are UNRELIABLE on purpose: the number
@@ -1345,6 +1403,25 @@ namespace SailwindCoop
                 FishingSyncManager?.OnFishingCastReceived(packet, sender);
             });
 
+            NetworkManager.RegisterHandler(PacketType.FishingBobberSync, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadFishingBobberSync(reader);
+                FishingSyncManager?.OnFishingBobberSyncReceived(packet, sender);
+            });
+
+            // Chip log sync handlers
+            NetworkManager.RegisterHandler(PacketType.ChipLogThrow, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadChipLogThrow(reader);
+                ChipLogSyncManager?.OnChipLogThrowReceived(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.ChipLogLineSync, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadChipLogLineSync(reader);
+                ChipLogSyncManager?.OnChipLogLineSyncReceived(packet, sender);
+            });
+
             // Navigation sync handlers
             NetworkManager.RegisterHandler(PacketType.NavItemState, (sender, reader) =>
             {
@@ -1399,6 +1476,18 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadMapFullSync(reader);
                 NavigationSyncManager?.OnMapFullSync(packet);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.ChartSession, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadChartSession(reader);
+                NavigationSyncManager?.OnRemoteChartSession(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.ChartCursor, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadChartCursor(reader);
+                NavigationSyncManager?.OnRemoteChartCursor(packet, sender);
             });
 
             // Cooking sync
@@ -1693,7 +1782,9 @@ namespace SailwindCoop
             TradingSyncManager?.Reset();
             Patches.EconomyPatches.ShopkeeperSellItemPatch.ResetPendingStallBuys(); // drain parked stall buys (see OnLobbyLeft)
             FishingSyncManager?.Reset();
+            ChipLogSyncManager?.Reset();
             NavigationSyncManager?.Reset();
+            ChartKitGhostManager?.Reset(); // destroys spawned ghost kit objects; a reloaded plugin can't reach them
             CookingSyncManager?.Reset();
             NPCBoatSyncManager?.Reset();
             CleaningSyncManager?.Reset();
@@ -1807,6 +1898,9 @@ namespace SailwindCoop
                         NavigationSyncManager?.SendMapFullSyncToGuest(friend.Id.Value, foldable);
                     }
                 }
+                // Ghost kit late-join replay: if someone is mid-charting, the joiner missed the
+                // ChartSession start - re-send every active session so the ghost appears.
+                NavigationSyncManager?.ReplayActiveChartSessionsTo(friend.Id.Value);
             });
 
             // The join state is out; the guest still won't stream position until its load completes, so

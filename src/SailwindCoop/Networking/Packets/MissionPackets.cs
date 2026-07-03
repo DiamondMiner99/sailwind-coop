@@ -307,4 +307,21 @@ namespace SailwindCoop.Networking.Packets
     {
         public NetworkDaySheet[][] Logs; // [4][21]
     }
+
+    /// <summary>
+    /// Host -> all guests: one line of the crew "spending feed" killfeed (see UI.TradeFeed). The host
+    /// observes every crew trade (its own vanilla trades plus every guest trade it executes), so ONLY
+    /// the host emits; the actor's display name is resolved RECEIVER-side from ActorSteamId while the
+    /// item name is resolved HOST-side (prefab directory). Additive wire: v0.2.22 clients silently
+    /// drop the unknown packet type.
+    /// </summary>
+    [Serializable]
+    public struct TradeFeedEventPacket
+    {
+        public ulong ActorSteamId;  // who traded; receivers resolve the display name locally
+        public byte Flags;          // bit0 = IsBuying
+        public byte CurrencyIndex;  // wallet slot (Currency enum, 0-3)
+        public int Price;
+        public string ItemName;     // host-resolved display name ("(Clone)"/copy-number stripped)
+    }
 }

@@ -1,5 +1,6 @@
 using System;
 using Steamworks;
+using UnityEngine;
 
 namespace SailwindCoop.Networking.Packets
 {
@@ -84,5 +85,20 @@ namespace SailwindCoop.Networking.Packets
     {
         public int RodInstanceId;
         public float ThrowCharge; // 0-1, how hard the cast was
+    }
+
+    /// <summary>
+    /// Bobber position stream (5Hz from owner, coalesced on >0.5m movement). The bobber launch is
+    /// emergent local physics on the owner (rod angular velocity + the owner's camera forward), so a
+    /// viewer's bobber never leaves the rod - stream the resulting position instead. Boat-frame when
+    /// the caster is aboard a boat, offset-independent world coords otherwise (BoatName empty).
+    /// </summary>
+    [Serializable]
+    public struct FishingBobberSyncPacket
+    {
+        public int RodInstanceId;
+        public string BoatName;  // "" = world frame
+        public Vector3 Position; // boat-local, or world minus floating-origin offset
+        public byte InWater;     // owner's floater.InWater (1/0, diagnostic)
     }
 }

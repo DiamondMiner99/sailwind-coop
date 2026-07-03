@@ -39,6 +39,16 @@
     <Reference Include="UnityEngine.AnimationModule">
       <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.AnimationModule.dll</HintPath>
     </Reference>
+    <!-- Spending-feed overlay (UI.TradeFeedUI): uGUI canvas + quiet coin AudioSource. -->
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.UIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>$(GameDir)/Sailwind_Data/Managed/UnityEngine.AudioModule.dll</HintPath>
+    </Reference>
 
     <!-- Game -->
     <Reference Include="Assembly-CSharp">

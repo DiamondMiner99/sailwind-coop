@@ -1,6 +1,7 @@
 using HarmonyLib;
 using SailwindCoop.Networking.Packets;
 using SailwindCoop.Sync;
+using Steamworks;
 
 namespace SailwindCoop.Patches
 {
@@ -83,14 +84,64 @@ namespace SailwindCoop.Patches
         // These patches block the entire transaction for guests.
 
         /// <summary>
+        /// Resolve the shopkeeper's port index via its private IslandEconomy (economy ->
+        /// IslandMarket.GetPortIndex(), the same resolution the market UI patches use).
+        /// GetComponentInParent&lt;Port&gt; on parentRegion is unreliable: vanilla Region is a standalone
+        /// weather-volume MonoBehaviour, not a Port child, so it nulls and the old fallback silently
+        /// sent PortIndex=0 for every stall trade (breaking host-side island-economy matching and
+        /// the port-region fallback for sells). Keep the Port lookup only as a last resort.
+        /// </summary>
+        private static int ResolveShopkeeperPortIndex(Shopkeeper shopkeeper, Region parentRegion)
+        {
+            var economy = Traverse.Create(shopkeeper).Field("economy").GetValue<IslandEconomy>();
+            var market = economy != null ? economy.GetComponent<IslandMarket>() : null;
+            if (market != null) return market.GetPortIndex();
+
+            var port = parentRegion != null ? parentRegion.GetComponentInParent<Port>() : null;
+            return port != null ? port.portIndex : 0;
+        }
+
+        /// <summary>
+        /// Carries the HOST's pre-trade wallet snapshot from a market Prefix to its Postfix, for the
+        /// spending feed. Vanilla BuyGood/SellGood return SILENTLY on reject (no stock / no money / nothing
+        /// to sell), so the only reliable success signal is the wallet delta on the selected currency slot.
+        /// Armed is set ONLY on the multiplayer host; the Postfix also runs after a skipped guest Prefix
+        /// (Harmony always runs postfixes) and must no-op there.
+        /// </summary>
+        public struct HostMarketFeedState
+        {
+            public bool Armed;
+            public int Currency;
+            public int WalletBefore;
+            public int GoodIndex;
+        }
+
+        private static HostMarketFeedState CaptureHostMarketState(EconomyUI ui)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost) return default;
+            int currency = (int)Traverse.Create(ui).Field("currentPlayerCurrency").GetValue<Currency>();
+            if (PlayerGold.currency == null || currency < 0 || currency >= PlayerGold.currency.Length) return default;
+            return new HostMarketFeedState
+            {
+                Armed = true,
+                Currency = currency,
+                WalletBefore = PlayerGold.currency[currency],
+                GoodIndex = Traverse.Create(ui).Field("currentSelectedGood").GetValue<int>()
+            };
+        }
+
+        /// <summary>
         /// Intercept guest buying at market and route to host.
+        /// Host: vanilla runs; the Postfix reports the trade to the crew spending feed (wallet-delta
+        /// detected, so silent vanilla rejects emit nothing).
         /// </summary>
         [HarmonyPatch(typeof(EconomyUI), "BuyGood")]
         public static class BuyGoodPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix(EconomyUI __instance)
+            public static bool Prefix(EconomyUI __instance, out HostMarketFeedState __state)
             {
+                __state = CaptureHostMarketState(__instance);
                 if (Plugin.IsMultiplayer && !Plugin.IsHost)
                 {
                     var currentIsland = Traverse.Create(__instance).Field("currentIsland").GetValue<IslandMarket>();
@@ -109,17 +160,29 @@ namespace SailwindCoop.Patches
                 }
                 return true;
             }
+
+            [HarmonyPostfix]
+            public static void Postfix(HostMarketFeedState __state)
+            {
+                if (!__state.Armed) return;
+                // A successful vanilla buy deducted the price from the selected wallet; a reject left it unchanged.
+                int paid = __state.WalletBefore - PlayerGold.currency[__state.Currency];
+                if (paid <= 0) return;
+                UI.TradeFeed.Report(SteamClient.SteamId, true, UI.TradeFeed.GoodDisplayName(__state.GoodIndex), paid, __state.Currency);
+            }
         }
 
         /// <summary>
         /// Intercept guest selling at market and route to host.
+        /// Host: vanilla runs; the Postfix reports the trade to the crew spending feed (see BuyGoodPatch).
         /// </summary>
         [HarmonyPatch(typeof(EconomyUI), "SellGood")]
         public static class SellGoodPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix(EconomyUI __instance)
+            public static bool Prefix(EconomyUI __instance, out HostMarketFeedState __state)
             {
+                __state = CaptureHostMarketState(__instance);
                 if (Plugin.IsMultiplayer && !Plugin.IsHost)
                 {
                     var currentIsland = Traverse.Create(__instance).Field("currentIsland").GetValue<IslandMarket>();
@@ -136,6 +199,16 @@ namespace SailwindCoop.Patches
                     return false;
                 }
                 return true;
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix(HostMarketFeedState __state)
+            {
+                if (!__state.Armed) return;
+                // A successful vanilla sell credited the price to the selected wallet; a reject left it unchanged.
+                int earned = PlayerGold.currency[__state.Currency] - __state.WalletBefore;
+                if (earned <= 0) return;
+                UI.TradeFeed.Report(SteamClient.SteamId, false, UI.TradeFeed.GoodDisplayName(__state.GoodIndex), earned, __state.Currency);
             }
         }
 
@@ -183,6 +256,16 @@ namespace SailwindCoop.Patches
             [HarmonyPostfix]
             public static void Postfix(Shopkeeper __instance, ShipItem item, int price)
             {
+                // Spending feed: the HOST's own stall sell runs pure vanilla and never reaches
+                // ExecuteShopTrade, so report it here. Guests' stall sells are reported host-side in
+                // ExecuteShopTrade, so no double-fire.
+                if (Plugin.IsMultiplayer && Plugin.IsHost && item != null)
+                {
+                    var hostRegion = Traverse.Create(__instance).Field("parentRegion").GetValue<Region>();
+                    int hostCurrency = hostRegion != null ? (int)hostRegion.portRegion : 0;
+                    UI.TradeFeed.Report(SteamClient.SteamId, false, UI.TradeFeed.CleanItemName(item.name), price, hostCurrency);
+                }
+
                 // Only for multiplayer guest
                 if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
                 if (item == null) return;
@@ -191,8 +274,7 @@ namespace SailwindCoop.Patches
                 var parentRegion = Traverse.Create(__instance).Field("parentRegion").GetValue<Region>();
                 if (parentRegion == null) return;
 
-                var port = parentRegion.GetComponentInParent<Port>();
-                int portIndex = port != null ? port.portIndex : 0;
+                int portIndex = ResolveShopkeeperPortIndex(__instance, parentRegion);
 
                 // Get good index from SaveablePrefab
                 var saveable = item.GetComponent<SaveablePrefab>();
@@ -209,7 +291,12 @@ namespace SailwindCoop.Patches
                     GoodIndex = goodIndex,
                     Price = price,
                     IsBuying = false,
-                    CurrencyIndex = -1,  // sell-to-shop has no selected currency here; -1 => host falls back to port region. MUST be set explicitly since the struct default 0 is a real wallet slot.
+                    // Credit the SAME wallet slot vanilla BuyItem just credited optimistically on this guest
+                    // (PlayerGold.currency[(int)parentRegion.portRegion], decomp Shopkeeper.cs:132-133). The old
+                    // -1 made the host fall back to Port.ports[PortIndex].region, which mis-resolved to slot 0
+                    // -> sale credited the wrong wallet, then the authoritative resync wiped the guest's
+                    // correct optimistic credit ("sold the item, got no money").
+                    CurrencyIndex = (int)parentRegion.portRegion,
                     PrefabIndex = prefabIndex   // carry the raw prefab index. Host doesn't spawn on a sell, but set explicitly so the struct default 0 isn't mistaken for a valid prefab.
                 };
 
@@ -303,11 +390,19 @@ namespace SailwindCoop.Patches
                 return saveable != null && saveable.prefabIndex > 0;
             }
 
+            // The display item's parent BEFORE vanilla Sell() reparents it to the FloatingOriginManager
+            // (decomp ShipItem.cs:511). Captured in the Prefix, threaded through the pending queue, and
+            // restored on a host REJECT. Restoring under the ShopArea transform instead (the old code)
+            // blew the item up to the ShopArea's lossyScale: ItemRigidbody.LateUpdate forces
+            // localScale = Vector3.one every frame for a loose item, so world scale = parent scale.
+            private static UnityEngine.Transform _preSellParent;
+
             [HarmonyPrefix]
             public static void Prefix(ShipItem item, out bool __state)
             {
                 __state = false; // did WE raise the remote-state guard?
                 if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
+                _preSellParent = item != null ? item.transform.parent : null;
                 if (!WillSpawnAuthoritatively(item)) return; // leave vanilla intact when no valid prefab to spawn
 
                 var sync = ItemSyncManager.Instance;
@@ -328,6 +423,11 @@ namespace SailwindCoop.Patches
                 // Only for multiplayer guest
                 if (!Plugin.IsMultiplayer || Plugin.IsHost)
                 {
+                    // Spending feed: the HOST's own stall buy runs pure vanilla (SellItem only fires
+                    // after the affordability gate, so reaching here IS success). Guests' stall buys
+                    // are reported host-side in ExecuteShopTrade, so no double-fire.
+                    if (Plugin.IsMultiplayer && Plugin.IsHost && item != null)
+                        UI.TradeFeed.Report(SteamClient.SteamId, true, UI.TradeFeed.CleanItemName(item.name), price, currency);
                     // (host/solo: nothing to restore - the Prefix never raised the guard)
                     return;
                 }
@@ -343,8 +443,7 @@ namespace SailwindCoop.Patches
                     var parentRegion = Traverse.Create(__instance).Field("parentRegion").GetValue<Region>();
                     if (parentRegion == null) return;
 
-                    var port = parentRegion.GetComponentInParent<Port>();
-                    int portIndex = port != null ? port.portIndex : 0;
+                    int portIndex = ResolveShopkeeperPortIndex(__instance, parentRegion);
 
                     // Get good index + RAW prefab index from SaveablePrefab. GoodIndex stays for the host's
                     // currency/economy logic; PrefabIndex is what the host actually spawns.
@@ -400,17 +499,18 @@ namespace SailwindCoop.Patches
                         // inbound), reject => restore it to the stall (un-sell + re-add to itemsForSale +
                         // return to shop position). The guard is still raised from the Prefix, so the
                         // GoPointer.DropItem / ShipItem.DestroyItem patches emit no packets either way.
-                        ParkOptimisticStallItem(item);
+                        ParkOptimisticStallItem(item, _preSellParent);
                     }
                     else
                     {
                         // FIFO pairing: this request still gets a host verdict, so park a null
                         // placeholder entry to keep verdicts aligned with their own buys (see queue below).
-                        ParkOptimisticStallItem(null);
+                        ParkOptimisticStallItem(null, null);
                     }
                 }
                 finally
                 {
+                    _preSellParent = null;
                     // Restore the remote-state guard LAST (after suppression), exactly if WE raised it. Nested
                     // toggles inside SuppressOptimisticStallItem restore to their own captured prior (== true here),
                     // so this is the single authoritative reset back to the real prior value.
@@ -430,14 +530,20 @@ namespace SailwindCoop.Patches
             {
                 public ShipItem Item;
                 public float Deadline;
+                public UnityEngine.Transform OriginalParent; // pre-Sell parent, for a scale-correct reject restore
             }
 
             private static readonly System.Collections.Generic.Queue<PendingStallBuy> _pendingStallBuys
                 = new System.Collections.Generic.Queue<PendingStallBuy>();
 
-            private static void ParkOptimisticStallItem(ShipItem item)
+            private static void ParkOptimisticStallItem(ShipItem item, UnityEngine.Transform originalParent)
             {
-                var entry = new PendingStallBuy { Item = item, Deadline = UnityEngine.Time.realtimeSinceStartup + 30f };
+                var entry = new PendingStallBuy
+                {
+                    Item = item,
+                    Deadline = UnityEngine.Time.realtimeSinceStartup + 30f,
+                    OriginalParent = originalParent
+                };
 
                 if (item != null)
                 {
@@ -482,7 +588,7 @@ namespace SailwindCoop.Patches
                 {
                     var expired = _pendingStallBuys.Dequeue();
                     Debug.VerboseLogger.Log("TRADING", "WARN", "No ShopTradeResult within timeout; settling parked stall item as bought (destroy)");
-                    SettleStallBuy(expired.Item, true);
+                    SettleStallBuy(expired.Item, true, expired.OriginalParent);
                     if (expired == entry) break;
                 }
             }
@@ -496,7 +602,10 @@ namespace SailwindCoop.Patches
             public static void ResetPendingStallBuys()
             {
                 while (_pendingStallBuys.Count > 0)
-                    SettleStallBuy(_pendingStallBuys.Dequeue().Item, true);
+                {
+                    var entry = _pendingStallBuys.Dequeue();
+                    SettleStallBuy(entry.Item, true, entry.OriginalParent);
+                }
             }
 
             /// <summary>
@@ -514,7 +623,8 @@ namespace SailwindCoop.Patches
                 // FIFO: verdicts arrive in request order (reliable channel), so this verdict belongs to the
                 // OLDEST pending entry. Safe no-op when nothing is pending (e.g. already timed out).
                 if (_pendingStallBuys.Count == 0) return;
-                SettleStallBuy(_pendingStallBuys.Dequeue().Item, success);
+                var settled = _pendingStallBuys.Dequeue();
+                SettleStallBuy(settled.Item, success, settled.OriginalParent);
 
                 // v0.2.20 vanilla hand-attach parity: vanilla ShipItem.Sell auto-picks the bought item into the
                 // buyer's hand (pointedAtBy.PickUpItem, decomp ShipItem.cs:514-517); the mod destroys that copy
@@ -570,7 +680,7 @@ namespace SailwindCoop.Patches
                 return fallback;
             }
 
-            private static void SettleStallBuy(ShipItem item, bool success)
+            private static void SettleStallBuy(ShipItem item, bool success, UnityEngine.Transform originalParent)
             {
                 if (item == null) return;
 
@@ -603,8 +713,11 @@ namespace SailwindCoop.Patches
 
                     // Re-add to the shop's for-sale list and snap back to the recorded stall position/rotation
                     // (private ShipItem.shopArea/shopPos/shopRot - the exact coords vanilla's
-                    // SmoothlyReturnToShop targets). Re-parent to the shop so it stays glued to the island
-                    // through floating-origin shifts (Sell() had re-parented it to the FloatingOriginManager).
+                    // SmoothlyReturnToShop targets). Re-parent to the item's PRE-Sell parent (island hierarchy,
+                    // unit scale) so it stays glued to the island through floating-origin shifts. NEVER parent
+                    // under the ShopArea transform itself: it is a scaled trigger volume and
+                    // ItemRigidbody.LateUpdate forces localScale = Vector3.one every frame for a loose item, so
+                    // the item would inherit the ShopArea's lossyScale (the "giant un-inspectable item" bug).
                     var shopArea = t.Field("shopArea").GetValue<ShopArea>();
                     item.gameObject.SetActive(true);
                     if (shopArea != null)
@@ -613,9 +726,14 @@ namespace SailwindCoop.Patches
                             shopArea.itemsForSale.Add(item);
                         var shopPos = t.Field("shopPos").GetValue<UnityEngine.Vector3>();
                         var shopRot = t.Field("shopRot").GetValue<UnityEngine.Quaternion>();
-                        item.transform.parent = shopArea.transform;
+                        item.transform.SetParent(
+                            originalParent != null ? originalParent : shopArea.transform.parent,
+                            worldPositionStays: true);
                         item.transform.position = shopArea.transform.TransformPoint(shopPos);
                         item.transform.rotation = shopRot;
+                        // Belt-and-braces: the restored parent chain is unit-scale, so this matches what
+                        // ItemRigidbody.LateUpdate re-asserts every frame anyway.
+                        item.transform.localScale = UnityEngine.Vector3.one;
                     }
                     // Refresh the look text back to the for-sale label (private in some builds - via Traverse).
                     try { t.Method("UpdateLookText").GetValue(); } catch { }

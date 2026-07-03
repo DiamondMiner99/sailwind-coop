@@ -418,6 +418,76 @@ namespace SailwindCoop.Patches
 
         #endregion
 
+        #region Nail Sync
+
+        /// <summary>
+        /// Patch ShipItemHammer.NailItem to sync nailing. NailItem has early-return failure paths
+        /// (not on floor, still moving), so only send when the flag actually flipped to true.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemHammer), "NailItem")]
+        [HarmonyPostfix]
+        public static void OnNailItem(ShipItem item)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+            if (item == null || !item.nailed) return;
+
+            var prefab = item.GetComponent<SaveablePrefab>();
+            if (prefab == null || prefab.instanceId == 0) return;
+
+            SendNailState(prefab.instanceId, true);
+        }
+
+        /// <summary>
+        /// Patch ShipItemHammer.OnAltActivate to sync un-nailing. The instant un-nail path flips
+        /// pointedAtItem.nailed true->false inside the original, so capture the pointed-at item
+        /// in a prefix and compare after.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemHammer), "OnAltActivate")]
+        [HarmonyPrefix]
+        public static void OnHammerAltActivatePrefix(ShipItemHammer __instance, out ShipItem __state)
+        {
+            __state = null;
+            if (!Plugin.IsMultiplayer) return;
+            if (__instance.held == null) return;
+
+            var pointedAt = __instance.held.GetPointedAtItem();
+            if (pointedAt != null && pointedAt.nailed)
+                __state = pointedAt;
+        }
+
+        [HarmonyPatch(typeof(ShipItemHammer), "OnAltActivate")]
+        [HarmonyPostfix]
+        public static void OnHammerAltActivatePostfix(ShipItem __state)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+            if (__state == null || __state.nailed) return; // was nailed before, still nailed => no un-nail happened
+
+            var prefab = __state.GetComponent<SaveablePrefab>();
+            if (prefab == null || prefab.instanceId == 0) return;
+
+            SendNailState(prefab.instanceId, false);
+        }
+
+        private static void SendNailState(int instanceId, bool nailed)
+        {
+            var packet = new NailStatePacket
+            {
+                ItemInstanceId = instanceId,
+                Nailed = nailed
+            };
+
+            VerboseLogger.Log("ITEM", "SEND", $"NailState, itemId={instanceId}, nailed={nailed}");
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.NailState, w =>
+            {
+                PacketSerializer.WriteNailState(w, packet);
+            });
+        }
+
+        #endregion
+
         #region Light Sync
 
         /// <summary>

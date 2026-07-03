@@ -26,6 +26,9 @@ namespace SailwindCoop.Networking
         private Lobby? _currentLobby;
         private bool _isInitialized;
         private float _lastInviteToastTime = -999f; // throttle the "invited you to co-op" toast
+        // Ids the HOST invited via the in-game menu this lobby; the admission gate in
+        // HandleLobbyMemberJoined only admits these (unless AllowCrewInvites). Cleared per lobby.
+        private readonly HashSet<SteamId> _hostSentInvites = new HashSet<SteamId>();
 
         public bool IsInLobby => _currentLobby.HasValue;
 
@@ -216,11 +219,17 @@ namespace SailwindCoop.Networking
                 }
 
                 var lobby = lobbyResult.Value;
-                lobby.SetFriendsOnly();
+                // PRIVATE, not FriendsOnly (2026-07-02 access-control report): a Steam friends-only
+                // lobby is visible and DIRECTLY joinable by friends of ANY member - a guest's friend,
+                // a total stranger to the host, clicked "Join Game" on the guest and boarded the crew.
+                // Private = invisible + joinable only through an invite; who gets admitted past an
+                // invite is then enforced host-side in HandleLobbyMemberJoined.
+                lobby.SetPrivate();
                 lobby.SetData("name", $"{SteamClient.Name}'s Sailwind Voyage");
                 lobby.SetData("version", Plugin.PluginVersion);
                 lobby.SetJoinable(true);
 
+                _hostSentInvites.Clear();
                 _currentLobby = lobby;
                 InvalidateRoleCache();
 
@@ -281,6 +290,7 @@ namespace SailwindCoop.Networking
             var lobbyId = _currentLobby.Value.Id;
             _currentLobby.Value.Leave();
             _currentLobby = null;
+            _hostSentInvites.Clear();
             InvalidateRoleCache();
 
             Plugin.Log.LogInfo($"Left lobby: {lobbyId}");
@@ -299,6 +309,10 @@ namespace SailwindCoop.Networking
 
             if (result)
             {
+                // Record HOST-sent invites: the admission gate in HandleLobbyMemberJoined only admits
+                // ids on this list (unless AllowCrewInvites). Guests inviting via the Steam overlay
+                // bypass this method entirely, which is exactly why the gate exists.
+                _hostSentInvites.Add(friendId);
                 Plugin.Log.LogInfo($"Invited friend: {friendId}");
             }
             else
@@ -355,6 +369,24 @@ namespace SailwindCoop.Networking
         private void HandleLobbyMemberJoined(Lobby lobby, Friend friend)
         {
             VerboseLogger.LobbyEvent($"Player joined: {friend.Name} ({friend.Id})");
+
+            // HOST ADMISSION GATE (2026-07-02): only the HOST's own invitees are admitted unless the
+            // host opted into AllowCrewInvites. Steam cannot kick a lobby member, but admission is what
+            // matters: an unadmitted member never gets OnPlayerJoined, so the host never peers with
+            // them and never sends the join state - their join times out and their mod warn-and-quits
+            // them. The gate runs only on the HOST (guests' handlers are visual/roster-side and follow
+            // the host's session state).
+            if (Plugin.IsHost
+                && Plugin.AllowCrewInvitesConfig?.Value != true
+                && friend.Id != SteamClient.SteamId
+                && !_hostSentInvites.Contains(friend.Id))
+            {
+                string name = string.IsNullOrEmpty(friend.Name) ? friend.Id.ToString() : friend.Name;
+                Plugin.Log.LogWarning($"[LOBBY] REFUSED admission for {name} ({friend.Id}): not invited by the host (a crew member invited them; enable AllowCrewInvites in the config to permit this)");
+                Plugin.Notify($"{name} tried to join but wasn't invited by you - not admitted. (Config: AllowCrewInvites)", 10f);
+                return;
+            }
+
             OnPlayerJoined?.Invoke(friend);
         }
 

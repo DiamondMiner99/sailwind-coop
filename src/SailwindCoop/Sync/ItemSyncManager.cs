@@ -30,6 +30,13 @@ namespace SailwindCoop.Sync
         private Dictionary<int, ShipItem> _remoteHeldItems = new Dictionary<int, ShipItem>();
 
         /// <summary>
+        /// Active deferred-collider disarm sweeps, keyed by item instanceId (E ship-spaz fix).
+        /// Drop/resync paths call StopColliderDisarmSweep before re-enabling colliders so a
+        /// mid-flight sweep cannot re-disable what the drop just restored.
+        /// </summary>
+        private Dictionary<int, Coroutine> _colliderDisarmSweeps = new Dictionary<int, Coroutine>();
+
+        /// <summary>
         /// Tracks items in each guest's inventory for disconnect cleanup (host only).
         /// Partitioned per holder so ONE guest leaving drops only its own items,
         /// not every connected guest's. Outer key: holder SteamId; inner set: that holder's item
@@ -623,8 +630,9 @@ namespace SailwindCoop.Sync
                             rb.angularVelocity = Vector3.zero;
                         }
 
-                        // Enable colliders
-                        foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
+                        // Enable colliders (children too - pickup disarm disables subcollider children)
+                        StopColliderDisarmSweep(packet.InstanceId);
+                        foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
                             col.enabled = true;
 
                         // Enable ItemRigidbody component
@@ -671,8 +679,9 @@ namespace SailwindCoop.Sync
                             rb.angularVelocity = Vector3.zero;
                         }
 
-                        // Enable colliders
-                        foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
+                        // Enable colliders (children too - pickup disarm disables subcollider children)
+                        StopColliderDisarmSweep(packet.InstanceId);
+                        foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
                             col.enabled = true;
 
                         // Enable ItemRigidbody component
@@ -1940,6 +1949,8 @@ namespace SailwindCoop.Sync
                     // G: a fishing rod's bobber/line lives OUTSIDE the rod hierarchy (world-parented);
                     // park it kinematic+inactive BEFORE the hide or it falls through the earth.
                     FishingSyncManager.SyncExternalRodParts(item, stowed: true);
+                    // C: the chip log's bobber/line is world-parented too; park it the same way.
+                    ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: true);
                     item.gameObject.SetActive(false);
                     VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} hidden (in remote inventory slot {packet.InventorySlot})");
                 }
@@ -1949,6 +1960,7 @@ namespace SailwindCoop.Sync
                     item.gameObject.SetActive(true);
                     // G: restore the rod's external bobber/line if a previous slot update parked it.
                     FishingSyncManager.SyncExternalRodParts(item, stowed: false);
+                    ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: false);
 
                     // REMOTE HELD ITEM PHYSICS FIX:
                     // When a player holds an item locally, the game sets held=GoPointer which triggers:
@@ -1962,30 +1974,7 @@ namespace SailwindCoop.Sync
                     // SOLUTION: Disable the ItemRigidbody MonoBehaviour entirely while item is remotely held.
                     // This stops its Update/FixedUpdate from running, so our settings persist.
                     // Re-enabled in OnRemoteItemDropped when the item is released.
-
-                    // Set held to non-null so ShipItem thinks item is held
-                    item.held = Object.FindObjectOfType<GoPointer>();
-
-                    var rb = item.GetComponent<Rigidbody>();
-                    if (rb != null) rb.isKinematic = true;
-
-                    if (item.itemRigidbodyC != null)
-                    {
-                        item.itemRigidbodyC.enabled = false;
-
-                        var irbRb = item.itemRigidbodyC.GetComponent<Rigidbody>();
-                        if (irbRb != null) irbRb.isKinematic = true;
-
-                        // Disable ALL colliders (some items like barrel/mug have multiple)
-                        foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
-                            col.enabled = false;
-                    }
-
-                    // Also disable the ShipItem's OWN trigger collider (ShipItem.Awake
-                    // forces it isTrigger=true; it lives on the ShipItem object, NOT itemRigidbodyC). While the
-                    // host drives a guest-held item along the remote avatar, that live trigger would enter a
-                    // real land Shopkeeper's trigger and pop a SELL menu for the guest's item on the host.
-                    SetShipItemOwnTriggers(item, false);
+                    DisarmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
 
                     VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} now following remote player (physics disabled)");
                 }
@@ -2213,6 +2202,7 @@ namespace SailwindCoop.Sync
                 // G: a rod dropped straight out of a remote inventory must get its parked external
                 // bobber/line back (positioning below moves the rod; the bobber re-snaps via its joint).
                 FishingSyncManager.SyncExternalRodParts(item, stowed: false);
+                ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: false);
 
                 // Clear the fake held reference we set during pickup
                 item.held = null;
@@ -2323,8 +2313,10 @@ namespace SailwindCoop.Sync
                             // Let physics run (not kinematic) so items fall naturally
                         }
 
-                        // Re-enable ALL colliders (was disabled during pickup)
-                        foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
+                        // Re-enable ALL colliders (was disabled during pickup; children too - the
+                        // pickup disarm disables subcollider children, vanilla never re-enables them)
+                        StopColliderDisarmSweep(packet.ItemInstanceId);
+                        foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
                             col.enabled = true;
 
                         // 5. Re-enable ItemRigidbody LAST (after all fields and parenting set)
@@ -2397,8 +2389,10 @@ namespace SailwindCoop.Sync
                             rb.angularVelocity = Vector3.zero;
                         }
 
-                        // Re-enable ALL colliders (was disabled during pickup)
-                        foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
+                        // Re-enable ALL colliders (was disabled during pickup; children too - the
+                        // pickup disarm disables subcollider children, vanilla never re-enables them)
+                        StopColliderDisarmSweep(packet.ItemInstanceId);
+                        foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
                             col.enabled = true;
 
                         // Re-enable ItemRigidbody
@@ -2449,6 +2443,7 @@ namespace SailwindCoop.Sync
                         {
                             // Moving to inventory - hide (G: park the rod's world-parented bobber first)
                             FishingSyncManager.SyncExternalRodParts(existingItem, stowed: true);
+                            ChipLogSyncManager.SyncExternalChipLogParts(existingItem, stowed: true);
                             existingItem.gameObject.SetActive(false);
                             VerboseLogger.ItemApply($"Host hiding guest item {packet.ItemInstanceId} (moved to inventory slot {packet.InventorySlot})");
                         }
@@ -2457,6 +2452,7 @@ namespace SailwindCoop.Sync
                             // Moving to hand - show (G: restore the rod's parked bobber after)
                             existingItem.gameObject.SetActive(true);
                             FishingSyncManager.SyncExternalRodParts(existingItem, stowed: false);
+                            ChipLogSyncManager.SyncExternalChipLogParts(existingItem, stowed: false);
                             VerboseLogger.ItemApply($"Host showing guest item {packet.ItemInstanceId} (moved to hand)");
                         }
                     }
@@ -2625,6 +2621,7 @@ namespace SailwindCoop.Sync
                 // Item is in guest's inventory - hide it (G: park the rod's world-parented bobber BEFORE
                 // the hide, or it stays a live non-kinematic rigidbody and falls through the earth)
                 FishingSyncManager.SyncExternalRodParts(item, stowed: true);
+                ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: true);
                 item.gameObject.SetActive(false);
                 VerboseLogger.ItemApply($"Host hiding guest item {packet.ItemInstanceId} (in inventory slot {packet.InventorySlot})");
             }
@@ -2634,30 +2631,12 @@ namespace SailwindCoop.Sync
                 item.gameObject.SetActive(true);
                 // G: restore the rod's parked bobber if an earlier stow parked it.
                 FishingSyncManager.SyncExternalRodParts(item, stowed: false);
+                ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: false);
 
                 // REMOTE HELD ITEM PHYSICS FIX (see detailed comment in OnRemoteItemPickedUp):
                 // Disable ItemRigidbody component to prevent game from resetting physics settings.
                 // Without this, held items knock other objects around on the viewer's screen.
-
-                item.held = Object.FindObjectOfType<GoPointer>();
-
-                var rb = item.GetComponent<Rigidbody>();
-                if (rb != null) rb.isKinematic = true;
-
-                if (item.itemRigidbodyC != null)
-                {
-                    item.itemRigidbodyC.enabled = false;
-
-                    var irbRb = item.itemRigidbodyC.GetComponent<Rigidbody>();
-                    if (irbRb != null) irbRb.isKinematic = true;
-
-                    // Disable ALL colliders (some items like barrel/mug have multiple)
-                    foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
-                        col.enabled = false;
-                }
-
-                // Disable the ShipItem's OWN trigger collider too (see OnRemoteItemPickedUp).
-                SetShipItemOwnTriggers(item, false);
+                DisarmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
 
                 VerboseLogger.ItemApply($"Host tracking guest-held item {packet.ItemInstanceId}");
             }
@@ -2704,6 +2683,108 @@ namespace SailwindCoop.Sync
                     OnRemoteItemDropped(skipped.Packet);
                 }
             }
+        }
+
+        /// <summary>
+        /// E (ship-spaz): physics-disarm a remotely held item, shared by the host approval path and the
+        /// guest OnRemoteItemPickedUp path. Vanilla ItemRigidbody.Start creates the Rigidbody
+        /// synchronously but adds its box/mesh/capsule colliders in a DEFERRED AddCollider coroutine
+        /// (3 WaitForFixedUpdate + WaitForEndOfFrame, ~60-110ms) which keeps running even after
+        /// itemRigidbodyC.enabled=false. The v0.2.22 instant stall-buy picks the item up within that
+        /// window, so a one-shot disable here finds ZERO colliders; they then spawn ENABLED on a
+        /// kinematic body that UpdateRemoteHeldItemVisuals teleports every frame - carrying it into a
+        /// hull depenetrates the boat (moored-ship spaz/sink). Also, vanilla CreateSubcollider puts
+        /// ItemSubcollider copies on CHILD GameObjects, which GetComponents missed unconditionally.
+        /// Fix: disarm via GetComponentsInChildren(true) AND run a short fixed-step sweep that disables
+        /// any collider AddCollider adds late. Drop paths re-enable via GetComponentsInChildren too.
+        /// </summary>
+        private void DisarmRemoteHeldItemPhysics(ShipItem item, int instanceId)
+        {
+            // Set held to non-null so ShipItem thinks item is held
+            item.held = Object.FindObjectOfType<GoPointer>();
+
+            var rb = item.GetComponent<Rigidbody>();
+            if (rb != null) rb.isKinematic = true;
+
+            if (item.itemRigidbodyC != null)
+            {
+                item.itemRigidbodyC.enabled = false;
+
+                var irbRb = item.itemRigidbodyC.GetComponent<Rigidbody>();
+                if (irbRb != null) irbRb.isKinematic = true;
+
+                // Disable ALL colliders, including inactive CHILD objects (barrel/mug multiples
+                // live on the itemRigidbodyC object; ItemSubcollider copies live on children)
+                foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
+                    col.enabled = false;
+            }
+
+            // Disable the ShipItem's OWN trigger collider (ShipItem.Awake forces it isTrigger=true;
+            // it lives on the ShipItem object, NOT itemRigidbodyC). While this machine drives a
+            // remotely held item along the avatar, that live trigger would enter a real land
+            // Shopkeeper's trigger and pop a SELL menu for the holder's item here.
+            SetShipItemOwnTriggers(item, false);
+
+            StartColliderDisarmSweep(item, instanceId);
+        }
+
+        /// <summary>
+        /// Start (or restart) the deferred-collider disarm sweep for an item. Keyed on instanceId so
+        /// a re-pickup replaces the old sweep and drop paths can stop it.
+        /// </summary>
+        private void StartColliderDisarmSweep(ShipItem item, int instanceId)
+        {
+            StopColliderDisarmSweep(instanceId);
+            _colliderDisarmSweeps[instanceId] = StartCoroutine(DisarmWhenCollidersAppear(item, instanceId));
+        }
+
+        /// <summary>
+        /// Stop the disarm sweep for an item, if one is running. Called by every drop/resync path
+        /// right before it re-enables colliders, so the sweep cannot fight the re-enable.
+        /// </summary>
+        private void StopColliderDisarmSweep(int instanceId)
+        {
+            if (_colliderDisarmSweeps.TryGetValue(instanceId, out var existing))
+            {
+                if (existing != null) StopCoroutine(existing);
+                _colliderDisarmSweeps.Remove(instanceId);
+            }
+        }
+
+        /// <summary>
+        /// E (ship-spaz): for up to ~90 fixed steps after a remote pickup, disable any collider that
+        /// vanilla's deferred AddCollider coroutine creates AFTER the one-shot disarm ran. Bails as
+        /// soon as the item leaves _remoteHeldItems (dropped/stowed) so it never fights a drop apply.
+        /// </summary>
+        private IEnumerator DisarmWhenCollidersAppear(ShipItem item, int instanceId)
+        {
+            // AddCollider finishes within ~4 frames of spawn, but 90 steps (~1.8s) covers
+            // hitching frame rates and items picked up moments after a laggy spawn apply.
+            for (int step = 0; step < 90; step++)
+            {
+                yield return new WaitForFixedUpdate();
+
+                // Item no longer remotely held (or replaced by a different ShipItem under the same
+                // id): the drop path owns collider state now - stop touching it.
+                if (!_remoteHeldItems.TryGetValue(instanceId, out var tracked) || !ReferenceEquals(tracked, item))
+                    break;
+                if (item == null || item.itemRigidbodyC == null)
+                    break;
+
+                foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
+                {
+                    if (col.enabled)
+                    {
+                        col.enabled = false;
+                        VerboseLogger.ItemApply($"Disarm sweep disabled late collider {col.GetType().Name} on remotely held item {instanceId}");
+                    }
+                }
+
+                var irbRb = item.itemRigidbodyC.GetComponent<Rigidbody>();
+                if (irbRb != null && !irbRb.isKinematic) irbRb.isKinematic = true;
+            }
+
+            _colliderDisarmSweeps.Remove(instanceId);
         }
 
         #endregion
@@ -3441,6 +3522,88 @@ namespace SailwindCoop.Sync
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        /// <summary>
+        /// Called when receiving NailState packet (hammer nail/un-nail).
+        /// Just flips ShipItem.nailed - ItemRigidbody re-evaluates isKinematic from it every
+        /// FixedUpdate, and GoPointer's pickup block reads it directly.
+        /// </summary>
+        public void OnRemoteNailState(NailStatePacket packet, SteamId sender = default)
+        {
+            VerboseLogger.ItemRecv($"NailState, itemId={packet.ItemInstanceId}, nailed={packet.Nailed}");
+
+            // Star-relay: forward to the other guests (reliable).
+            if (Plugin.IsHost)
+                Plugin.NetworkManager.SendToAllExcept(sender, PacketType.NailState, w =>
+                    PacketSerializer.WriteNailState(w, packet));
+
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (item == null)
+            {
+                Plugin.Log.LogWarning($"OnRemoteNailState: item {packet.ItemInstanceId} not found");
+                return;
+            }
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                item.nailed = packet.Nailed;
+
+                // Kill residual motion before the next FixedUpdate flips the body kinematic,
+                // so an un-nail later does not release it with a stale velocity.
+                if (packet.Nailed)
+                {
+                    var body = item.GetItemRigidbody()?.GetBody();
+                    if (body != null)
+                    {
+                        body.velocity = Vector3.zero;
+                        body.angularVelocity = Vector3.zero;
+                    }
+                }
+
+                VerboseLogger.ItemApply($"Applied nail state: id={packet.ItemInstanceId}, nailed={packet.Nailed}");
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+        }
+
+        /// <summary>
+        /// Host-only: replays every currently-nailed item's state to ONE peer after its join finished.
+        /// The join snapshot always applies items with nailed=false (NetworkSaveData carries no nail flag,
+        /// kept for 0.2.22 wire compat), so this targeted NailState burst is what makes nailed items
+        /// kinematic for a late joiner.
+        /// </summary>
+        public void ResyncNailedStateTo(SteamId target)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+
+            int sent = 0;
+            foreach (var prefab in Object.FindObjectsOfType<SaveablePrefab>())
+            {
+                // id==0 GUARD: unsold vendor-table items all share instanceId==0 and are unaddressable.
+                if (prefab.instanceId == 0) continue;
+
+                var item = prefab.GetComponent<ShipItem>();
+                if (item == null || !item.sold || !item.nailed) continue;
+
+                var packet = new NailStatePacket
+                {
+                    ItemInstanceId = prefab.instanceId,
+                    Nailed = true
+                };
+
+                VerboseLogger.ItemSend($"NailState (join resync), id={prefab.instanceId}, target={target}");
+
+                Plugin.NetworkManager.SendReliable(target, PacketType.NailState, w =>
+                    PacketSerializer.WriteNailState(w, packet));
+                sent++;
+            }
+
+            if (sent > 0)
+                Plugin.Log.LogInfo($"[ITEMS] Nailed-state resync to {target}: {sent} item(s) resent");
         }
 
         /// <summary>
@@ -4308,6 +4471,7 @@ namespace SailwindCoop.Sync
 
             // G: a leaver's inventory-stashed rod gets its parked external bobber/line restored too.
             FishingSyncManager.SyncExternalRodParts(item, stowed: false);
+            ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: false);
 
             // Clear the fake held reference we set during pickup
             item.held = null;
@@ -4341,8 +4505,10 @@ namespace SailwindCoop.Sync
                     rb.angularVelocity = Vector3.zero;
                 }
 
-                // Re-enable ALL colliders (was disabled during pickup)
-                foreach (var col in item.itemRigidbodyC.GetComponents<Collider>())
+                // Re-enable ALL colliders (was disabled during pickup; children too - the
+                // pickup disarm disables subcollider children, vanilla never re-enables them)
+                StopColliderDisarmSweep(instanceId);
+                foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
                     col.enabled = true;
 
                 // Re-enable ItemRigidbody

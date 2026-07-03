@@ -157,6 +157,18 @@ namespace SailwindCoop.Networking.Packets
     }
 
     /// <summary>
+    /// Syncs an item being nailed/un-nailed with the hammer.
+    /// Sent on ShipItemHammer.NailItem (Nailed=true) and the OnAltActivate un-nail path (Nailed=false).
+    /// The receiver just flips ShipItem.nailed; ItemRigidbody re-evaluates kinematic every FixedUpdate.
+    /// </summary>
+    [Serializable]
+    public struct NailStatePacket
+    {
+        public int ItemInstanceId;
+        public bool Nailed;
+    }
+
+    /// <summary>
     /// Syncs pipe being filled with tobacco.
     /// Sent when player loads tobacco into a pipe via LoadTobacco().
     /// TobaccoType: 1=cigarette(white), 2=cigar(green), 3=pipe(black), 4=hookah(brown)

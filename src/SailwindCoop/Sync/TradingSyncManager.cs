@@ -698,6 +698,8 @@ namespace SailwindCoop.Sync
 
                 VerboseLogger.Log("TRADING", "EXEC", $"Market BUY: good={goodIndex}, price={price}, currency={currency}, itemId={spawned.GetComponent<SaveablePrefab>()?.instanceId}");
                 SendMarketTradeResult(requester, true, 0, currency, price, true); // guest-sounds: gold sound + money notif
+                // Spending feed: guest market buy executed here on the host - broadcast the crew feed line.
+                SailwindCoop.UI.TradeFeed.Report(requester, true, SailwindCoop.UI.TradeFeed.GoodDisplayName(goodIndex), price, currency);
             }
             else
             {
@@ -728,6 +730,8 @@ namespace SailwindCoop.Sync
 
                 VerboseLogger.Log("TRADING", "EXEC", $"Market SELL: good={goodIndex}, price={price}, currency={currency}");
                 SendMarketTradeResult(requester, true, 0, currency, price, false); // guest-sounds: gold sound + money notif
+                // Spending feed: guest market sell executed here on the host.
+                SailwindCoop.UI.TradeFeed.Report(requester, false, SailwindCoop.UI.TradeFeed.GoodDisplayName(goodIndex), price, currency);
             }
 
             // Send immediate supply sync after any trade
@@ -841,6 +845,11 @@ namespace SailwindCoop.Sync
             // is never debited and the buyer keeps the item for free.
             int currency = (packet.CurrencyIndex >= 0 && PlayerGold.currency != null && packet.CurrencyIndex < PlayerGold.currency.Length)
                 ? packet.CurrencyIndex : region;
+            // Guest sells always carry an explicit CurrencyIndex since v0.2.23 (the -1 fallback credited the
+            // wrong wallet slot when PortIndex mis-resolved). A -1 sell now means an outdated client - warn so
+            // any regression is visible in one grep.
+            if (!packet.IsBuying && packet.CurrencyIndex < 0)
+                VerboseLogger.Log("TRADING", "WARN", $"ShopSell arrived with CurrencyIndex=-1 (outdated client?); falling back to port region {region}");
 
             // Validate and deduct currency
             if (packet.IsBuying)
@@ -884,12 +893,16 @@ namespace SailwindCoop.Sync
                 // authoritative ItemSpawned from SpawnAuthoritativeStallItem is the canonical item).
                 // spawnedItemId (0 on the no-prefab degrade path) lets the buyer auto-pick it up.
                 SendShopTradeResult(sender, true, 0, currency, packet.Price, spawnedItemId);
+                // Spending feed: guest stall buy charged here on the host.
+                SailwindCoop.UI.TradeFeed.Report(sender, true, StallItemDisplayName(packet), packet.Price, currency);
             }
             else
             {
                 // Guest sold to shop - host adds currency
                 PlayerGold.currency[currency] += packet.Price;
                 VerboseLogger.Log("TRADING", "EXEC", $"ShopSell added {packet.Price} to currency {currency}");
+                // Spending feed: guest stall sell credited here on the host.
+                SailwindCoop.UI.TradeFeed.Report(sender, false, StallItemDisplayName(packet), packet.Price, currency);
             }
 
             // Log transaction to DayLog
@@ -897,6 +910,15 @@ namespace SailwindCoop.Sync
 
             // Try to update island economy if host is at same island
             TryUpdateIslandEconomy(packet);
+        }
+
+        /// <summary>Display name for a stall trade's item: raw prefab index first (goods AND non-good
+        /// stall items), the good index as the outdated-client fallback.</summary>
+        private static string StallItemDisplayName(ShopTradeRequestPacket packet)
+        {
+            return packet.PrefabIndex > 0
+                ? SailwindCoop.UI.TradeFeed.PrefabDisplayName(packet.PrefabIndex)
+                : SailwindCoop.UI.TradeFeed.GoodDisplayName(packet.GoodIndex);
         }
 
         /// <summary>

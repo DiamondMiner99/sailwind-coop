@@ -28,6 +28,20 @@ namespace SailwindCoop.Sync
         private const float TempLineSyncInterval = 0.2f; // 5Hz
         private float _lastTempLineSyncTime;
 
+        // === Chart Kit Ghost Sync ===
+
+        // Active charting sessions (itemId -> session), tracked on EVERY peer for ghost teardown;
+        // the HOST additionally uses it to replay Active sessions to late joiners and to broadcast
+        // terminal Active=false when the drawer drops.
+        private Dictionary<int, ChartSessionPacket> _activeChartSessions = new Dictionary<int, ChartSessionPacket>();
+
+        private const float ChartCursorSyncInterval = 0.1f; // 10Hz
+        private const float ChartCursorCoalesceDelta = 0.001f; // chart units of movement before a resend
+        private float _lastChartCursorSendTime;
+        private float _lastSentCursorX;
+        private float _lastSentCursorY;
+        private byte _lastSentCursorTool = 255; // sentinel so the first cursor always sends
+
         private void Awake()
         {
             if (Instance != null)
@@ -425,6 +439,11 @@ namespace SailwindCoop.Sync
             {
                 _mapDrawingLocks.Remove(packet.ItemInstanceId);
             }
+
+            // Belt-and-suspenders ghost teardown: the drawer sends ChartSession(Active=false) at
+            // DisableMapCam too, but a release always means the session is over.
+            _activeChartSessions.Remove(packet.ItemInstanceId);
+            ChartKitGhostManager.Instance?.EndSession(packet.ItemInstanceId);
         }
 
         /// <summary>
@@ -649,6 +668,134 @@ namespace SailwindCoop.Sync
             VerboseLogger.NavApply($"Map full sync applied, item={packet.ItemInstanceId}, lines={foldable.mapChart.chartData.lines.Count}");
         }
 
+        // === Chart Kit Ghost Sync ===
+
+        /// <summary>
+        /// Called by the drawing player's own client when a charting session starts (EnableMapCam)
+        /// or ends (DisableMapCam). Broadcasts ChartSession so bystanders show/tear down the ghost kit.
+        /// </summary>
+        public void OnLocalChartSession(int itemInstanceId, bool active, int kitPos)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (IsApplyingRemoteState) return;
+            if (itemInstanceId == 0) return;
+
+            var packet = new ChartSessionPacket
+            {
+                ItemInstanceId = itemInstanceId,
+                Active = active,
+                KitPos = (sbyte)kitPos,
+                UserSteamId = SteamClient.SteamId
+            };
+
+            if (active)
+            {
+                _activeChartSessions[itemInstanceId] = packet;
+                // Reset the cursor coalescer so the new session's first cursor always sends.
+                _lastSentCursorTool = 255;
+            }
+            else
+            {
+                _activeChartSessions.Remove(itemInstanceId);
+            }
+
+            VerboseLogger.NavSend($"ChartSession, item={itemInstanceId}, active={active}, kitPos={kitPos}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.ChartSession, w =>
+                PacketSerializer.WriteChartSession(w, packet));
+        }
+
+        /// <summary>
+        /// Called by the drawing player's own client with the chart-local cursor position
+        /// (UpdateQuill postfix). Unreliable, 10Hz, coalesced on sub-millimeter movement.
+        /// </summary>
+        public void OnLocalChartCursor(int itemInstanceId, byte tool, float cursorX, float cursorY)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (IsApplyingRemoteState) return;
+            if (itemInstanceId == 0) return;
+
+            if (Time.time - _lastChartCursorSendTime < ChartCursorSyncInterval) return;
+            if (tool == _lastSentCursorTool
+                && Mathf.Abs(cursorX - _lastSentCursorX) < ChartCursorCoalesceDelta
+                && Mathf.Abs(cursorY - _lastSentCursorY) < ChartCursorCoalesceDelta) return;
+
+            _lastChartCursorSendTime = Time.time;
+            _lastSentCursorX = cursorX;
+            _lastSentCursorY = cursorY;
+            _lastSentCursorTool = tool;
+
+            var packet = new ChartCursorPacket
+            {
+                ItemInstanceId = itemInstanceId,
+                Tool = tool,
+                CursorX = cursorX,
+                CursorY = cursorY
+            };
+
+            Plugin.NetworkManager.SendToAllUnreliable(PacketType.ChartCursor, w =>
+                PacketSerializer.WriteChartCursor(w, packet));
+        }
+
+        public void OnRemoteChartSession(ChartSessionPacket packet, SteamId sender = default)
+        {
+            VerboseLogger.NavRecv($"ChartSession, item={packet.ItemInstanceId}, active={packet.Active}, user={packet.UserSteamId}");
+
+            // Star-relay: forward to the other guests so all bystanders show the ghost kit.
+            if (Plugin.IsHost)
+                Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ChartSession, w =>
+                    PacketSerializer.WriteChartSession(w, packet));
+
+            // Our own session echoed back (e.g. via relay) - the real rig is on screen, no ghost.
+            if (packet.UserSteamId == SteamClient.SteamId) return;
+
+            if (packet.Active)
+                _activeChartSessions[packet.ItemInstanceId] = packet;
+            else
+                _activeChartSessions.Remove(packet.ItemInstanceId);
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                if (packet.Active)
+                    ChartKitGhostManager.Instance?.StartSession(packet.ItemInstanceId, packet.UserSteamId, packet.KitPos);
+                else
+                    ChartKitGhostManager.Instance?.EndSession(packet.ItemInstanceId);
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+        }
+
+        public void OnRemoteChartCursor(ChartCursorPacket packet, SteamId sender = default)
+        {
+            // Star-relay: forward to the other guests (UNRELIABLE to match the original send).
+            if (Plugin.IsHost)
+                Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ChartCursor, w =>
+                    PacketSerializer.WriteChartCursor(w, packet), reliable: false);
+
+            // No IsApplyingRemoteState wrap needed: this only feeds the ghost's target fields,
+            // no vanilla code paths (and thus no patched send paths) run.
+            ChartKitGhostManager.Instance?.OnCursor(packet);
+        }
+
+        /// <summary>
+        /// Late-join replay (host-only): re-send every Active charting session to a joining guest,
+        /// alongside SendMapFullSyncToGuest, so a joiner sees a mid-session ghost kit.
+        /// </summary>
+        public void ReplayActiveChartSessionsTo(ulong guestSteamId)
+        {
+            if (!Plugin.IsHost) return;
+
+            foreach (var kvp in _activeChartSessions)
+            {
+                var packet = kvp.Value;
+                VerboseLogger.NavSend($"ChartSession replay, item={packet.ItemInstanceId}, user={packet.UserSteamId}, to={guestSteamId}");
+                Plugin.NetworkManager.SendReliable(guestSteamId, PacketType.ChartSession, w =>
+                    PacketSerializer.WriteChartSession(w, packet));
+            }
+        }
+
         // === Utility ===
 
         private PickupableItem FindItemByInstanceId(int instanceId)
@@ -676,6 +823,28 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void OnPeerLeft(SteamId leaver)
         {
+            // Ghost teardown runs on EVERY peer (a dropped drawer never sends its terminal
+            // ChartSession(Active=false), so its ghost kit would sit on the map forever).
+            ChartKitGhostManager.Instance?.OnPeerLeft(leaver.Value);
+
+            if (Plugin.IsHost)
+            {
+                // Host: broadcast the terminal session-end the leaver never sent, so all remaining
+                // guests tear their ghosts down too.
+                List<int> leaverSessions = new List<int>();
+                foreach (var kvp in _activeChartSessions)
+                    if (kvp.Value.UserSteamId == leaver.Value) leaverSessions.Add(kvp.Key);
+                foreach (var itemInstanceId in leaverSessions)
+                {
+                    var session = _activeChartSessions[itemInstanceId];
+                    _activeChartSessions.Remove(itemInstanceId);
+                    session.Active = false;
+                    Plugin.NetworkManager.SendToAllReliable(PacketType.ChartSession, w =>
+                        PacketSerializer.WriteChartSession(w, session));
+                    VerboseLogger.NavEvent($"OnPeerLeft {leaver}: broadcast terminal ChartSession end for item {itemInstanceId}");
+                }
+            }
+
             if (!Plugin.IsHost) return;
 
             // Collect first - we mutate _mapDrawingLocks in the loop below.
@@ -711,6 +880,9 @@ namespace SailwindCoop.Sync
         {
             _mapDrawingLocks.Clear();
             _lastTempLineSyncTime = 0f;
+            _activeChartSessions.Clear();
+            _lastChartCursorSendTime = 0f;
+            _lastSentCursorTool = 255;
         }
     }
 }

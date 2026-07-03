@@ -1,7 +1,9 @@
+using System.Collections.Generic;
 using HarmonyLib;
 using SailwindCoop.Debug;
 using SailwindCoop.Networking.Packets;
 using SailwindCoop.Sync;
+using Steamworks;
 using UnityEngine;
 
 namespace SailwindCoop.Patches
@@ -92,6 +94,21 @@ namespace SailwindCoop.Patches
 
         #region Guest Interactions - Stove Food
 
+        // Per-foodId send cooldowns (Time.time). Guest triggers keep firing while the local copy never
+        // enters a trigger (place: overlapping slot triggers double-fire same frame + ~30s OnTriggerEnter
+        // re-send loop; remove: CookableFood.Update fires TakeOutOfCooker every frame at ~45Hz while the
+        // host holds the food). 1.5s still allows a retry if the host genuinely rejected.
+        private const float RequestCooldown = 1.5f;
+        private static readonly Dictionary<int, float> _lastPlaceRequest = new Dictionary<int, float>();
+        private static readonly Dictionary<int, float> _lastRemoveRequest = new Dictionary<int, float>();
+
+        /// <summary>Lobby-leave/teardown hygiene (called from CookingSyncManager.Reset).</summary>
+        public static void ResetRequestCooldowns()
+        {
+            _lastPlaceRequest.Clear();
+            _lastRemoveRequest.Clear();
+        }
+
         /// <summary>
         /// Intercept CookableFood.InsertIntoCookTrigger on guest - send request to host.
         /// </summary>
@@ -103,12 +120,37 @@ namespace SailwindCoop.Patches
             if (Plugin.IsHost) return true;
             if (CookingSyncManager.Instance?.IsApplyingRemoteState == true) return true;
 
+            // Already in a slot locally (host state said so via CookingState apply) - this is an echo
+            // of an existing placement, never forward it to the host. EXCEPT when the LOCAL player is
+            // holding the food: after a self pickup the stale trigger lingers until the next
+            // CookingState apply (the TakeOutOfCooker prefix below suppresses vanilla for self-held
+            // food), and a stove click inside that window is a legitimate re-placement the host
+            // already knows how to handle (it frees the old slot before re-inserting).
+            if (__instance.isInTrigger())
+            {
+                var shipItem = __instance.GetComponent<ShipItem>();
+                bool heldLocally = shipItem != null && shipItem.held != null;
+                if (heldLocally && ItemSyncManager.Instance != null)
+                {
+                    // ItemSyncManager fakes held non-null for REMOTE-held food; only a self hold counts.
+                    var holder = ItemSyncManager.Instance.GetItemHolder(__instance.GetComponent<SaveablePrefab>()?.instanceId ?? 0);
+                    if (holder.Value != 0 && holder.Value != SteamClient.SteamId.Value)
+                        heldLocally = false;
+                }
+                if (!heldLocally) return false;
+            }
+
             // Guest: send request to host
             var foodPrefab = __instance.GetComponent<SaveablePrefab>();
             var stove = trigger.GetComponentInParent<ShipItemStove>();
             var stovePrefab = stove?.GetComponent<SaveablePrefab>();
 
             if (foodPrefab == null || stovePrefab == null) return true;
+
+            float lastSent;
+            if (_lastPlaceRequest.TryGetValue(foodPrefab.instanceId, out lastSent) && Time.time - lastSent < RequestCooldown)
+                return false;
+            _lastPlaceRequest[foodPrefab.instanceId] = Time.time;
 
             var packet = new FoodPlaceOnStoveRequestPacket
             {
@@ -139,6 +181,21 @@ namespace SailwindCoop.Patches
 
             var foodPrefab = __instance.GetComponent<SaveablePrefab>();
             if (foodPrefab == null) return true;
+
+            // A REMOTE player holds this food (host picked it up but the guest's trigger is still set
+            // until the next 2Hz CookingState apply): clear the local trigger via vanilla immediately
+            // instead of spamming remove requests the host must reject ("food not found or not in stove").
+            if (ItemSyncManager.Instance != null)
+            {
+                var holder = ItemSyncManager.Instance.GetItemHolder(foodPrefab.instanceId);
+                if (holder.Value != 0 && holder.Value != SteamClient.SteamId.Value)
+                    return true;
+            }
+
+            float lastSent;
+            if (_lastRemoveRequest.TryGetValue(foodPrefab.instanceId, out lastSent) && Time.time - lastSent < RequestCooldown)
+                return false;
+            _lastRemoveRequest[foodPrefab.instanceId] = Time.time;
 
             var packet = new FoodRemoveFromStoveRequestPacket
             {

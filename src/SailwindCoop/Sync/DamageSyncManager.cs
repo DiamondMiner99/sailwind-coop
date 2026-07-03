@@ -376,8 +376,15 @@ namespace SailwindCoop.Sync
         {
             if (Plugin.IsHost) return;
 
-            var boat = GameState.lastBoat;
-            var boatName = boat?.name ?? "";
+            // A: vanilla applies oakum to GameState.currentBoat.parent (the boat the player is ON),
+            // not lastBoat - using lastBoat let a guest ashore repair the boat he last stood on.
+            var boat = BoatUtility.GetCurrentBoat();
+            if (boat == null)
+            {
+                Plugin.Log.LogWarning("[DAMAGE] Oakum repair request dropped: not aboard a boat");
+                return;
+            }
+            var boatName = boat.name;
 
             var packet = new GuestOakumRepairPacket
             {

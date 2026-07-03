@@ -22,13 +22,37 @@ namespace SailwindCoop.Sync
         private HashSet<int> _hookedRods = new HashSet<int>();
 
         // K1: rods that have been CAST (bobber out) but not necessarily hooked. Vanilla pays the line out
-        // via the auto-unroll in ShipItemFishingRod.Update, which only runs on the OWNER's machine (viewer
-        // rods have held=false -> currentMinVelocity=99999), so without streaming the viewer's line stays
-        // at minLength from cast until the first FishingState at the bite. Owned rods in
-        // (_castRods U _hookedRods) stream FishingLineLength at 5Hz, coalesced by LineLengthCoalesceDelta.
+        // via the auto-unroll in ShipItemFishingRod.Update, which only unrolls meaningfully on the OWNER's
+        // machine (the viewer's bobber is never launched, so its joint sees no pull; note viewer rods do
+        // NOT have held=false - ItemSyncManager fakes a non-null `held` on remote-held items, which is why
+        // vanilla's held-gated code, including the FishingRodFish bite roll, still runs on viewers). Without
+        // streaming, the viewer's line stays at minLength from cast until the first FishingState at the
+        // bite. Owned rods in (_castRods U _hookedRods) stream FishingLineLength at 5Hz, coalesced by
+        // LineLengthCoalesceDelta.
         private readonly HashSet<int> _castRods = new HashSet<int>();
         private readonly Dictionary<int, float> _lastSentLineLength = new Dictionary<int, float>();
         private const float LineLengthCoalesceDelta = 0.25f; // metres of change before a resend
+
+        // B (bobber stream, send side): the bobber launch is emergent local physics on the owner
+        // (measured rod angular velocity + the owner's camera forward, decomp ShipItemFishingRod
+        // :264-289), so a viewer's bobber never leaves the rod - it dangles vertically through the
+        // deck, puts floater.InWater=true under the boat and mislocates the hooked-fish mesh. Owned
+        // rods in (_castRods U _hookedRods) stream the bobber position at 5Hz, coalesced on world
+        // movement > BobberCoalesceDelta.
+        private readonly Dictionary<int, Vector3> _lastSentBobberPos = new Dictionary<int, Vector3>();
+        private const float BobberCoalesceDelta = 0.5f; // metres of world movement before a resend
+
+        // B (receive side): remote-owned bobbers are made kinematic (joint/float forces ignored) and
+        // lerped to the streamed target every frame; a boat-frame target tracks the boat between
+        // packets. Keyed by rod instanceId.
+        private class RemoteBobberState
+        {
+            public Rigidbody Body;
+            public Transform BoatModel; // null = world frame
+            public Vector3 TargetLocal; // boat-local, or world minus floating-origin offset
+        }
+        private readonly Dictionary<int, RemoteBobberState> _remoteBobbers = new Dictionary<int, RemoteBobberState>();
+        private readonly List<int> _remoteBobberRemovalScratch = new List<int>();
 
         // Vanilla hardcodes this in ShipItemFishingRod.OnLoad (decomp :103); fallback if the private
         // field reads back zero (e.g. called before OnLoad ran on this copy).
@@ -54,6 +78,8 @@ namespace SailwindCoop.Sync
         private void Update()
         {
             if (!Plugin.IsMultiplayer) return;
+
+            UpdateRemoteBobbers();
 
             // Sync hooked rod state at 5Hz
             if (Time.time - _lastStateSyncTime >= StatesSyncInterval)
@@ -135,24 +161,24 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// K1/K2: 5Hz line-length streaming for the local player's CAST rods (union with hooked rods, so
-        /// the line keeps converging even in the hooked window between FishingState ticks). Coalesced:
-        /// only resends when the limit moved more than LineLengthCoalesceDelta since the last send.
+        /// K1/K2 + B: 5Hz line-length AND bobber-position streaming for the local player's CAST rods
+        /// (union with hooked rods, so both keep converging even in the hooked window between
+        /// FishingState ticks). Each stream is coalesced independently.
         /// </summary>
         private void SyncCastRodLineLengths()
         {
             if (_castRods.Count == 0 && _hookedRods.Count == 0) return;
 
             foreach (var rodId in _castRods)
-                SyncOneCastRodLineLength(rodId);
+                SyncOneCastRod(rodId);
             foreach (var rodId in _hookedRods)
             {
                 if (!_castRods.Contains(rodId))
-                    SyncOneCastRodLineLength(rodId);
+                    SyncOneCastRod(rodId);
             }
         }
 
-        private void SyncOneCastRodLineLength(int rodId)
+        private void SyncOneCastRod(int rodId)
         {
             if (!IsLocalPlayerOwner(rodId)) return;
 
@@ -162,6 +188,12 @@ namespace SailwindCoop.Sync
             var bobberJoint = Traverse.Create(rod).Field("bobberJoint").GetValue<ConfigurableJoint>();
             if (bobberJoint == null) return;
 
+            SyncOneCastRodLineLength(rodId, bobberJoint);
+            SyncOneCastRodBobber(rodId, rod, bobberJoint);
+        }
+
+        private void SyncOneCastRodLineLength(int rodId, ConfigurableJoint bobberJoint)
+        {
             float len = bobberJoint.linearLimit.limit;
             if (_lastSentLineLength.TryGetValue(rodId, out var last) && Mathf.Abs(len - last) <= LineLengthCoalesceDelta)
                 return;
@@ -177,6 +209,120 @@ namespace SailwindCoop.Sync
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.FishingLineLengthSync, w =>
                 PacketSerializer.WriteFishingLineLength(w, packet));
+        }
+
+        /// <summary>
+        /// B: owner-side bobber position stream. Same boat-frame scheme as ItemSyncManager drops: the
+        /// rod's own latched boat, else the boat whose EmbarkCol the rod's trigger is inside, else the
+        /// caster's own boat (a HELD rod never latches currentActualBoat); world coords minus the
+        /// floating-origin offset when the caster is on land/dock.
+        /// </summary>
+        private void SyncOneCastRodBobber(int rodId, ShipItemFishingRod rod, ConfigurableJoint bobberJoint)
+        {
+            Vector3 worldPos = bobberJoint.transform.position;
+            if (_lastSentBobberPos.TryGetValue(rodId, out var last)
+                && (worldPos - last).sqrMagnitude <= BobberCoalesceDelta * BobberCoalesceDelta)
+                return;
+            _lastSentBobberPos[rodId] = worldPos;
+
+            Transform boatModel = rod.currentActualBoat;
+            if (boatModel == null)
+            {
+                try
+                {
+                    var col = Traverse.Create(rod).Field("currentlyStayedEmbarkCol").GetValue<Collider>();
+                    if (col != null) boatModel = col.transform.parent;
+                }
+                catch { }
+            }
+            if (boatModel == null) boatModel = GameState.currentBoat;
+
+            string boatName = "";
+            Vector3 position;
+            var boatSaveable = boatModel != null ? boatModel.parent?.GetComponent<SaveableObject>() : null;
+            if (boatSaveable != null)
+            {
+                boatName = boatSaveable.gameObject.name;
+                position = boatModel.InverseTransformPoint(worldPos);
+            }
+            else
+            {
+                var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
+                position = worldPos - offset;
+            }
+
+            byte inWater = 0;
+            try
+            {
+                // SimpleFloatingObject lives in Assembly-CSharp but also name-collides with a Crest
+                // type, so read InWater reflectively instead of referencing the type.
+                var fish = Traverse.Create(rod).Field("fish").GetValue<FishingRodFish>();
+                if (fish != null && Traverse.Create(fish).Field("floater").Property("InWater").GetValue<bool>())
+                    inWater = 1;
+            }
+            catch { }
+
+            var packet = new FishingBobberSyncPacket
+            {
+                RodInstanceId = rodId,
+                BoatName = boatName,
+                Position = position,
+                InWater = inWater
+            };
+
+            VerboseLogger.FishingSend($"BobberSync, rod={rodId}, boat={boatName}, pos={position}, inWater={inWater}", throttle: true);
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.FishingBobberSync, w =>
+                PacketSerializer.WriteFishingBobberSync(w, packet));
+        }
+
+        /// <summary>
+        /// B: per-frame convergence of remote-owned bobbers toward their streamed targets. Bodies are
+        /// kinematic while tracked, so this is the only thing moving them; a boat-frame target keeps
+        /// riding the boat between 5Hz samples.
+        /// </summary>
+        private void UpdateRemoteBobbers()
+        {
+            if (_remoteBobbers.Count == 0) return;
+
+            foreach (var kvp in _remoteBobbers)
+            {
+                var state = kvp.Value;
+                if (state.Body == null)
+                {
+                    _remoteBobberRemovalScratch.Add(kvp.Key);
+                    continue;
+                }
+
+                Vector3 target = state.BoatModel != null
+                    ? state.BoatModel.TransformPoint(state.TargetLocal)
+                    : state.TargetLocal + (FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero);
+
+                var t = state.Body.transform;
+                if ((target - t.position).sqrMagnitude > 100f)
+                    t.position = target; // teleport-scale divergence: snap instead of a long glide
+                else
+                    t.position = Vector3.Lerp(t.position, target, Mathf.Clamp01(10f * Time.deltaTime));
+            }
+
+            if (_remoteBobberRemovalScratch.Count > 0)
+            {
+                foreach (var id in _remoteBobberRemovalScratch)
+                    _remoteBobbers.Remove(id);
+                _remoteBobberRemovalScratch.Clear();
+            }
+        }
+
+        /// <summary>
+        /// B: stop tracking a remote-owned bobber and optionally hand it back to local joint physics.
+        /// restoreDynamic=false when the caller parks the bobber itself (remote stow).
+        /// </summary>
+        public void ClearRemoteBobber(int rodInstanceId, bool restoreDynamic)
+        {
+            if (!_remoteBobbers.TryGetValue(rodInstanceId, out var state)) return;
+            _remoteBobbers.Remove(rodInstanceId);
+            if (restoreDynamic && state.Body != null)
+                state.Body.isKinematic = false;
         }
 
         #endregion
@@ -207,19 +353,23 @@ namespace SailwindCoop.Sync
             int rodId = prefab.instanceId;
             ulong myId = SteamClient.SteamId.Value;
 
+            // Take ownership BEFORE the grab-steal ReleaseFish below: OnReleaseFishPrefix blocks
+            // non-owners and OnReleaseFishPostfix is now __runOriginal/owner-gated, so releasing
+            // while the previous owner is still registered would go fully silent (fish never
+            // escapes anywhere and _hookedRods goes stale).
+            var previousOwner = GetRodOwner(rodId);
+            SetRodOwner(rodId, myId);
+
             // Check if fish was hooked by previous owner - auto-escape
             var fish = Traverse.Create(rod).Field("fish").GetValue<FishingRodFish>();
             if (fish != null && fish.currentFish != null && !fish.fishDead)
             {
-                var previousOwner = GetRodOwner(rodId);
                 if (previousOwner != 0 && previousOwner != myId)
                 {
                     VerboseLogger.FishingEvent($"Rod grabbed from other player, fish escapes, rod={rodId}");
                     fish.ReleaseFish();
                 }
             }
-
-            SetRodOwner(rodId, myId);
 
             var packet = new RodOwnerChangedPacket
             {
@@ -252,9 +402,10 @@ namespace SailwindCoop.Sync
                     PacketSerializer.WriteFishEscape(w, escapePacket));
             }
 
-            // Rod left the hand: stop the cast-rod line stream for it (K1 bookkeeping).
+            // Rod left the hand: stop the cast-rod line/bobber streams for it (K1/B bookkeeping).
             _castRods.Remove(rodId);
             _lastSentLineLength.Remove(rodId);
+            _lastSentBobberPos.Remove(rodId);
 
             // Clear ownership
             SetRodOwner(rodId, 0);
@@ -339,6 +490,7 @@ namespace SailwindCoop.Sync
             // vanilla auto-unroll payout instead of a line stuck at minLength until the bite.
             _castRods.Add(rodId);
             _lastSentLineLength.Remove(rodId); // force the first stream tick to send
+            _lastSentBobberPos.Remove(rodId);  // ditto for the bobber stream (B)
 
             var packet = new FishingCastPacket
             {
@@ -360,9 +512,10 @@ namespace SailwindCoop.Sync
 
             int rodId = prefab.instanceId;
             MarkRodUnhooked(rodId);
-            // Collect gate guarantees the owner reeled to minLength; stop the cast stream.
+            // Collect gate guarantees the owner reeled to minLength; stop the cast streams.
             _castRods.Remove(rodId);
             _lastSentLineLength.Remove(rodId);
+            _lastSentBobberPos.Remove(rodId);
 
             // If host, process immediately
             if (Plugin.IsHost)
@@ -401,6 +554,7 @@ namespace SailwindCoop.Sync
             _castRods.Remove(rodId);
             _hookedRods.Remove(rodId);
             _lastSentLineLength.Remove(rodId);
+            _lastSentBobberPos.Remove(rodId);
 
             if (!IsLocalPlayerOwner(rodId)) return;
 
@@ -454,6 +608,12 @@ namespace SailwindCoop.Sync
 
                 if (stowed)
                 {
+                    // B: stop the remote-bobber lerp fighting the park below (keep it kinematic - the
+                    // park is intentional; the show branch restores dynamics).
+                    var rodPrefab = rod.GetComponent<SaveablePrefab>();
+                    if (rodPrefab != null)
+                        Instance?.ClearRemoteBobber(rodPrefab.instanceId, restoreDynamic: false);
+
                     // Park the bobber the way vanilla OnEnterInventory does, then fully hide it (the
                     // prefab's own supported unsold state, OnLoad :107, so deactivating is safe).
                     if (bobberRb != null) bobberRb.isKinematic = true;
@@ -497,6 +657,7 @@ namespace SailwindCoop.Sync
             _hookedRods.Remove(rodInstanceId);
             _castRods.Remove(rodInstanceId);
             _lastSentLineLength.Remove(rodInstanceId);
+            _lastSentBobberPos.Remove(rodInstanceId);
 
             var packet = new RodOwnerChangedPacket
             {
@@ -582,6 +743,10 @@ namespace SailwindCoop.Sync
             MarkRodUnhooked(rodId);
             _castRods.Remove(rodId);
             _lastSentLineLength.Remove(rodId);
+            _lastSentBobberPos.Remove(rodId);
+            // B: for a GUEST-owned rod the host is a viewer; release its kinematic bobber like
+            // OnFishCollectResponseReceived does on the other guests.
+            ClearRemoteBobber(rodId, restoreDynamic: true);
 
             VerboseLogger.FishingEvent($"Fish collected, rod={rodId}, fishItem={fishItemId}, hookConsumed={hookConsumed}");
             VerboseLogger.FishingSend($"FishCollectResponse, rod={rodId}, fishItem={fishItemId}, hookConsumed={hookConsumed}");
@@ -618,6 +783,11 @@ namespace SailwindCoop.Sync
 
             VerboseLogger.FishingRecv($"RodOwnerChanged, rod={packet.RodInstanceId}, owner={packet.NewOwnerId}");
             SetRodOwner(packet.RodInstanceId, packet.NewOwnerId);
+
+            // B: rod no longer remote-owned here (released, or ownership came to us) - hand the
+            // bobber back to local joint physics.
+            if (packet.NewOwnerId == 0 || packet.NewOwnerId == SteamClient.SteamId.Value)
+                ClearRemoteBobber(packet.RodInstanceId, restoreDynamic: true);
         }
 
         public void OnFishingCastReceived(FishingCastPacket packet, SteamId sender = default)
@@ -642,6 +812,71 @@ namespace SailwindCoop.Sync
                 rod.StartCoroutine("ThrowRod");
 
                 VerboseLogger.FishingApply($"FishingCast applied, rod={packet.RodInstanceId}");
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+        }
+
+        public void OnFishingBobberSyncReceived(FishingBobberSyncPacket packet, SteamId sender = default)
+        {
+            // Star-relay: forward BEFORE the owner early-return so the host (not the owner) still relays.
+            if (Plugin.IsHost)
+                Plugin.NetworkManager.SendToAllExcept(sender, PacketType.FishingBobberSync, w =>
+                    PacketSerializer.WriteFishingBobberSync(w, packet));
+
+            if (IsLocalPlayerOwner(packet.RodInstanceId)) return; // Owner's bobber is the source of truth
+
+            VerboseLogger.FishingRecv($"BobberSync, rod={packet.RodInstanceId}, boat={packet.BoatName}, pos={packet.Position}, inWater={packet.InWater}", throttle: true);
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                var rod = FindRodByInstanceId(packet.RodInstanceId);
+                if (rod == null) return;
+
+                var bobberJoint = Traverse.Create(rod).Field("bobberJoint").GetValue<ConfigurableJoint>();
+                if (bobberJoint == null || !bobberJoint.gameObject.activeInHierarchy) return; // remotely stowed
+
+                var body = bobberJoint.GetComponent<Rigidbody>();
+                if (body == null) return;
+
+                Transform boatModel = null;
+                if (!string.IsNullOrEmpty(packet.BoatName))
+                {
+                    var boat = BoatUtility.FindBoatByName(packet.BoatName);
+                    boatModel = boat != null ? boat.GetComponent<BoatRefs>()?.boatModel : null;
+                    if (boatModel == null)
+                    {
+                        // Applying a boat-local pos in the wrong frame is worse than a dropped sample.
+                        VerboseLogger.FishingEvent($"BobberSync boat '{packet.BoatName}' not found, sample dropped, rod={packet.RodInstanceId}");
+                        return;
+                    }
+                }
+
+                body.isKinematic = true;
+
+                bool firstSample = !_remoteBobbers.TryGetValue(packet.RodInstanceId, out var state);
+                if (firstSample)
+                {
+                    state = new RemoteBobberState();
+                    _remoteBobbers[packet.RodInstanceId] = state;
+                }
+                state.Body = body;
+                state.BoatModel = boatModel;
+                state.TargetLocal = packet.Position;
+
+                if (firstSample)
+                {
+                    // The local bobber is wherever local physics dropped it (typically dangling under
+                    // the deck); a cut to the streamed spot beats a long visible glide through the hull.
+                    body.transform.position = boatModel != null
+                        ? boatModel.TransformPoint(packet.Position)
+                        : packet.Position + (FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero);
+                }
+
+                VerboseLogger.FishingApply($"BobberSync applied, rod={packet.RodInstanceId}");
             }
             finally
             {
@@ -855,6 +1090,10 @@ namespace SailwindCoop.Sync
                 }
 
                 MarkRodUnhooked(packet.RodInstanceId);
+                // B: owner stops streaming after a collect (rod leaves _castRods/_hookedRods there);
+                // the collect gate guarantees the line is at minLength, so joint physics parks the
+                // bobber at the rod tip once it is dynamic again.
+                ClearRemoteBobber(packet.RodInstanceId, restoreDynamic: true);
                 VerboseLogger.FishingApply($"FishCollect applied, rod={packet.RodInstanceId}");
             }
             finally
@@ -867,10 +1106,21 @@ namespace SailwindCoop.Sync
 
         public void Reset()
         {
+            // Hand remote-driven bobbers back to physics before dropping tracking: the LOCAL player is
+            // leaving, so no stream will ever un-kinematic them again (vanilla only restores in
+            // OnLeaveInventory), and the rods stay in this continuing local session.
+            if (_remoteBobbers.Count > 0)
+            {
+                var trackedIds = new List<int>(_remoteBobbers.Keys);
+                foreach (var id in trackedIds)
+                    ClearRemoteBobber(id, restoreDynamic: true);
+            }
+
             _rodOwners.Clear();
             _hookedRods.Clear();
             _castRods.Clear();
             _lastSentLineLength.Clear();
+            _lastSentBobberPos.Clear();
             _lastStateSyncTime = 0f;
         }
 
@@ -917,8 +1167,9 @@ namespace SailwindCoop.Sync
                     }
                 }
 
-                // Clear ownership
+                // Clear ownership; the leaver's bobber stream is gone, return the bobber to physics.
                 _rodOwners.Remove(rodId);
+                ClearRemoteBobber(rodId, restoreDynamic: true);
             }
 
             VerboseLogger.FishingEvent($"Player disconnect cleanup, player={steamId}, rodsReleased={rodsToRelease.Count}");

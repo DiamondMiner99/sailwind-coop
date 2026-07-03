@@ -1718,6 +1718,27 @@ namespace SailwindCoop.Networking.Packets
         }
 
         /// <summary>
+        /// Serialize nail state change.
+        /// </summary>
+        public static void WriteNailState(BinaryWriter writer, NailStatePacket packet)
+        {
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.Nailed);
+        }
+
+        /// <summary>
+        /// Deserialize nail state change.
+        /// </summary>
+        public static NailStatePacket ReadNailState(BinaryReader reader)
+        {
+            return new NailStatePacket
+            {
+                ItemInstanceId = reader.ReadInt32(),
+                Nailed = reader.ReadBoolean()
+            };
+        }
+
+        /// <summary>
         /// Serialize pipe filled with tobacco.
         /// </summary>
         public static void WritePipeFilled(BinaryWriter writer, PipeFilledPacket packet)
@@ -2245,6 +2266,27 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteTradeFeedEvent(BinaryWriter writer, TradeFeedEventPacket packet)
+        {
+            writer.Write(packet.ActorSteamId);
+            writer.Write(packet.Flags);
+            writer.Write(packet.CurrencyIndex);
+            writer.Write(packet.Price);
+            writer.Write(packet.ItemName ?? ""); // Must mirror ReadTradeFeedEvent order
+        }
+
+        public static TradeFeedEventPacket ReadTradeFeedEvent(BinaryReader reader)
+        {
+            return new TradeFeedEventPacket
+            {
+                ActorSteamId = reader.ReadUInt64(),
+                Flags = reader.ReadByte(),
+                CurrencyIndex = reader.ReadByte(),
+                Price = reader.ReadInt32(),
+                ItemName = reader.ReadString()
+            };
+        }
+
         public static void WriteGuestJoinComplete(BinaryWriter writer, GuestJoinCompletePacket packet)
         {
             // No payload: the packet type plus the transport-level sender SteamId carry everything.
@@ -2527,6 +2569,55 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteFishingBobberSync(BinaryWriter w, FishingBobberSyncPacket p)
+        {
+            w.Write(p.RodInstanceId);
+            w.Write(p.BoatName ?? "");
+            WriteVector3(w, p.Position);
+            w.Write(p.InWater);
+        }
+
+        public static FishingBobberSyncPacket ReadFishingBobberSync(BinaryReader r)
+        {
+            return new FishingBobberSyncPacket
+            {
+                RodInstanceId = r.ReadInt32(),
+                BoatName = r.ReadString(),
+                Position = ReadVector3(r),
+                InWater = r.ReadByte()
+            };
+        }
+
+        public static void WriteChipLogThrow(BinaryWriter w, ChipLogThrowPacket p)
+        {
+            w.Write(p.ItemInstanceId);
+        }
+
+        public static ChipLogThrowPacket ReadChipLogThrow(BinaryReader r)
+        {
+            return new ChipLogThrowPacket
+            {
+                ItemInstanceId = r.ReadInt32()
+            };
+        }
+
+        public static void WriteChipLogLineSync(BinaryWriter w, ChipLogLineSyncPacket p)
+        {
+            w.Write(p.ItemInstanceId);
+            w.Write(p.LineLength);
+            w.Write(p.Thrown);
+        }
+
+        public static ChipLogLineSyncPacket ReadChipLogLineSync(BinaryReader r)
+        {
+            return new ChipLogLineSyncPacket
+            {
+                ItemInstanceId = r.ReadInt32(),
+                LineLength = r.ReadSingle(),
+                Thrown = r.ReadBoolean()
+            };
+        }
+
         #endregion
 
         #region Navigation Packets
@@ -2718,6 +2809,44 @@ namespace SailwindCoop.Networking.Packets
                 };
             }
             return p;
+        }
+
+        public static void WriteChartSession(BinaryWriter w, ChartSessionPacket p)
+        {
+            w.Write(p.ItemInstanceId);
+            w.Write(p.Active);
+            w.Write(p.KitPos);
+            w.Write(p.UserSteamId);
+        }
+
+        public static ChartSessionPacket ReadChartSession(BinaryReader r)
+        {
+            return new ChartSessionPacket
+            {
+                ItemInstanceId = r.ReadInt32(),
+                Active = r.ReadBoolean(),
+                KitPos = r.ReadSByte(),
+                UserSteamId = r.ReadUInt64()
+            };
+        }
+
+        public static void WriteChartCursor(BinaryWriter w, ChartCursorPacket p)
+        {
+            w.Write(p.ItemInstanceId);
+            w.Write(p.Tool);
+            w.Write(p.CursorX);
+            w.Write(p.CursorY);
+        }
+
+        public static ChartCursorPacket ReadChartCursor(BinaryReader r)
+        {
+            return new ChartCursorPacket
+            {
+                ItemInstanceId = r.ReadInt32(),
+                Tool = r.ReadByte(),
+                CursorX = r.ReadSingle(),
+                CursorY = r.ReadSingle()
+            };
         }
 
         #endregion

@@ -14,6 +14,58 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.23 - 2026-07-03
+
+> Security fix + the 2026-07-03 playtest fix batch + two new crew features. Joining
+> stays compatible with v0.2.22, but the new syncs (nailing, chip log, charting, spending
+> feed) only work between updated players - **everyone should update.**
+
+Security:
+
+- **Strangers can no longer walk into your crew.** The lobby was created as Steam
+  "friends-only", which lets friends of ANY crew member join directly - a guest's friend
+  (a total stranger to the host) boarded a live session that way. The lobby is now
+  **private** (invite-only), and by default the host only admits players the **host**
+  personally invited; anyone else who slips in via a crew member's Steam-overlay invite is
+  turned away with a notice to the host. Hosts who want the crew to bring friends can set
+  `AllowCrewInvites = true` in `BepInEx/config/com.sailwindcoop.mod.cfg`.
+
+Fixes:
+
+- **"Not enough money" no longer spawns a giant unusable item.** A rejected stall buy
+  re-shelved the item under the shop's (scaled) trigger volume, so it grew ~12x and could
+  no longer be picked up or inspected. It now returns to its real shelf spot at normal size.
+- **Crew get paid when they sell.** A guest's stall sale was credited to the wrong wallet
+  slot on the host, and the wallet sync then erased the money the seller saw locally.
+- **Stoves keep all 3 cooking slots.** Every crew member's game was echoing stove
+  placements back to the host, and each duplicate permanently ate a cook slot (one kettle
+  could consume all three) - it also cooked that food 2-3x too fast. Placements are now
+  deduplicated and already-degraded stoves self-repair.
+- **Buying an item and immediately carrying it aboard no longer flings the ship.** A newly
+  purchased item picked up within the first split second could keep solid physics colliders,
+  which then teleported into the hull with the carrier and violently shoved the boat
+  (the "ship spaz" / hull damage while sweeping).
+- **No more phantom fish.** Other players' games were rolling their own fish bites on your
+  rod (each observer saw a different random fish while you saw none) - bites now come only
+  from the rod's owner. Casts also no longer render as a line dangling straight down: the
+  bobber's real position is now streamed to everyone.
+- **Oakum can't be applied from the dock.** (It was silently repairing your last boat from
+  shore - vanilla requires being aboard, and now so does the mod.)
+
+New:
+
+- **Nailing syncs.** Hammer + nails now hold items down for the whole crew (and for late
+  joiners), and un-nailing syncs too.
+- **The chip log syncs.** Everyone sees the chip fly out, the line pay out, and the
+  speedometer read - not just the thrower.
+- **Charting is visible to the crew.** When someone uses the charting kit, others standing
+  at the table now see the kit set up on the map with a moving quill and ruler while they
+  draw. (Drawn lines already synced; now the act of drawing does.)
+- **Spending feed.** When a crew member buys or sells, everyone gets a quiet coin sound and
+  a small corner notice ("Name bought X for Y") that fades after a few seconds - so the
+  host can hear the shared wallet draining. Configurable via `SpendingFeed` and
+  `SpendingFeedVolume` under `[Coop]` in the config.
+
 ## v0.2.22 - 2026-07-02
 
 > **All players must update** (network format changed). The big fix batch from the

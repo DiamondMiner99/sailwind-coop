@@ -76,4 +76,20 @@ namespace SailwindCoop.Networking.Packets
         public int ItemInstanceId;
         public MapLinePacket[] Lines;
     }
+
+    public struct ChartSessionPacket
+    {
+        public int ItemInstanceId;
+        public bool Active;
+        public sbyte KitPos;      // -1=left, 0=top, 1=right (mirrors MapTableCamera kitPos)
+        public ulong UserSteamId; // who is charting (ghost ownership + disconnect cleanup)
+    }
+
+    public struct ChartCursorPacket
+    {
+        public int ItemInstanceId;
+        public byte Tool;   // 0=none, 1=quill, 2=protSmall, 3=protLarge
+        public float CursorX; // chart-local
+        public float CursorY;
+    }
 }

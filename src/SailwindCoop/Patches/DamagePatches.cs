@@ -135,6 +135,10 @@ namespace SailwindCoop.Patches
                 // (ShopkeeperTryToSellItemPatch) host-routes the purchase. Only the sold branch is a repair.
                 if (!__instance.sold) return true;
 
+                // A: vanilla only repairs when aboard (GameState.currentBoat != null); sold oakum used
+                // ashore is a no-op. Let vanilla run its no-op instead of routing a repair to lastBoat.
+                if (GameState.currentBoat == null) return true;
+
                 // Guest: send request to host instead of executing locally
                 var prefab = __instance.GetComponent<SaveablePrefab>();
                 if (prefab == null) return true;

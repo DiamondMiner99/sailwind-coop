@@ -209,7 +209,7 @@ namespace SailwindCoop.Patches
         /// </summary>
         [HarmonyPatch(typeof(MapTableCamera), "EnableMapCam")]
         [HarmonyPostfix]
-        public static void MapTableCamera_EnableMapCam_Postfix(ShipItem lookAtMap)
+        public static void MapTableCamera_EnableMapCam_Postfix(ShipItem lookAtMap, int kitPos)
         {
             if (!Plugin.IsMultiplayer) return;
             if (lookAtMap == null) return;
@@ -221,6 +221,10 @@ namespace SailwindCoop.Patches
             {
                 NavigationSyncManager.Instance?.LockMapForDrawing(instanceId);
             }
+
+            // Ghost kit: tell bystanders a charting session started here (kitPos = which map edge
+            // the ink set sits on, straight from the vanilla arg).
+            NavigationSyncManager.Instance?.OnLocalChartSession(instanceId, true, kitPos);
         }
 
         /// <summary>
@@ -256,6 +260,43 @@ namespace SailwindCoop.Patches
 
             NavigationSyncManager.Instance?.ReleaseMapDrawing(instanceId);
             NavigationSyncManager.Instance?.OnLocalMapTempLineCleared(instanceId);
+            NavigationSyncManager.Instance?.OnLocalChartSession(instanceId, false, 0);
+        }
+
+        /// <summary>
+        /// Ghost kit cursor stream: UpdateQuill runs every frame the drawer's look-raycast hits the
+        /// chart with the world-space hit point; convert to chart-local and stream it (the manager
+        /// throttles to 10Hz unreliable). The same point drives the ghost ruler's far end.
+        /// </summary>
+        [HarmonyPatch(typeof(MapTableCamera), "UpdateQuill")]
+        [HarmonyPostfix]
+        public static void MapTableCamera_UpdateQuill_Postfix(MapTableCamera __instance, Vector3 worldPos)
+        {
+            if (!Plugin.IsMultiplayer) return;
+
+            var foldable = __instance.currentMap as ShipItemFoldable;
+            var mapChart = foldable?.mapChart;
+            if (mapChart == null) return;
+
+            var instanceId = foldable.GetComponent<SaveablePrefab>()?.instanceId ?? 0;
+            if (instanceId == 0) return;
+
+            Vector3 local = mapChart.transform.InverseTransformPoint(worldPos);
+            // Vanilla LookRaycast calls UpdateQuill AND UpdateProt every frame with the same hit point,
+            // so this one postfix carries the whole cursor stream; derive the active tool here. The
+            // protractor zeroes currentLineColor (ChangeLineColor cases -2/-3), so check protActive too:
+            // prot scale one = large (3), 0.66 = small (2), matching ChartCursorPacket.Tool.
+            byte tool = (byte)(__instance.currentLineColor > 0 ? 1 : 0);
+            if (tool == 0)
+            {
+                var camT = Traverse.Create(__instance);
+                if (camT.Field("protActive").GetValue<bool>())
+                {
+                    var prot = camT.Field("prot").GetValue<Transform>();
+                    tool = (byte)(prot != null && prot.localScale == Vector3.one ? 3 : 2);
+                }
+            }
+            NavigationSyncManager.Instance?.OnLocalChartCursor(instanceId, tool, local.x, local.y);
         }
 
         /// <summary>

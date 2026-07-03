@@ -186,5 +186,28 @@ namespace SailwindCoop.Networking.Packets
         // Network diagnostics (200+): unreliable-path RTT measurement for the F8 overlay
         PingRequest = 200,               // Bidirectional: "echo this back" - carries sender's Time.realtimeSinceStartup
         PingReply = 201,                 // Bidirectional: verbatim echo of PingRequest.SendTime; receiver computes RTT
+
+        // Nail sync (202): hammer nail/un-nail state on a ShipItem
+        NailState = 202,                 // Bidirectional: item nailed (kinematic) or un-nailed; host relays
+
+        // Fishing bobber stream (203): the bobber launch is emergent local physics on the owner
+        // (rod angular velocity + owner camera forward), so viewers never reproduce it
+        FishingBobberSync = 203,         // Owner -> all: cast bobber position in boat frame (or world); host relays
+
+        // Chip log sync (204-205): the chip log throw/payout is entirely local physics in vanilla
+        // (thrown flag + line auto-unroll only run on the thrower's machine), so viewers see a
+        // parked bobber and a zero speedometer without these
+        ChipLogThrow = 204,              // Thrower -> all: chip log thrown (replays ThrowRod); host relays
+        ChipLogLineSync = 205,           // Thrower -> all: 5Hz line length + thrown flag stream; host relays
+
+        // Charting kit ghost (206-207): the map-drawing kit/quill/ruler are a per-client camera-mode
+        // rig on layer 23 in vanilla, so bystanders see nothing while a crewmate charts
+        ChartSession = 206,              // Drawer -> all (reliable): charting session start/stop + kit placement; host relays + replays to late joiners
+        ChartCursor = 207,               // Drawer -> all (UNRELIABLE, 10Hz coalesced): chart-local cursor for the ghost quill/ruler; host relays
+
+        // Crew spending feed (208): the host observes EVERY crew trade (its own vanilla trades plus
+        // every guest trade it executes), so only the host emits; guests never send this. Additive
+        // wire - v0.2.22 clients silently drop the unknown type.
+        TradeFeedEvent = 208,            // Host -> all guests: actor SteamId, buy/sell, item name, price, currency
     }
 }

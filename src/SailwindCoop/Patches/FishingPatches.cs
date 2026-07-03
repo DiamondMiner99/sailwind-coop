@@ -75,13 +75,22 @@ namespace SailwindCoop.Patches
         /// </summary>
         [HarmonyPatch(typeof(FishingRodFish), "CatchFish")]
         [HarmonyPostfix]
-        public static void OnCatchFishPostfix(FishingRodFish __instance)
+        public static void OnCatchFishPostfix(FishingRodFish __instance, bool __runOriginal)
         {
             if (!Plugin.IsMultiplayer) return;
+            // Harmony runs postfixes even when a prefix skipped the original: a CatchFish blocked
+            // by OnCatchFishPrefix (observer bite roll on a remote-owned rod) must never broadcast,
+            // or every non-owner gets a phantom FishBite(-1) -> random fish.
+            if (!__runOriginal) return;
             if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return;
 
             var rod = Traverse.Create(__instance).Field("rod").GetValue<ShipItemFishingRod>();
             if (rod == null) return;
+
+            // Defense in depth: only the rod's owner broadcasts bites.
+            var prefab = rod.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+            if (!FishingSyncManager.Instance.IsLocalPlayerOwner(prefab.instanceId)) return;
 
             // Get fish prefab index
             var currentFish = __instance.currentFish;
@@ -119,29 +128,51 @@ namespace SailwindCoop.Patches
         /// </summary>
         [HarmonyPatch(typeof(FishingRodFish), "ReleaseFish")]
         [HarmonyPostfix]
-        public static void OnReleaseFishPostfix(FishingRodFish __instance)
+        public static void OnReleaseFishPostfix(FishingRodFish __instance, bool __runOriginal)
         {
             if (!Plugin.IsMultiplayer) return;
+            // A ReleaseFish blocked by OnReleaseFishPrefix must never broadcast (phantom FishEscape
+            // from a non-owner can kill the owner's REAL fish). Same hole as OnCatchFishPostfix.
+            if (!__runOriginal) return;
             if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return;
 
             var rod = Traverse.Create(__instance).Field("rod").GetValue<ShipItemFishingRod>();
             if (rod == null) return;
 
+            // Defense in depth: only the rod's owner broadcasts escapes.
+            var prefab = rod.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+            if (!FishingSyncManager.Instance.IsLocalPlayerOwner(prefab.instanceId)) return;
+
             FishingSyncManager.Instance?.OnLocalFishEscape(rod);
         }
 
+        // Runs every frame per held rod: cached FieldRefs, not per-call Traverse (matches FishRodRef).
+        private static readonly AccessTools.FieldRef<ShipItemFishingRod, bool> RodActivatedRef =
+            AccessTools.FieldRefAccess<ShipItemFishingRod, bool>("activated");
+        private static readonly AccessTools.FieldRef<ShipItemFishingRod, bool> RodHoldingRef =
+            AccessTools.FieldRefAccess<ShipItemFishingRod, bool>("holding");
+        private static readonly AccessTools.FieldRef<ShipItemFishingRod, float> RodThrowChargeRef =
+            AccessTools.FieldRefAccess<ShipItemFishingRod, float>("throwCharge");
+
         /// <summary>
-        /// Patch ShipItemFishingRod.ThrowRod to sync cast event.
+        /// Sync cast event. Prefix on ExtraLateUpdate, NOT a ThrowRod postfix: vanilla zeroes
+        /// throwCharge BEFORE StartCoroutine(ThrowRod) (decomp ShipItemFishingRod.cs:376-381), so a
+        /// ThrowRod-side capture always read 0. (activated &amp;&amp; !holding) is exactly vanilla's
+        /// throw condition; snapshot the charge here, before the original consumes it. `activated`
+        /// is only ever set by local input, so remote cast replays never re-trigger this.
         /// </summary>
-        [HarmonyPatch(typeof(ShipItemFishingRod), "ThrowRod")]
-        [HarmonyPostfix]
-        public static void OnThrowRod(ShipItemFishingRod __instance)
+        [HarmonyPatch(typeof(ShipItemFishingRod), "ExtraLateUpdate")]
+        [HarmonyPrefix]
+        public static void OnRodExtraLateUpdatePrefix(ShipItemFishingRod __instance)
         {
             if (!Plugin.IsMultiplayer) return;
             if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return;
 
-            var throwCharge = Traverse.Create(__instance).Field("throwCharge").GetValue<float>();
-            FishingSyncManager.Instance?.OnLocalRodCast(__instance, throwCharge);
+            if (RodActivatedRef(__instance) && !RodHoldingRef(__instance))
+            {
+                FishingSyncManager.Instance?.OnLocalRodCast(__instance, RodThrowChargeRef(__instance));
+            }
         }
 
         /// <summary>

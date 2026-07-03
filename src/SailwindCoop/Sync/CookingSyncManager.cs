@@ -399,15 +399,40 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            // Find free slot
+            // Idempotency guard: every guest's local physics echoes the host's own placement (and
+            // re-sends while its local copy never enters a trigger), and vanilla InsertIntoCookTrigger
+            // overwrites currentTrigger WITHOUT clearing the old slot's currentFood - so each duplicate
+            // request permanently ate another cook slot (phantom-slot leak, "no free slot" with one item).
+            if (cookable.isInTrigger())
+            {
+                var currentTrigger = cookable.GetCurrentCookTrigger();
+                bool onThisStove = false;
+                foreach (var slot in stove.slots)
+                {
+                    if (slot == currentTrigger) { onThisStove = true; break; }
+                }
+                if (onThisStove)
+                {
+                    VerboseLogger.CookingEvent($"FoodPlaceOnStove ignored: food {packet.FoodInstanceId} already on stove {packet.StoveInstanceId} (duplicate request)");
+                    return;
+                }
+                // On a different stove - free that slot properly before re-inserting here
+                cookable.TakeOutOfCooker();
+            }
+
+            // Find free slot, self-healing phantom slots leaked by pre-fix duplicates: a slot whose
+            // currentFood no longer points back at it is unreachable by TakeOutOfCooker and would
+            // otherwise stay occupied forever (and multi-cook that food in ShipItemStove.AddHeat).
             StoveCookTrigger freeSlot = null;
             foreach (var slot in stove.slots)
             {
-                if (slot.currentFood == null)
+                if (slot.currentFood != null && slot.currentFood.GetCurrentCookTrigger() != slot)
                 {
-                    freeSlot = slot;
-                    break;
+                    VerboseLogger.CookingEvent($"FoodPlaceOnStove: cleared phantom slot on stove {packet.StoveInstanceId} (stale food ref)");
+                    slot.currentFood = null;
                 }
+                if (freeSlot == null && slot.currentFood == null)
+                    freeSlot = slot;
             }
 
             if (freeSlot == null)
@@ -958,6 +983,7 @@ namespace SailwindCoop.Sync
         public void Reset()
         {
             _lastSyncTime = 0f;
+            Patches.CookingPatches.ResetRequestCooldowns(); // stale instanceId keys must not leak into the next lobby
         }
     }
 }
