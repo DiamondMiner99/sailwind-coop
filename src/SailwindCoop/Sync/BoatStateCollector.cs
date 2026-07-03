@@ -244,6 +244,36 @@ namespace SailwindCoop.Sync
                 var shipItem = prefab.GetComponent<ShipItem>();
                 if (shipItem == null) continue;
 
+                // HELD-ITEM PHANTOM FIX (boat path, 2026-07-02): skip items currently in someone's hand.
+                // Same rationale as the CollectWorldItems held filter: a held item can still be
+                // boat-childed (ShipItem.EnterBoat parents it under the boat and holding does not
+                // re-parent it out), so it would be serialized as a loose boat item under the
+                // ORIGINAL's instanceId. Skipping BOTH serialization and itemIds registration means
+                // the joiner's synced set never contains the id, so the holder's next drop/pickup
+                // triggers the per-peer AnyPeerMissingSyncedItem backfill and spawn-syncs it cleanly.
+                if (shipItem.held != null)
+                {
+                    Plugin.Log.LogInfo($"[ITEM:COLLECT] Skipping in-hand boat item {prefab.name} (id={prefab.instanceId}) - held items are backfilled on drop, not serialized to joiners");
+                    continue;
+                }
+
+                // POCKET-INHERIT FIX (boat path, cluster B-pipe-not-synced): skip items stowed in the
+                // HOST's personal pockets while aboard. Vanilla never re-parents an item when it is
+                // pocketed (ItemRigidbody.EnterInventorySlot only disables the collider), so an item
+                // pocketed while standing ON the boat remains a child of the boat and is enumerated
+                // here instead of by CollectWorldItems' pocket filter. Serializing it puts the host's
+                // ghost into the JOINER's pocket slot (SaveablePrefab.Load -> PutInInventory), the
+                // join clean-slate destroys it, and because the id was registered as synced the
+                // pickup-time backfill never fires - every later ItemDropped/PipeFilled for that id
+                // no-ops on the guest for the whole session. Skip ONLY the genuine player-pocket
+                // range (0..99); boat CargoCarrier shelves (>=100) ARE shared boat state and are kept.
+                int invSlot = shipItem.GetCurrentInventorySlot();
+                if (invSlot >= 0 && invSlot < 100)
+                {
+                    Plugin.Log.LogInfo($"[ITEM:COLLECT] Skipping host pocket item {prefab.name} (id={prefab.instanceId}, slot={invSlot}) (boat-childed) - personal inventory is not synced to joiners");
+                    continue;
+                }
+
                 // Items loaded from save have instanceId=0; assign unique IDs so they can be synced.
                 if (prefab.instanceId == 0)
                 {
@@ -314,6 +344,8 @@ namespace SailwindCoop.Sync
                 // genuine player-pocket range (0..99); a loose ground/dock item returns -1 and is kept,
                 // and boat cargo (>=100) is left to the boat-item path. Read via the same accessor the rest
                 // of the mod uses (ItemSyncManager / ItemPatches reference GetCurrentInventorySlot).
+                // NOTE: CollectItems (boat path) enforces the same held + pocket filters, since an
+                // item pocketed while ABOARD stays boat-childed and is enumerated there instead.
                 int invSlot = shipItem.GetCurrentInventorySlot();
                 if (invSlot >= 0 && invSlot < 100)
                 {

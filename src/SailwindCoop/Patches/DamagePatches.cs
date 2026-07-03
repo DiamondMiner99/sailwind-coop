@@ -130,9 +130,22 @@ namespace SailwindCoop.Patches
             {
                 if (!Plugin.IsMultiplayer || Plugin.IsHost) return true;
 
+                // H: an UNSOLD oakum's OnAltActivate is the PURCHASE path (vanilla base.OnAltActivate ->
+                // Shopkeeper.TryToSellItem), not a repair. Let vanilla run so the guest stall-buy router
+                // (ShopkeeperTryToSellItemPatch) host-routes the purchase. Only the sold branch is a repair.
+                if (!__instance.sold) return true;
+
                 // Guest: send request to host instead of executing locally
                 var prefab = __instance.GetComponent<SaveablePrefab>();
                 if (prefab == null) return true;
+
+                // H hardening: an unregistered id=0 packet is doomed host-side (FindItemByInstanceId can't
+                // resolve the shared id=0 pool). Log and drop rather than desync via a local fallback.
+                if (prefab.instanceId == 0)
+                {
+                    Plugin.Log.LogWarning("[DAMAGE] Oakum repair skipped: item has unregistered instanceId=0 (legacy/scene oakum) - request not sent");
+                    return false;
+                }
 
                 DamageSyncManager.Instance?.SendOakumRepairRequest(prefab.instanceId);
 

@@ -182,5 +182,9 @@ namespace SailwindCoop.Networking.Packets
 
         // Guest join completion (199): explicit end-of-join signal for targeted resyncs
         GuestJoinComplete = 199,         // Guest -> Host: join coroutine finished; host replies with a targeted mission-cargo resync
+
+        // Network diagnostics (200+): unreliable-path RTT measurement for the F8 overlay
+        PingRequest = 200,               // Bidirectional: "echo this back" - carries sender's Time.realtimeSinceStartup
+        PingReply = 201,                 // Bidirectional: verbatim echo of PingRequest.SendTime; receiver computes RTT
     }
 }

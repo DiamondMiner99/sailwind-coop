@@ -26,7 +26,7 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.21";
+        public const string PluginVersion = "0.2.22";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -263,6 +263,10 @@ namespace SailwindCoop
         // Tracks the last disconnect notification time so the clean (OnPlayerLeft) and P2P-drop
         // (OnDisconnected) paths don't both toast for the same leave.
         private static float _lastDisconnectNotifyTime = -10f;
+
+        // F8-overlay ping loop cadence (seconds, realtime clock so pauses don't stall it).
+        private const float PingInterval = 2f;
+        private static float _lastPingSendTime = -10f;
 
         // #8: the P2P-disconnect handler, stored so it can be RE-SUBSCRIBED each time OnLobbyLeft recreates the
         // NetworkManager. A one-time inline subscription was bound to the first (now shut-down) manager, so every
@@ -1250,6 +1254,24 @@ namespace SailwindCoop
                 ItemSyncManager?.ResyncMissionCargoTo(sender);
             });
 
+            // Ping loop (F8 overlay diagnostics). Both legs are UNRELIABLE on purpose: the number
+            // should measure the same path the high-rate gameplay sync uses, and a lost probe just
+            // means no sample until the next 2s cycle. SendTime is the REQUESTER's clock echoed back
+            // verbatim, so only the requester's own Time.realtimeSinceStartup is ever compared.
+            NetworkManager.RegisterHandler(PacketType.PingRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadPingRequest(reader);
+                NetworkManager?.SendUnreliable(sender, PacketType.PingReply, w =>
+                    PacketSerializer.WritePingReply(w, new PingReplyPacket { SendTime = packet.SendTime }));
+            });
+
+            NetworkManager.RegisterHandler(PacketType.PingReply, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadPingReply(reader);
+                float rttMs = (Time.realtimeSinceStartup - packet.SendTime) * 1000f;
+                NetworkStats.RecordPing(sender, rttMs);
+            });
+
             // Day Logs Full Sync
             NetworkManager.RegisterHandler(PacketType.DayLogsFullSync, (sender, reader) =>
             {
@@ -1517,6 +1539,27 @@ namespace SailwindCoop
             // F9 was removed. Keep the menu labels + player list live while a menu is open.
             SailwindCoop.UI.CoopMenu.Tick();
             SailwindCoop.UI.CoopPauseMenu.Tick();
+
+            // 2s ping loop for the F8 overlay: each machine probes its DIRECT peers (star topology,
+            // so a guest's ConnectedPeers is just the host, and the host's is every guest). Unreliable
+            // on purpose - see the PingRequest handler comment.
+            if (IsMultiplayer && NetworkManager != null)
+            {
+                if (Time.realtimeSinceStartup - _lastPingSendTime > PingInterval)
+                {
+                    _lastPingSendTime = Time.realtimeSinceStartup;
+                    foreach (var peer in NetworkManager.ConnectedPeers)
+                    {
+                        NetworkManager.SendUnreliable(peer, PacketType.PingRequest, w =>
+                            PacketSerializer.WritePingRequest(w, new PingRequestPacket { SendTime = Time.realtimeSinceStartup }));
+                    }
+                }
+            }
+            else if (NetworkStats.PingMs.Count > 0)
+            {
+                // Left the lobby - drop stale readings so a future session can't show a ghost ping.
+                NetworkStats.Clear();
+            }
         }
 
         private void OnApplicationQuit()
@@ -1557,6 +1600,8 @@ namespace SailwindCoop
             // is idempotent there and additionally covers a GUEST seeing a fellow guest leave (where the
             // host-only OnPeerDisconnected early-returns, leaving the visual slot dangling).
             ItemSyncManager?.ForgetCarrierHeldItemVisual(peer);
+            // Drop the leaver's F8-overlay ping reading (harmless if absent).
+            NetworkStats.Forget(peer);
 
             // Full reset only when the crew is now empty (e.g. a guest's only peer - the host - left, or the
             // last guest left the host). This also clears the LOCAL active-control tracking, which must NOT

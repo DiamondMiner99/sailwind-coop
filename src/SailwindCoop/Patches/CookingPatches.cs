@@ -361,6 +361,55 @@ namespace SailwindCoop.Patches
         #region Guest Interactions - Kettle
 
         /// <summary>
+        /// J: Intercept ShipItemKettle.OnItemClick on guest when using a water bottle - send water request
+        /// to host. Mirrors ShipItemSoup_OnItemClick_Prefix; reuses the SoupAddWaterRequest packet (the host
+        /// handler resolves the container as soup OR kettle). Without this the guest fill ran purely locally
+        /// and the 2Hz KettleState snapshot reverted it within 0.5s.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemKettle), nameof(ShipItemKettle.OnItemClick))]
+        [HarmonyPrefix]
+        public static bool ShipItemKettle_OnItemClick_Prefix(ShipItemKettle __instance, PickupableItem heldItem, ref bool __result)
+        {
+            if (!Plugin.IsMultiplayer) return true;
+            if (Plugin.IsHost) return true;
+            if (CookingSyncManager.Instance?.IsApplyingRemoteState == true) return true;
+
+            // Check if this is a bottle interaction (water fill)
+            var bottle = heldItem?.GetComponent<ShipItemBottle>();
+            if (bottle != null && bottle.amount == 1f && bottle.sold && __instance.sold)
+            {
+                var kettlePrefab = __instance.GetComponent<SaveablePrefab>();
+                var bottlePrefab = bottle.GetComponent<SaveablePrefab>();
+
+                if (kettlePrefab != null && bottlePrefab != null)
+                {
+                    var packet = new AddWaterRequestPacket
+                    {
+                        BottleInstanceId = bottlePrefab.instanceId,
+                        ContainerInstanceId = kettlePrefab.instanceId
+                    };
+
+                    VerboseLogger.CookingRequest($"KettleAddWater (via SoupAddWaterRequest), bottle={packet.BottleInstanceId}, kettle={packet.ContainerInstanceId}");
+
+                    Plugin.NetworkManager.SendToAllReliable(PacketType.SoupAddWaterRequest, w =>
+                        PacketSerializer.WriteAddWaterRequest(w, packet));
+
+                    // Update bottle locally - empty it since water is transferred to host's kettle.
+                    // Kettle water syncs back via KettleState; the host's ItemHealthChanged echo corrects
+                    // any over-drain when the kettle is nearly full (FillWater remainder).
+                    bottle.health = 0;
+                    UISoundPlayer.instance?.PlayLiquidPourSound();
+
+                    __result = false; // Indicates the interaction was handled
+                    return false; // Skip local kettle fill - host handles it
+                }
+            }
+
+            // Tea insertion falls through to the InsertDrink prefix; placement falls through vanilla
+            return true;
+        }
+
+        /// <summary>
         /// Intercept ShipItemKettle.InsertDrink on guest - send request to host.
         /// </summary>
         [HarmonyPatch(typeof(ShipItemKettle), nameof(ShipItemKettle.InsertDrink))]
@@ -462,6 +511,29 @@ namespace SailwindCoop.Patches
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.FuelInsertedEvent, w =>
                 PacketSerializer.WriteFuelInserted(w, packet));
+        }
+
+        // STOVE FUEL-COUNT CLAMP (2026-07-02 "-17300/3" report): vanilla StoveFuel.Update runs
+        // `UnregisterBurntFuel(); DestroyItem();` EVERY FRAME while a burnt fuel is lit and not yet
+        // destroyed, and currentFuel-- has no floor. If anything no-ops the destroy (the range-cull
+        // suppression exempted in ItemPatches was one confirmed way; an exception in the destroy chain
+        // is another), the counter plunges ~60/s. Clamp at 0, repair the garbage look-text once, and
+        // swallow the redundant call. Solo-safe: the clamp only ever fires when the counter is already
+        // broken (vanilla can't legitimately call this with currentFuel <= 0).
+        private static readonly AccessTools.FieldRef<StoveFuelTrigger, int> CurrentFuelRef =
+            AccessTools.FieldRefAccess<StoveFuelTrigger, int>("currentFuel");
+
+        [HarmonyPatch(typeof(StoveFuelTrigger), nameof(StoveFuelTrigger.UnregisterBurntFuel))]
+        [HarmonyPrefix]
+        public static bool StoveFuelTrigger_UnregisterBurntFuel_Prefix(StoveFuelTrigger __instance)
+        {
+            if (CurrentFuelRef(__instance) > 0) return true;
+
+            CurrentFuelRef(__instance) = 0;
+            try { Traverse.Create(__instance).Method("UpdateLookText").GetValue(); }
+            catch (System.Exception e) { Plugin.Log.LogWarning($"[COOKING] could not refresh stove look text after fuel clamp: {e.Message}"); }
+            Plugin.Log.LogWarning("[COOKING] Clamped stove fuel counter at 0 (burnt-fuel destroy is being suppressed or failing - see the -17300/3 fix notes)");
+            return false;
         }
 
         #endregion

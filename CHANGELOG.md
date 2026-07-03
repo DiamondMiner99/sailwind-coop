@@ -14,6 +14,42 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.22 - 2026-07-02
+
+> **All players must update** (network format changed). The big fix batch from the
+> 2026-07-02 evening playtest - thanks to the crew for the detailed reports and logs.
+
+- **A crewmate no longer gets "left behind" by the ship after unmooring.** If the game's
+  embark detection wedges (it could after repeated on/off cargo hops while moored), the mod
+  now detects a player standing on the crew deck while detached and re-attaches them within
+  about a second - no more jumping in the water and climbing the ladder to fix it.
+- **Waves no longer make the ship dip underwater / float in the air for crew.** Wave
+  timing was being snapped to the host's (stale) clock twice a second, teleporting the
+  water surface under the hull; the guest's ocean clock now converges smoothly.
+- **Shop purchases land in your hand** (or at your feet), not on the trader - and a cooked
+  fish arrives cooked for everyone (item state now travels with the purchase).
+- **Crew can buy oakum now.**
+- **Inspecting a shop item no longer gives the other player a free copy** - inspection is
+  local, exactly like vanilla.
+- **Kettle and liquids respect crew actions**: filling the kettle from a bottle works for
+  crew (not just the host), and bottle/tea/mug levels stay consistent for everyone.
+- **Fishing works for crew**: cast lines appear immediately for others, catches sync, the
+  rod stops "ghost bending" after a fish escapes, hooks no longer turn into phantoms after
+  attaching one, and a bought rod's line no longer dangles through the earth while stowed.
+- **Mooring ropes can't be held and moored at once**: if a crewmate moors while you hold
+  the rope, it's released from your hand (with a notice) instead of leaving a phantom rope
+  in mid-air.
+- **Cargo no longer falls through the dock on the other player's screen** when taken off
+  the boat and set down ashore.
+- **The host's items in pockets sync properly** - the host's pipe (and similar pocketed
+  items) now appear for the crew once taken out.
+- **Ship dirt is shared**: a joining crew member now sees the boat's actual grime and can
+  genuinely clean it.
+- **Sleep while sailing matches vanilla time**: rest and travel distance are consistent
+  again (underway naps give vanilla partial rest; moor or use a tavern for a full
+  fast-forward sleep).
+- New: **ping display** in the Shift+F8 debug overlay.
+
 ## v0.2.21 - 2026-07-02
 
 > Network-compatible with v0.2.20 (no wire change), but as always the whole crew should

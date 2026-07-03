@@ -158,6 +158,13 @@ namespace SailwindCoop.Patches
             // (never-happened) wake doesn't broadcast the eyes-open/timeScale=1 cycle-state to the guest.
             private static bool _blockedThisCall;
 
+            // Log throttles: the wake gate and duration-cap check run every frame during a warp (~40
+            // lines/s). Throttle each to ~1 per 2s of REAL time (unscaledTime), matching the
+            // [SLEEP:QUORUM] heartbeat throttle in SleepSyncManager. Diagnostics only - gate logic is
+            // unaffected.
+            private static float _lastBlockingLog;
+            private static float _lastCapCheckLog;
+
             // __state: true iff THIS WakeUp actually proceeded (Prefix returned true) AND it
             // was a tavern sleep. The Postfix uses it to re-enable MouseLook after the REAL vanilla WakeUp
             // ran - covering the host-auto / host-manual / guest-manual tavern wakes that go through
@@ -225,7 +232,11 @@ namespace SailwindCoop.Patches
                     if (Plugin.IsHost && !isManualWake &&
                         !crewRested && !DurationCapReached() && !GameState.recovering)
                     {
-                        VerboseLogger.SleepEvent($"Wake gate BLOCKING auto-wake: tavern={isTavern}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, host_sleep={PlayerNeeds.sleep:F1}%");
+                        if (Time.unscaledTime - _lastBlockingLog > 2f)
+                        {
+                            _lastBlockingLog = Time.unscaledTime;
+                            VerboseLogger.SleepEvent($"Wake gate BLOCKING auto-wake: tavern={isTavern}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, host_sleep={PlayerNeeds.sleep:F1}%");
+                        }
                         _blockedThisCall = true;
                         return false;
                     }
@@ -258,22 +269,35 @@ namespace SailwindCoop.Patches
                 if (GameState.sleepingInTavern)
                 {
                     bool tavernCap = Sun.sun != null && Sun.sun.localTime > 7f && Sun.sun.localTime < 10f && dur > 3.3f;
-                    VerboseLogger.SleepEvent($"Duration cap check: tavern={GameState.sleepingInTavern}, dur={dur:F2}s, result={tavernCap}");
+                    if (Time.unscaledTime - _lastCapCheckLog > 2f)
+                    {
+                        _lastCapCheckLog = Time.unscaledTime;
+                        VerboseLogger.SleepEvent($"Duration cap check: tavern={GameState.sleepingInTavern}, dur={dur:F2}s, result={tavernCap}");
+                    }
                     return tavernCap;
                 }
-                // The vanilla boat cap (dur > 4.5f) is crossed in ~3.7 real
+                // MOORED (timeskip) sleep only: the vanilla boat cap (dur > 4.5f) is crossed in ~3.7 real
                 // seconds during the time-warp - long before slower-resting crewmates fill. Suppress the
                 // boat cap while ANY crewmate is still filling so it can't release the wake gate early. The
                 // SleepingBackstop (real-time, in SleepSyncManager, bidirectional) still force-wakes an
                 // AFK/never-resting crew, so the crew can never be wedged asleep at 16x.
+                // UNMOORED sleep (no timeskip): the cap is the vanilla 4.5-game-hour nap boundary (~36s of
+                // real 16x warp) and MUST fire - clock, physics and rest run consistently at 16x, so the
+                // nap ends at the vanilla partial-rest point; the AllCrewRested early-wake still applies if
+                // everyone fills sooner. Do not suppress it, or an unmoored crew warps far past vanilla.
                 // N-player: "waiting" is the whole-crew quorum (!AllCrewRested), which already
                 // folds in the host-rested requirement - so it covers a slow HOST as well as a slow guest.
                 // At N=1 these are equivalent.
                 var sm = SleepSyncManager.Instance;
                 bool waitingForCrew = Plugin.HasConnectedGuest && sm != null &&
-                    sm.CurrentState == SleepSyncManager.SleepState.Sleeping && !sm.AllCrewRested;
+                    sm.CurrentState == SleepSyncManager.SleepState.Sleeping &&
+                    sm.IsTimeskipEnabled && !sm.AllCrewRested;
                 bool boatCap = dur > 4.5f && !GameState.recovering && !waitingForCrew;
-                VerboseLogger.SleepEvent($"Duration cap check: tavern={GameState.sleepingInTavern}, dur={dur:F2}s, waitingForCrew={waitingForCrew}, result={boatCap}");
+                if (Time.unscaledTime - _lastCapCheckLog > 2f)
+                {
+                    _lastCapCheckLog = Time.unscaledTime;
+                    VerboseLogger.SleepEvent($"Duration cap check: tavern={GameState.sleepingInTavern}, dur={dur:F2}s, waitingForCrew={waitingForCrew}, result={boatCap}");
+                }
                 return boatCap;
             }
 

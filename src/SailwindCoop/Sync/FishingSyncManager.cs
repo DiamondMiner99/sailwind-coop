@@ -21,6 +21,19 @@ namespace SailwindCoop.Sync
         // Rods with hooked fish (for 5Hz state sync)
         private HashSet<int> _hookedRods = new HashSet<int>();
 
+        // K1: rods that have been CAST (bobber out) but not necessarily hooked. Vanilla pays the line out
+        // via the auto-unroll in ShipItemFishingRod.Update, which only runs on the OWNER's machine (viewer
+        // rods have held=false -> currentMinVelocity=99999), so without streaming the viewer's line stays
+        // at minLength from cast until the first FishingState at the bite. Owned rods in
+        // (_castRods U _hookedRods) stream FishingLineLength at 5Hz, coalesced by LineLengthCoalesceDelta.
+        private readonly HashSet<int> _castRods = new HashSet<int>();
+        private readonly Dictionary<int, float> _lastSentLineLength = new Dictionary<int, float>();
+        private const float LineLengthCoalesceDelta = 0.25f; // metres of change before a resend
+
+        // Vanilla hardcodes this in ShipItemFishingRod.OnLoad (decomp :103); fallback if the private
+        // field reads back zero (e.g. called before OnLoad ran on this copy).
+        private static readonly Vector3 FallbackInitialBobberPos = new Vector3(0.3091888f, 1.137f, 0.71f);
+
         // Timing
         private const float StatesSyncInterval = 0.2f; // 5Hz
         private float _lastStateSyncTime;
@@ -49,6 +62,7 @@ namespace SailwindCoop.Sync
 
                 Plugin.Profiler?.StartMeasure();
                 SyncHookedRodStates();
+                SyncCastRodLineLengths();
                 Plugin.Profiler?.EndMeasure("Fishing");
             }
         }
@@ -118,6 +132,51 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllReliable(PacketType.FishingStateSync, w =>
                     PacketSerializer.WriteFishingState(w, packet));
             }
+        }
+
+        /// <summary>
+        /// K1/K2: 5Hz line-length streaming for the local player's CAST rods (union with hooked rods, so
+        /// the line keeps converging even in the hooked window between FishingState ticks). Coalesced:
+        /// only resends when the limit moved more than LineLengthCoalesceDelta since the last send.
+        /// </summary>
+        private void SyncCastRodLineLengths()
+        {
+            if (_castRods.Count == 0 && _hookedRods.Count == 0) return;
+
+            foreach (var rodId in _castRods)
+                SyncOneCastRodLineLength(rodId);
+            foreach (var rodId in _hookedRods)
+            {
+                if (!_castRods.Contains(rodId))
+                    SyncOneCastRodLineLength(rodId);
+            }
+        }
+
+        private void SyncOneCastRodLineLength(int rodId)
+        {
+            if (!IsLocalPlayerOwner(rodId)) return;
+
+            var rod = FindRodByInstanceId(rodId);
+            if (rod == null) return;
+
+            var bobberJoint = Traverse.Create(rod).Field("bobberJoint").GetValue<ConfigurableJoint>();
+            if (bobberJoint == null) return;
+
+            float len = bobberJoint.linearLimit.limit;
+            if (_lastSentLineLength.TryGetValue(rodId, out var last) && Mathf.Abs(len - last) <= LineLengthCoalesceDelta)
+                return;
+            _lastSentLineLength[rodId] = len;
+
+            var packet = new FishingLineLengthPacket
+            {
+                RodInstanceId = rodId,
+                LineLength = len
+            };
+
+            VerboseLogger.FishingSend($"LineLength (cast stream), rod={rodId}, len={len:F2}", throttle: true);
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.FishingLineLengthSync, w =>
+                PacketSerializer.WriteFishingLineLength(w, packet));
         }
 
         #endregion
@@ -192,6 +251,10 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllReliable(PacketType.FishEscape, w =>
                     PacketSerializer.WriteFishEscape(w, escapePacket));
             }
+
+            // Rod left the hand: stop the cast-rod line stream for it (K1 bookkeeping).
+            _castRods.Remove(rodId);
+            _lastSentLineLength.Remove(rodId);
 
             // Clear ownership
             SetRodOwner(rodId, 0);
@@ -272,6 +335,11 @@ namespace SailwindCoop.Sync
 
             int rodId = prefab.instanceId;
 
+            // K1: start streaming the line length for this cast rod (5Hz, coalesced) so viewers see the
+            // vanilla auto-unroll payout instead of a line stuck at minLength until the bite.
+            _castRods.Add(rodId);
+            _lastSentLineLength.Remove(rodId); // force the first stream tick to send
+
             var packet = new FishingCastPacket
             {
                 RodInstanceId = rodId,
@@ -292,6 +360,9 @@ namespace SailwindCoop.Sync
 
             int rodId = prefab.instanceId;
             MarkRodUnhooked(rodId);
+            // Collect gate guarantees the owner reeled to minLength; stop the cast stream.
+            _castRods.Remove(rodId);
+            _lastSentLineLength.Remove(rodId);
 
             // If host, process immediately
             if (Plugin.IsHost)
@@ -313,6 +384,129 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllReliable(PacketType.FishCollectRequest, w =>
                     PacketSerializer.WriteFishCollectRequest(w, packet));
             }
+        }
+
+        /// <summary>
+        /// K2: called from the ShipItemFishingRod.OnEnterInventory postfix. Vanilla resets
+        /// currentTargetLength=minLength purely locally on stow, and once the rod is out of _hookedRods
+        /// nothing streams the line any more - so remote copies kept the last extended length forever.
+        /// Send one authoritative reset and stop the cast stream.
+        /// </summary>
+        public void OnLocalRodStowed(ShipItemFishingRod rod)
+        {
+            var prefab = rod.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+
+            int rodId = prefab.instanceId;
+            _castRods.Remove(rodId);
+            _hookedRods.Remove(rodId);
+            _lastSentLineLength.Remove(rodId);
+
+            if (!IsLocalPlayerOwner(rodId)) return;
+
+            float minLength = 0.5f;
+            try
+            {
+                var m = Traverse.Create(rod).Field("minLength").GetValue<float>();
+                if (m > 0f) minLength = m;
+            }
+            catch { }
+
+            var packet = new FishingLineLengthPacket
+            {
+                RodInstanceId = rodId,
+                LineLength = minLength
+            };
+
+            VerboseLogger.FishingSend($"LineLength (stow reset), rod={rodId}, len={minLength:F2}");
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.FishingLineLengthSync, w =>
+                PacketSerializer.WriteFishingLineLength(w, packet));
+        }
+
+        /// <summary>
+        /// G (rod line through the earth): the rod's bobber+line assembly is NOT a child of the rod -
+        /// vanilla OnLoad reparents it to the shifting world - so the mod's remote hide/show
+        /// (gameObject.SetActive on the rod alone) left the bobber an active NON-kinematic rigidbody
+        /// whose joint went limp when the rod deactivated; it fell through all geometry and rendered a
+        /// line from the stow point into the ground. Vanilla's own stow protection (OnEnterInventory:
+        /// bobber kinematic + teleport to initialBobberPos) only runs on the stowing player's machine.
+        /// This helper replicates it on remote hide/show. Call with stowed=true BEFORE
+        /// item.gameObject.SetActive(false) and with stowed=false AFTER item.gameObject.SetActive(true).
+        /// No-op for anything that is not a ShipItemFishingRod.
+        /// </summary>
+        public static void SyncExternalRodParts(ShipItem item, bool stowed)
+        {
+            var rod = item as ShipItemFishingRod;
+            if (rod == null) return;
+
+            try
+            {
+                var t = Traverse.Create(rod);
+                var bobberJoint = t.Field("bobberJoint").GetValue<ConfigurableJoint>();
+                if (bobberJoint == null) return;
+
+                var initialBobberPos = t.Field("initialBobberPos").GetValue<Vector3>();
+                if (initialBobberPos == Vector3.zero)
+                    initialBobberPos = FallbackInitialBobberPos; // hardcoded in vanilla OnLoad (decomp :103)
+
+                var bobberRb = bobberJoint.GetComponent<Rigidbody>();
+
+                if (stowed)
+                {
+                    // Park the bobber the way vanilla OnEnterInventory does, then fully hide it (the
+                    // prefab's own supported unsold state, OnLoad :107, so deactivating is safe).
+                    if (bobberRb != null) bobberRb.isKinematic = true;
+                    bobberJoint.transform.position = rod.transform.TransformPoint(initialBobberPos);
+                    try
+                    {
+                        var minLength = t.Field("minLength").GetValue<float>();
+                        t.Field("currentTargetLength").SetValue(minLength > 0f ? minLength : 0.5f);
+                    }
+                    catch { }
+                    bobberJoint.gameObject.SetActive(false);
+                    VerboseLogger.FishingEvent($"Parked external rod parts (remote stow), rod={rod.name}");
+                }
+                else
+                {
+                    // Unity re-creates the native joint when the component's GameObject re-enables and
+                    // connectedBody is still assigned, so the line reels/casts normally afterwards.
+                    if (rod.sold) bobberJoint.gameObject.SetActive(true);
+                    bobberJoint.transform.position = rod.transform.TransformPoint(initialBobberPos);
+                    if (bobberRb != null) bobberRb.isKinematic = false;
+                    VerboseLogger.FishingEvent($"Restored external rod parts (remote show), rod={rod.name}");
+                }
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[FISHING] SyncExternalRodParts({(stowed ? "stow" : "show")}) failed on {item.name}: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// G hygiene: called (one line) from EconomyPatches.SettleStallBuy when a stall-buy confirm
+        /// destroys the guest's parked OPTIMISTIC rod. That rod broadcast RodOwnerChanged(owner=me) once
+        /// on the optimistic pickup and is destroyed without ever sending owner=0, leaving a stale
+        /// ghost-rod ownership entry on the host. Clear it locally and broadcast the release.
+        /// </summary>
+        public void OnOptimisticRodDestroyed(int rodInstanceId)
+        {
+            if (rodInstanceId == 0) return;
+
+            _rodOwners.Remove(rodInstanceId);
+            _hookedRods.Remove(rodInstanceId);
+            _castRods.Remove(rodInstanceId);
+            _lastSentLineLength.Remove(rodInstanceId);
+
+            var packet = new RodOwnerChangedPacket
+            {
+                RodInstanceId = rodInstanceId,
+                NewOwnerId = 0
+            };
+
+            VerboseLogger.FishingSend($"RodOwnerChanged (optimistic rod destroyed), rod={rodInstanceId}, owner=0");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.RodOwnerChanged, w =>
+                PacketSerializer.WriteRodOwnerChanged(w, packet));
         }
 
         #endregion
@@ -345,7 +539,11 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            var spawnPos = fish != null ? fish.transform.position : rod.transform.position;
+            // K5: spawn at the ROD, not the fish/bobber transform. The bobber rigidbody is never synced,
+            // so for a guest-owned rod the HOST's fish transform is garbage (dangling below the rod,
+            // through deck/water) and the caught-fish item could spawn underwater/in geometry and vanish.
+            // The collect gate guarantees the owner reeled to minLength, so the rod position IS correct.
+            var spawnPos = rod.transform.position + Vector3.up * 0.75f;
 
             var fishItem = Object.Instantiate(fishPrefab, spawnPos, Quaternion.identity).GetComponent<ShipItem>();
             fishItem.sold = true;
@@ -377,6 +575,13 @@ namespace SailwindCoop.Sync
                 FishItemId = fishItemId,
                 HookConsumed = hookConsumed
             };
+
+            // K5 bookkeeping symmetry: when the host processes a GUEST's collect request, only the guest's
+            // OnLocalFishCollect ran MarkRodUnhooked - mirror it here so the host stops 5Hz-syncing a rod
+            // that no longer has a fish (and stops the cast stream; the line is at minLength).
+            MarkRodUnhooked(rodId);
+            _castRods.Remove(rodId);
+            _lastSentLineLength.Remove(rodId);
 
             VerboseLogger.FishingEvent($"Fish collected, rod={rodId}, fishItem={fishItemId}, hookConsumed={hookConsumed}");
             VerboseLogger.FishingSend($"FishCollectResponse, rod={rodId}, fishItem={fishItemId}, hookConsumed={hookConsumed}");
@@ -664,6 +869,8 @@ namespace SailwindCoop.Sync
         {
             _rodOwners.Clear();
             _hookedRods.Clear();
+            _castRods.Clear();
+            _lastSentLineLength.Clear();
             _lastStateSyncTime = 0f;
         }
 

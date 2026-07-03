@@ -17,6 +17,22 @@ namespace SailwindCoop.Sync
         private float _lastSyncTime;
         private GoPointer _cachedGoPointer;
 
+        // A (guest-world-pinned-underway): embark self-heal watchdog state. Vanilla runs TWO parallel
+        // embark state machines (PlayerEmbarkDisembarkTrigger + PlayerEmbarkerNew) whose predicates can
+        // deadlock during moored on/off cargo cycles (static embarked sticks true / no fresh EmbarkCol
+        // OnTriggerEnter), leaving the guest's CharacterController parented to "_shifting world" while
+        // physically standing on the deck - when the host then unmoors, the guest is pinned in the world
+        // and the boat sails out from under them. The watchdog detects "world-parented but standing on a
+        // crew boat collider" sustained for EmbarkProbeRequiredHits consecutive probes (~1s dwell, so a
+        // genuine jump/dock stand never trips it; dock colliders have no BoatRefs parent) and force-heals
+        // via BoatStateApplicator.ForceEmbarkLocalPlayer - deliberately predicate-agnostic: it repairs
+        // the pin whichever vanilla field stuck, rather than patching one fragile vanilla trigger path.
+        private const float EmbarkProbeInterval = 0.25f;
+        private const int EmbarkProbeRequiredHits = 4;
+        private float _lastEmbarkProbeTime;
+        private int _embarkProbeHits;
+        private Transform _embarkProbeBoatRoot;
+
         private void Awake()
         {
             if (Instance != null)
@@ -39,14 +55,132 @@ namespace SailwindCoop.Sync
         {
             if (!Plugin.IsMultiplayer) return;
 
+            var charController = Refs.charController;
+            if (charController == null) return;
+
+            // Runs before the 20Hz send gate on its own (slower) cadence, so the position rate limit
+            // can't starve the probe.
+            EmbarkSelfHealTick(charController);
+
             // Rate limit to 20 Hz
             if (Time.time - _lastSyncTime < SyncInterval) return;
             _lastSyncTime = Time.time;
 
-            var charController = Refs.charController;
-            if (charController == null) return;
-
             SendPlayerPosition(charController);
+        }
+
+        /// <summary>
+        /// A (guest-world-pinned-underway): ~4Hz probe; see the field-block comment for the mechanism.
+        /// Heal = the SAME dual-frame transfer the join path uses (ForceEmbarkLocalPlayer), which
+        /// preserves the world pose - so on a moored boat the heal is visually a no-op and underway it
+        /// snaps the guest's parenting back onto the deck they are already standing on.
+        /// </summary>
+        private void EmbarkSelfHealTick(CharacterController charController)
+        {
+            if (Time.time - _lastEmbarkProbeTime < EmbarkProbeInterval) return;
+            _lastEmbarkProbeTime = Time.time;
+
+            // Guest-only self-heal (the host's own embark state is authoritative on its own machine and
+            // this failure mode is co-op-specific: the HOST unmoors while the GUEST is mid-cargo-cycle).
+            // Skip every transient/legit world-parented state: join teleport in flight, recovery,
+            // co-op sleep warp, and swimming (a swimmer is SUPPOSED to be world-parented next to the hull).
+            if (Plugin.IsHost
+                || BoatSyncManager.IsJoinInProgress
+                || GameState.recovering
+                || GameState.sleeping
+                || PlayerSwimming.observerSwimming)
+            {
+                _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+                return;
+            }
+
+            // Only the pinned state is interesting: charController parented directly to "_shifting world"
+            // (the exact same parent test the 20Hz sender uses for onBoat, so watchdog and wire agree).
+            var parent = charController.transform.parent;
+            if (parent == null || parent.name != "_shifting world")
+            {
+                _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+                return;
+            }
+
+            // Probe: short raycast straight down from the FEET (observerMirror tracks the controller
+            // origin ~capsule center; drop by the live capsule geometry, same math as the 20Hz sender).
+            // Solids only - EmbarkCol/dock trigger volumes must not count as "standing on".
+            var bodyT = Refs.observerMirror != null ? Refs.observerMirror.transform : charController.transform;
+            var feet = bodyT.position + Vector3.down * ControllerFeetGap();
+            if (!Physics.Raycast(feet + Vector3.up * 0.25f, Vector3.down, out var hit, 2.75f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+            {
+                _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+                return;
+            }
+
+            // "Standing on a crew boat" = the hit collider lives under a BoatRefs root (hull/deck/railing
+            // colliders are all children of the boat root) that is NOT an NPC trader boat - the guest
+            // must never be force-embarked onto AI traffic they happen to stand on.
+            var boatRefs = hit.collider.GetComponentInParent<BoatRefs>();
+            if (boatRefs == null || hit.collider.GetComponentInParent<NPCBoatController>() != null)
+            {
+                _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+                return;
+            }
+
+            // DOCK-EDGE guard (review finding): a player overhanging the edge of a DOCK beside a moored
+            // crew boat can have the feet ray miss the dock and hit the hull/railing 1-2m below - four
+            // such probes would force-embark someone genuinely standing on land, the inverse of the bug
+            // this watchdog heals. Someone actually STANDING on the deck has geometry directly underfoot,
+            // so require a short hit distance (ray starts 0.25m above the feet).
+            if (hit.distance > 0.9f)
+            {
+                _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+                return;
+            }
+
+            // Require the SAME boat across all consecutive hits so a probe can't accumulate across
+            // different boats (e.g. hopping between two moored hulls).
+            if (boatRefs.transform != _embarkProbeBoatRoot)
+            {
+                _embarkProbeBoatRoot = boatRefs.transform;
+                _embarkProbeHits = 1;
+                return;
+            }
+            if (++_embarkProbeHits < EmbarkProbeRequiredHits) return;
+
+            // ~1s of sustained world-parented-on-deck: the vanilla machines are deadlocked. Before
+            // healing, dump the four vanilla embark fields so the next playtest log captures WHICH
+            // predicate stuck (static-embarked-true vs missed EmbarkCol re-Enter) - the logs so far
+            // could not distinguish them, and this dump is the designed instrument to do so.
+            var boatRoot = _embarkProbeBoatRoot;
+            _embarkProbeHits = 0; _embarkProbeBoatRoot = null;
+            try
+            {
+                var trigger = Object.FindObjectOfType<PlayerEmbarkDisembarkTrigger>();
+                object stayedTrigger = trigger != null
+                    ? Traverse.Create(trigger).Field("currentlyStayedTrigger").GetValue()
+                    : "no-trigger-component";
+                var embarker = charController.GetComponent<PlayerEmbarkerNew>()
+                               ?? Object.FindObjectOfType<PlayerEmbarkerNew>();
+                object embarkerEmbarked = "no-embarker", embarkerBoat = "no-embarker";
+                if (embarker != null)
+                {
+                    var et = Traverse.Create(embarker);
+                    embarkerEmbarked = et.Field("embarked").GetValue();
+                    embarkerBoat = et.Field("currentBoat").GetValue();
+                }
+                Plugin.Log.LogWarning(
+                    $"[PLAYER:EMBARK-HEAL] World-pinned on '{boatRoot.name}' for {EmbarkProbeRequiredHits} probes. " +
+                    $"Pre-heal vanilla state: Trigger.embarked(static)={PlayerEmbarkDisembarkTrigger.embarked}, " +
+                    $"Trigger.currentlyStayedTrigger={stayedTrigger ?? "null"}, " +
+                    $"Embarker.embarked={embarkerEmbarked}, Embarker.currentBoat={embarkerBoat ?? "null"}");
+            }
+            catch (System.Exception e)
+            {
+                // The dump is diagnostics only - never let a Traverse hiccup block the heal itself.
+                Plugin.Log.LogWarning($"[PLAYER:EMBARK-HEAL] pre-heal state dump failed (non-fatal): {e.Message}");
+            }
+
+            bool healed = BoatStateApplicator.ForceEmbarkLocalPlayer(boatRoot);
+            Plugin.Log.LogWarning($"[PLAYER:EMBARK-HEAL] ForceEmbarkLocalPlayer('{boatRoot.name}') => {(healed ? "healed" : "FAILED (walkCol unresolved)")}");
         }
 
         /// <summary>

@@ -1135,6 +1135,28 @@ namespace SailwindCoop.Sync
             IsApplyingRemoteState = true;
             try
             {
+                // Contested-grab guard: if the LOCAL player is holding this rope, force-release it
+                // before applying the authoritative remote state. Vanilla enforces "held ropes are
+                // never moored" (OnPickup unmoors, OnTriggerEnter requires !held); applying MoorTo
+                // to a held rope breaks that invariant and GoPointer.Update then drags the moored
+                // rope to the player's hand every frame (the mid-air phantom rope). Covers BOTH
+                // branches: moor (invariant restore) and unmoor (stops GoPointer fighting the
+                // forced hanger reset below). rope.held is only ever set by the local GoPointer,
+                // so this cannot touch remote avatars. DropItem() fires no Harmony-patched mooring
+                // methods and does NOT call OnDrop, so no echo/throw-back is generated.
+                if (rope.held != null)
+                {
+                    // NOTE: DropItem() fires the mod's GoPointer drop prefix, but the rope is a
+                    // PickupableItem (not a ShipItem), so OnLocalDrop's ShipItem cast bails and nothing
+                    // broadcasts - if the drop patch is ever broadened past ShipItem, this force-release
+                    // must gain an explicit suppression (review finding).
+                    var pointer = rope.held;
+                    pointer.DropItem();
+                    rope.ResetRopePos();
+                    VerboseLogger.ControlApply($"Force-released locally-held rope {packet.RopeIndex} (remote mooring state wins)");
+                    Plugin.Notify("Mooring rope taken by a crewmate");
+                }
+
                 if (packet.IsMoored)
                 {
                     var dock = FindClosestDockMooring(packet.DockPosition);

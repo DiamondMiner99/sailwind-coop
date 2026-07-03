@@ -40,6 +40,8 @@ namespace SailwindCoop.Sync
 
         // Guest ocean time sync (wave phase)
         private TimeProviderCustom _oceanTimeProvider;
+        // Pending host-ocean-clock error, converged via bounded slew in AdvanceOceanTime (never snapped).
+        private float _oceanTimeSlewError;
 
         // ===== Crest wave drive sync =====
         // The LIVE ocean is the Crest stack: OceanUpdaterCrest crossfades two inertia
@@ -275,8 +277,27 @@ namespace SailwindCoop.Sync
                 }
                 else
                 {
-                    // Periodic re-sync to correct drift from Time.deltaTime differences
-                    _oceanTimeProvider._time = packet.OceanTime;
+                    // WAVE-JUMP fix (2026-07-02 report: "boat goes under the water a few feet with lag
+                    // then floats in the air"): the stamped OceanTime is one-way-latency STALE on
+                    // arrival, so the old hard snap `_time = packet.OceanTime` rewound the guest's whole
+                    // wave field by ~latency every 500ms (seconds during a reliable-channel lag stall) -
+                    // a deep-water swell phase moves ~8-14 m/s, so each snap stepped the surface under
+                    // the hull by feet, and the soft-Y blend + buoyancy then overshot into the air.
+                    // Instead SLEW: record the error and converge at max +/-10% timescale in
+                    // AdvanceOceanTime so the ocean clock stays monotonic and jump-free. The guest
+                    // settles a constant ~one-way-latency behind the host - a constant offset is
+                    // invisible (the boat-Y stream is delayed by about the same amount). Only a
+                    // join/teleport-scale desync (>3s) snaps outright.
+                    float oceanErr = packet.OceanTime - _oceanTimeProvider._time;
+                    if (Mathf.Abs(oceanErr) > 3f)
+                    {
+                        _oceanTimeProvider._time = packet.OceanTime;
+                        _oceanTimeSlewError = 0f;
+                    }
+                    else
+                    {
+                        _oceanTimeSlewError = oceanErr;
+                    }
                 }
             }
 
@@ -374,7 +395,10 @@ namespace SailwindCoop.Sync
             var windWaves = WindWavesRef(updater);
             if (windWaves != null)
             {
-                windWaves._weight = packet.HostWindWavesWeight;
+                // MoveTowards, not assignment: the 2Hz hard weight snap stepped the wave AMPLITUDE
+                // visibly; converge at 0.25/receive (~4 packets = 2s worst case) instead - same
+                // reasoning as the ocean-time slew.
+                windWaves._weight = Mathf.MoveTowards(windWaves._weight, packet.HostWindWavesWeight, 0.25f);
             }
         }
 
@@ -413,8 +437,14 @@ namespace SailwindCoop.Sync
         {
             if (_oceanTimeProvider == null) return;
 
-            _oceanTimeProvider._time += Time.deltaTime;
-            _oceanTimeProvider._deltaTime = Time.deltaTime;
+            // Advance monotonically, folding in at most +/-10% of the frame's dt from the pending
+            // host-clock error (see the slew comment at the receive site) - the surface can therefore
+            // never visibly jump, only imperceptibly stretch/compress until converged.
+            float step = Time.deltaTime;
+            float slew = Mathf.Clamp(_oceanTimeSlewError, -0.1f * step, 0.1f * step);
+            _oceanTimeProvider._time += step + slew;
+            _oceanTimeSlewError -= slew;
+            _oceanTimeProvider._deltaTime = step;
         }
 
         /// <summary>
@@ -425,6 +455,7 @@ namespace SailwindCoop.Sync
             _lastSyncTime = 0f;
             _hasReceivedState = false;
             _targetWind = Vector3.zero;
+            _oceanTimeSlewError = 0f;
             Patches.WeatherPatches.LocalWeatherOverride = false;
 
             // Clean up ocean time provider

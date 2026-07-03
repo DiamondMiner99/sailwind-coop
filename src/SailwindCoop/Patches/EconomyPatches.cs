@@ -352,6 +352,12 @@ namespace SailwindCoop.Patches
                     int goodIndex = saveable != null ? PrefabsDirectory.ItemToGoodIndex(saveable.prefabIndex) : -1;
                     int prefabIndex = saveable != null ? saveable.prefabIndex : -1;
 
+                    // Capture the DISPLAY item's state before it gets parked/destroyed. Cooked-ness is
+                    // NOT a prefab: CookInShop sets amount>=1 on the raw prefab (decomp CookableFood.cs:90-98),
+                    // so a pristine host Instantiate would silently un-cook the purchase. FoodState is a
+                    // nullable component - send 0s when absent.
+                    var foodState = item.GetComponent<FoodState>();
+
                     // Send request to host (IsBuying=true because player is buying from shop)
                     var packet = new ShopTradeRequestPacket
                     {
@@ -363,7 +369,13 @@ namespace SailwindCoop.Patches
                         Price = price,
                         IsBuying = true,
                         CurrencyIndex = currency,   // forward the wallet the guest paid with so the host charges the correct currency slot (port.region alone can resolve a wrong/empty wallet => reject)
-                        PrefabIndex = prefabIndex   // raw prefab index the host spawns directly (goods AND non-good stall items; the good<->item round-trip breaks for the dead band)
+                        PrefabIndex = prefabIndex,  // raw prefab index the host spawns directly (goods AND non-good stall items; the good<->item round-trip breaks for the dead band)
+                        ItemAmount = item.amount,   // v0.2.20: carry item state so the authoritative spawn matches the bought item (cooked fish etc.)
+                        ItemHealth = item.health,
+                        FoodDried = foodState != null ? foodState.dried : 0f,
+                        FoodSmoked = foodState != null ? foodState.smoked : 0f,
+                        FoodSalted = foodState != null ? foodState.salted : 0f,
+                        FoodSpoiled = foodState != null ? foodState.spoiled : 0f
                     };
 
                     Debug.VerboseLogger.Log("TRADING", "SEND", $"ShopBuy: port={portIndex}, good={goodIndex}, prefab={prefabIndex}, price={price}, currency={currency}");
@@ -497,12 +509,65 @@ namespace SailwindCoop.Patches
             /// ShipItem.shopPos/shopRot, the same coords SmoothlyReturnToShop uses). The
             /// IsApplyingRemoteState guard suppresses any destroy packet. Safe no-op when nothing is pending.
             /// </summary>
-            public static void ResolvePendingStallBuy(bool success)
+            public static void ResolvePendingStallBuy(bool success, int spawnedItemId = 0)
             {
                 // FIFO: verdicts arrive in request order (reliable channel), so this verdict belongs to the
                 // OLDEST pending entry. Safe no-op when nothing is pending (e.g. already timed out).
                 if (_pendingStallBuys.Count == 0) return;
                 SettleStallBuy(_pendingStallBuys.Dequeue().Item, success);
+
+                // v0.2.20 vanilla hand-attach parity: vanilla ShipItem.Sell auto-picks the bought item into the
+                // buyer's hand (pointedAtBy.PickUpItem, decomp ShipItem.cs:514-517); the mod destroys that copy
+                // and host-spawns a canonical one, so re-attach it here. The authoritative ItemSpawned precedes
+                // this result on the same reliable channel, but retry a few frames to be safe. Skips silently
+                // if the hand is occupied or the item never materializes (part B leaves it at the buyer's feet).
+                if (success && spawnedItemId != 0)
+                    Plugin.Instance?.StartCoroutine(AutoPickupSpawnedStallItem(spawnedItemId));
+            }
+
+            private static System.Collections.IEnumerator AutoPickupSpawnedStallItem(int spawnedItemId)
+            {
+                const int maxFrames = 60; // ~1s at 60fps - the spawn packet is already inbound on the same channel
+                for (int i = 0; i < maxFrames; i++)
+                {
+                    var item = ItemSyncManager.FindItemByInstanceId(spawnedItemId);
+                    if (item != null)
+                    {
+                        // Item is here: attach exactly once, or skip silently if we can't.
+                        if (item.held == null && item.gameObject.activeInHierarchy)
+                        {
+                            var pointer = FindFreeLocalPointer();
+                            if (pointer != null)
+                            {
+                                // Deliberately NO IsApplyingRemoteState guard: the GoPointer.PickUpItem postfix
+                                // must fire so the normal ItemPickupRequest->approval flow runs (the host owns
+                                // and registered this item, so approval is guaranteed).
+                                pointer.PickUpItem(item);
+                                Debug.VerboseLogger.Log("TRADING", "LOCAL", $"Stall buy: auto-picked up authoritative item {item.name} (id={spawnedItemId})");
+                            }
+                            else
+                            {
+                                Debug.VerboseLogger.Log("TRADING", "LOCAL", $"Stall buy: hand occupied; leaving authoritative item {spawnedItemId} on the ground");
+                            }
+                        }
+                        yield break;
+                    }
+                    yield return null;
+                }
+                Debug.VerboseLogger.Log("TRADING", "WARN", $"Stall buy: authoritative item {spawnedItemId} never arrived; skipping auto-pickup");
+            }
+
+            /// <summary>The local player's free hand pointer (crosshair preferred), or null if all occupied.</summary>
+            private static GoPointer FindFreeLocalPointer()
+            {
+                GoPointer fallback = null;
+                foreach (var pointer in UnityEngine.Object.FindObjectsOfType<GoPointer>())
+                {
+                    if (pointer.GetHeldItem() != null) continue;
+                    if (pointer.type == GoPointer.PointerType.crosshairMouse) return pointer;
+                    if (fallback == null) fallback = pointer;
+                }
+                return fallback;
             }
 
             private static void SettleStallBuy(ShipItem item, bool success)
@@ -521,6 +586,9 @@ namespace SailwindCoop.Patches
                         // SaveablePrefab into SaveLoadManager.currentPrefabs, so a raw Destroy leaves a dangling
                         // entry that crashes the next SaveGame. DestroyItem() calls Unregister(); the guard makes
                         // the ShipItem.DestroyItem patch skip the ItemDestroyed broadcast.
+                        // G hygiene: the optimistic rod broadcast RodOwnerChanged(owner=me) on pickup and dies
+                        // here without ever releasing - clear + broadcast owner=0 so no ghost entry lingers.
+                        if (item is ShipItemFishingRod) FishingSyncManager.Instance?.OnOptimisticRodDestroyed(item.GetComponent<SaveablePrefab>()?.instanceId ?? 0);
                         item.DestroyItem();
                         return;
                     }

@@ -163,6 +163,77 @@ namespace SailwindCoop.Patches
         }
 
         /// <summary>
+        /// K2: patch ShipItemFishingRod.OnEnterInventory to broadcast the vanilla stow-time line reset
+        /// (currentTargetLength = minLength runs purely locally in vanilla) and stop the cast stream.
+        /// Receivers apply it through the normal FishingLineLength path.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemFishingRod), "OnEnterInventory")]
+        [HarmonyPostfix]
+        public static void OnRodEnterInventory(ShipItemFishingRod __instance)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+            FishingSyncManager.Instance?.OnLocalRodStowed(__instance);
+        }
+
+        /// <summary>
+        /// K4: patch ShipItemFishingRod.OnItemClick to sync a hook ATTACH. Vanilla sets rod.health=1 and
+        /// destroys the held hook, but rod health was never broadcast from this path (OnLocalItemHealthChanged
+        /// only fired from food/drink patches), so a successful attach left the other machines' rod hookless.
+        /// health > 0 with __result==true can only be the attach transition: vanilla returns false early
+        /// whenever health was ALREADY > 0, and the non-hook click path leaves health at 0.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemFishingRod), "OnItemClick")]
+        [HarmonyPostfix]
+        public static void OnRodItemClick(ShipItemFishingRod __instance, bool __result)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+            if (__result && __instance.health > 0f)
+            {
+                ItemSyncManager.Instance?.OnLocalItemHealthChanged(__instance, forceSync: true);
+            }
+        }
+
+        /// <summary>
+        /// K5 (glitchy perpetual rod bend): block FishingRodFish.FixedUpdate for REMOTE-owned rods. The
+        /// viewer's local sim recomputed currentTargetTension from its own (wrong, unsynced) bobber joint
+        /// forces every physics tick and fought the 5Hz FishingState applies. With it blocked, the
+        /// packet-driven SetRodTension fully owns the viewer's rod bend. Mirrors the existing
+        /// CatchFish/ReleaseFish prefix-block pattern (no IsApplyingRemoteState allowance needed: no
+        /// packet handler ever drives FixedUpdate).
+        /// </summary>
+        // 50Hz per rod: use a cached FieldRef, not per-tick Traverse reflection (review finding).
+        private static readonly AccessTools.FieldRef<FishingRodFish, ShipItemFishingRod> FishRodRef =
+            AccessTools.FieldRefAccess<FishingRodFish, ShipItemFishingRod>("rod");
+
+        [HarmonyPatch(typeof(FishingRodFish), "FixedUpdate")]
+        [HarmonyPrefix]
+        public static bool OnFishFixedUpdatePrefix(FishingRodFish __instance)
+        {
+            if (!Plugin.IsMultiplayer) return true;
+
+            var mgr = FishingSyncManager.Instance;
+            if (mgr == null) return true;
+
+            var rod = FishRodRef(__instance);
+            if (rod == null) return true;
+
+            var prefab = rod.GetComponent<SaveablePrefab>();
+            if (prefab == null) return true;
+
+            var owner = mgr.GetRodOwner(prefab.instanceId);
+            if (owner != 0 && !mgr.IsLocalPlayerOwner(prefab.instanceId))
+                return false; // remote-owned: viewer sim off, FishingState packets own the bend
+
+            return true;
+        }
+
+        /// <summary>
         /// Patch FishingRodFish.CollectFish to route through host.
         /// </summary>
         [HarmonyPatch(typeof(FishingRodFish), "CollectFish")]

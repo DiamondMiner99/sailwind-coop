@@ -227,6 +227,17 @@ namespace SailwindCoop.Networking.Packets
         public bool IsBuying;              // true = guest buying from shop
         public int CurrencyIndex;          // Wallet slot the guest actually paid with (-1 = host falls back to port region). Mirrors MarketTradeRequestPacket.CurrencyIndex.
         public int PrefabIndex;            // The RAW prefab index (saveable.prefabIndex) of a bought item. GoodIndex<->ItemIndex is only a bijection for real goods; the dead band (31..200, non-good stall items) breaks the round-trip, so the host spawns directly from PrefabsDirectory.directory[PrefabIndex]. -1 / 0 = no valid prefab (host won't authoritatively spawn).
+        // v0.2.20 WIRE CHANGE (appended at END - field order must match Write/ReadShopTradeRequest):
+        // item STATE of the actual stall display item. "Cooked" is NOT a prefab - CookInShop sets
+        // ShipItem.amount>=1 on the same raw prefab (decomp CookableFood.cs:90-98) - so a pristine host
+        // Instantiate silently un-cooks the purchase. Carry amount/health + the 4 FoodState floats so
+        // SpawnAuthoritativeStallItem reproduces the exact item the buyer paid for.
+        public float ItemAmount;           // ShipItem.amount (>=1 means cooked for CookableFood)
+        public float ItemHealth;           // ShipItem.health
+        public float FoodDried;            // FoodState.dried (0 if no FoodState component)
+        public float FoodSmoked;           // FoodState.smoked
+        public float FoodSalted;           // FoodState.salted
+        public float FoodSpoiled;          // FoodState.spoiled
     }
 
     /// <summary>
@@ -243,6 +254,11 @@ namespace SailwindCoop.Networking.Packets
         public byte Reason;       // 0=ok, 2=not enough money (matches MarketTradeResult reason codes)
         public int PriceAmount;   // price (positive)
         public int CurrencyIndex; // wallet slot the trade charged
+        // v0.2.20 WIRE CHANGE (appended at END - field order must match Write/ReadShopTradeResult):
+        // SaveablePrefab.instanceId of the host-authoritative spawned item on success (0 on reject /
+        // no-spawn). The buyer uses it to auto-pick the inbound canonical copy into a free hand,
+        // restoring vanilla ShipItem.Sell hand-attach parity.
+        public int SpawnedItemId;
     }
 
     /// <summary>

@@ -41,6 +41,15 @@ namespace SailwindCoop.Sync
         /// </summary>
         public bool IsTavernSleep => _isTavernSleep;
 
+        /// <summary>
+        /// True when the CURRENT co-op sleep is a TIMESKIP sleep (moored/tavern - the vanilla 9x Sun
+        /// fast-forward). Exposed read-only so SleepPatches can scope the waitingForCrew suppression of the
+        /// vanilla 4.5-game-hour boat cap to timeskip sleeps only: an UNMOORED nap must keep the vanilla cap
+        /// (clock=physics=rest all at 16x, partial rest by design). Reliable on BOTH host and guest: the host
+        /// sets it in TransitionToSleeping, the guest in OnSleepApprovedReceived (SleepApproved.IsTimeskip).
+        /// </summary>
+        public bool IsTimeskipEnabled => _isTimeskipEnabled;
+
         // Context tracking
         private bool _isTavernSleep;
         private bool _isTimeskipEnabled;
@@ -288,9 +297,9 @@ namespace SailwindCoop.Sync
 
             if (CurrentState == SleepState.Awake) return;
 
-            // Host fast-forward, single-set: Sun's 9x timeskip is asserted ONCE in TransitionToSleeping
-            // (Sleep.timeskipSleep=true) and Sun.Update re-reads that flag every frame, so it holds for the whole
-            // co-op SLEEPING with no per-frame re-assert needed. (Decomp Sleep.FallAsleep ONLY sets
+            // Host fast-forward, single-set: Sun's 9x timeskip (moored/tavern only) is asserted ONCE in
+            // TransitionToSleeping (Sleep.timeskipSleep=true) and Sun.Update re-reads that flag every frame, so
+            // it holds for the whole co-op SLEEPING with no per-frame re-assert needed. (Decomp Sleep.FallAsleep ONLY sets
             // timeskipSleep=TRUE, and only for moored/tavern; for the unmoored boat case it leaves the flag
             // UNTOUCHED. Nothing clears it mid-sleep - only Sleep.WakeUp does, on wake.) Cleared on every wake
             // by TransitionToAwake (and vanilla WakeUp).
@@ -983,26 +992,26 @@ namespace SailwindCoop.Sync
             var sharedBoat = BoatUtility.FindBoatByName(_sharedBoatName);
             bool isMoored = sharedBoat != null &&
                            sharedBoat.GetComponent<BoatMooringRopes>()?.AnyRopeMoored() == true;
-            // DELIBERATE CO-OP DESIGN CHOICE: in single-player, vanilla only enables the 9x Sun timeskip
-            // (Sleep.timeskipSleep -> Sun.sun.timescale = initialTimescale*9 in Sun.Update) when moored||tavern;
-            // unmoored sleep leaves Sun.sun.timescale at 1x. But OUR sleep ALSO forces Time.timeScale=16x
-            // unconditionally (SleepPatches StartSleepTimeWarp / SendCycleStateAfterDelay). The SLEEP NEED and
-            // currentSleepDuration both fill off Sun.sun.timescale (PlayerNeeds.Update / Sleep.Update), NOT
-            // Time.timeScale - so an UNMOORED co-op sleep ran the clock at 16x while the sleep need crawled at 1x
-            // ("fills a pixel at a time"). We deliberately let co-op crew-sleep fast-forward even when unmoored:
-            // enable timeskip for EVERY co-op sleep so Sun.sun.timescale matches the warp and the fill rate keeps
-            // up. The moored/tavern fast-path is unchanged (it already evaluated true); this ADDS the unmoored
-            // co-op path. _isTimeskipEnabled drives the guest's Sleep.timeskipSleep (OnSleepApprovedReceived) and
-            // is set once on the host below, making Time.timeScale and Sun.sun.timescale consistent.
-            _isTimeskipEnabled = true; // was: isMoored || _isTavernSleep
-            // Host: drive Sun's timescale immediately for the unmoored boat case. Moored/tavern FallAsleep sets
-            // this itself; the unmoored boat case never sets it (decomp Sleep.FallAsleep only sets timeskipSleep
-            // TRUE for moored/tavern and leaves it UNTOUCHED otherwise - it never sets it false), so set it ONCE
+            // VANILLA RATE-COUPLING (reverts the v0.2.15 "force timeskip on every co-op sleep" change):
+            // the 9x Sun timeskip (Sleep.timeskipSleep -> Sun.sun.timescale = initialTimescale*9 in Sun.Update)
+            // is only enabled where VANILLA has it - moored/tavern. The v0.2.15 rationale ("sleep need crawled
+            // at 1x") misread PlayerNeeds.Update: `sleep += Time.deltaTime * 8f * Sun.sun.timescale` already
+            // runs at the 16x warped deltaTime, so a vanilla UNMOORED nap fills at 16x too - clock, physics
+            // and rest all consistent, capped at 4.5 game-hours (a deliberate partial-rest nap). Forcing the
+            // 9x underway ran clock+rest at 144x while boat physics stayed at 16x: the bar filled in ~10s,
+            // the AllCrewRested quorum auto-woke, and the boat had barely moved. _isTimeskipEnabled drives
+            // the guest's Sleep.timeskipSleep (OnSleepApprovedReceived via SleepApproved.IsTimeskip) and the
+            // SleepPatches boat-cap scoping (IsTimeskipEnabled).
+            _isTimeskipEnabled = isMoored || _isTavernSleep;
+            // Host: drive Sun's timescale immediately for the moored/tavern case. Vanilla FallAsleep also sets
+            // it there (decomp Sleep.FallAsleep only sets timeskipSleep TRUE for moored/tavern and leaves it
+            // UNTOUCHED otherwise - it never sets it false), but our FallAsleep timing is gated, so set it ONCE
             // here. Sun.Update re-reads the flag every frame, so this single set holds the 9x for the whole warp;
-            // no per-frame re-assert is needed. Cleared on every wake by TransitionToAwake (and vanilla WakeUp).
-            if (Plugin.IsHost) Sleep.timeskipSleep = true;
+            // no per-frame re-assert is needed. NEVER set for an unmoored sleep (vanilla keeps Sun at 1x there).
+            // Cleared on every wake by TransitionToAwake (and vanilla WakeUp).
+            if (Plugin.IsHost && _isTimeskipEnabled) Sleep.timeskipSleep = true;
 
-            VerboseLogger.SleepEvent($"State -> SLEEPING, tavern={_isTavernSleep}, moored={isMoored}, timeskip(co-op,forced)={_isTimeskipEnabled}");
+            VerboseLogger.SleepEvent($"State -> SLEEPING, tavern={_isTavernSleep}, moored={isMoored}, timeskip={_isTimeskipEnabled}");
 
             if (Plugin.IsHost)
             {

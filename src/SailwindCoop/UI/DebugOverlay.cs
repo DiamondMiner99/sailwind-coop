@@ -3,6 +3,7 @@ using SailwindCoop.Networking;
 using SailwindCoop.Player;
 using SailwindCoop.Sync;
 using SailwindCoop.Debug;
+using Steamworks;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -42,6 +43,12 @@ namespace SailwindCoop.UI
             public bool IsRegistered;
             public bool IsDuplicate;
         }
+
+        // Per-peer ping lines ("ping <name>: <n> ms"), rebuilt at the ping-loop cadence (2s) so
+        // OnGUI never allocates strings per frame. Host shows one line per guest; guest shows host.
+        private readonly List<string> _pingLines = new List<string>();
+        private float _lastPingLineTime;
+        private const float PingLineInterval = 2f; // Matches Plugin's ping-send cadence
 
         // Baseline FPS tracking (when not in multiplayer)
         private float _baselineFps;
@@ -363,6 +370,18 @@ namespace SailwindCoop.UI
                     if (networkManager != null)
                     {
                         GUILayout.Label($"P2P Peers: {networkManager.ConnectedPeers.Count}", _labelStyle);
+
+                        // Per-peer ping (fed by the 2s PingRequest/PingReply loop in Plugin.Update).
+                        // Rebuild the cached lines at the same cadence; draw from cache every frame.
+                        if (Time.realtimeSinceStartup - _lastPingLineTime > PingLineInterval)
+                        {
+                            _lastPingLineTime = Time.realtimeSinceStartup;
+                            RebuildPingLines(networkManager);
+                        }
+                        for (int i = 0; i < _pingLines.Count; i++)
+                        {
+                            GUILayout.Label(_pingLines[i], _labelStyle);
+                        }
                     }
 
                     var remoteManager = RemotePlayerManager.Instance;
@@ -406,6 +425,22 @@ namespace SailwindCoop.UI
             }
 
             Plugin.Profiler?.EndMeasure("OnGUI");
+        }
+
+        private void RebuildPingLines(P2PNetworkManager networkManager)
+        {
+            _pingLines.Clear();
+            foreach (var peer in networkManager.ConnectedPeers)
+            {
+                // Friend.Name reads "[unknown]" until Steam loads that user's persona (same caveat
+                // as SteamLobbyManager's invite toast) - fall back to the raw SteamId digits.
+                string name = new Friend(peer).Name;
+                if (string.IsNullOrEmpty(name) || name == "[unknown]") name = peer.Value.ToString();
+
+                _pingLines.Add(NetworkStats.PingMs.TryGetValue(peer, out var ms)
+                    ? $"ping {name}: {ms:F0} ms"
+                    : $"ping {name}: -- ms");
+            }
         }
 
         private void DrawPerformanceSection()

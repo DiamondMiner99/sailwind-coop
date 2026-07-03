@@ -674,20 +674,23 @@ namespace SailwindCoop.Sync
         {
             if (!Plugin.IsHost) return;
 
-            VerboseLogger.CookingRecv($"SoupAddWaterRequest, bottle={packet.BottleInstanceId}, soup={packet.ContainerInstanceId}");
+            VerboseLogger.CookingRecv($"SoupAddWaterRequest, bottle={packet.BottleInstanceId}, container={packet.ContainerInstanceId}");
 
+            // J: the container may be a soup pot OR a kettle (the kettle guest prefix reuses this packet)
             var soup = FindSoupByInstanceId(packet.ContainerInstanceId);
+            var kettle = soup == null ? FindKettleByInstanceId(packet.ContainerInstanceId) : null;
             var bottle = FindMugByInstanceId(packet.BottleInstanceId); // ShipItemBottle includes water bottles
 
-            if (soup == null || bottle == null)
+            if ((soup == null && kettle == null) || bottle == null)
             {
-                VerboseLogger.CookingEvent($"SoupAddWater rejected: soup or bottle not found");
+                VerboseLogger.CookingEvent($"SoupAddWater rejected: container or bottle not found");
                 return;
             }
 
-            if (!soup.sold || !bottle.sold)
+            bool containerSold = soup != null ? soup.sold : kettle.sold;
+            if (!containerSold || !bottle.sold)
             {
-                VerboseLogger.CookingEvent($"SoupAddWater rejected: soup or bottle not sold");
+                VerboseLogger.CookingEvent($"SoupAddWater rejected: container or bottle not sold");
                 return;
             }
 
@@ -698,11 +701,26 @@ namespace SailwindCoop.Sync
             }
 
             // Execute the water fill - same as game's OnItemClick logic
-            bottle.health = soup.FillWater(bottle.health);
-            soup.UpdateLookText();
-            soup.itemRigidbodyC?.UpdateMass();
+            if (soup != null)
+            {
+                bottle.health = soup.FillWater(bottle.health);
+                soup.UpdateLookText();
+                soup.itemRigidbodyC?.UpdateMass();
+            }
+            else
+            {
+                // Mirrors vanilla ShipItemKettle.OnItemClick bottle branch. Kettle water propagates
+                // to all guests via the existing 2Hz KettleState snapshot.
+                bottle.health = kettle.FillWater(bottle.health);
+                kettle.UpdateLookText();
+                kettle.itemRigidbodyC?.UpdateMass();
+            }
 
-            VerboseLogger.CookingEvent($"SoupAddWater executed, bottle={packet.BottleInstanceId}, soup={packet.ContainerInstanceId}");
+            // J: broadcast the drained bottle level, or every peer (including the requester) keeps a stale
+            // full bottle - the host is the item-health authority and ItemHealthChanged is event-only.
+            ItemSyncManager.Instance?.OnLocalItemHealthChanged(bottle, forceSync: true);
+
+            VerboseLogger.CookingEvent($"SoupAddWater executed, bottle={packet.BottleInstanceId}, container={packet.ContainerInstanceId}, target={(soup != null ? "soup" : "kettle")}");
         }
 
         public void OnKettleAddTeaRequest(KettleAddTeaRequestPacket packet, SteamId sender)
@@ -749,6 +767,11 @@ namespace SailwindCoop.Sync
             }
 
             kettle.InsertDrink(tea);
+
+            // J: echo the tea item's post-insert remainder (InsertDrink drains drink.amount) so the guest's
+            // copy of the leaves matches host truth; OnLocalItemHealthChanged also broadcasts amount.
+            ItemSyncManager.Instance?.OnLocalItemHealthChanged(tea, forceSync: true);
+
             VerboseLogger.CookingEvent($"KettleAddTea executed, kettle={packet.KettleInstanceId}, tea={packet.TeaInstanceId}");
         }
 
@@ -768,6 +791,11 @@ namespace SailwindCoop.Sync
             }
 
             kettle.PourTea(mug);
+
+            // J: echo the mug's new health + liquid amount/type (PourTea sets mug.amount to the tea type or
+            // water and adds health) so all peers see the authoritative pour result immediately.
+            ItemSyncManager.Instance?.OnLocalItemHealthChanged(mug, forceSync: true);
+
             VerboseLogger.CookingEvent($"KettlePour executed, kettle={packet.KettleInstanceId}, mug={packet.MugInstanceId}");
         }
 

@@ -274,8 +274,19 @@ namespace SailwindCoop.Sync
                         continue;
                     }
 
-                    ApplyBoatStatePhaseA(boat, hostBoat);
-                    boatDataPairs.Add((boat, hostBoat));
+                    // PER-BOAT ISOLATION (2026-07-02 rejoin lesson): one throwing item/boat previously
+                    // aborted the whole join coroutine - the guest was left with an empty, purchasable,
+                    // reefed ship and GuestJoinComplete never fired. A failed boat logs and is skipped;
+                    // the rest of the world still applies and the post-join resyncs can heal the gap.
+                    try
+                    {
+                        ApplyBoatStatePhaseA(boat, hostBoat);
+                        boatDataPairs.Add((boat, hostBoat));
+                    }
+                    catch (System.Exception e)
+                    {
+                        Plugin.Log.LogError($"[JOIN] PhaseA FAILED for boat {hostBoat.Name}: {e}");
+                    }
                 }
 
                 // ApplyBoatStatePhaseA resets IsApplyingRemoteState to false in its finally block.
@@ -287,10 +298,15 @@ namespace SailwindCoop.Sync
                 Plugin.Log.LogInfo($"[JOIN] Waiting frame for sail Destroy() to complete...");
                 yield return null;
 
-                // Phase B: Apply rope lengths (now only new ropes exist)
+                // Phase B: Apply rope lengths (now only new ropes exist). Per-boat isolation, same
+                // lesson as Phase A.
                 foreach (var (boat, data) in boatDataPairs)
                 {
-                    ApplyBoatStatePhaseB(boat, data);
+                    try { ApplyBoatStatePhaseB(boat, data); }
+                    catch (System.Exception e)
+                    {
+                        Plugin.Log.LogError($"[JOIN] PhaseB FAILED for boat {data.Name}: {e}");
+                    }
                 }
 
                 // Re-enable physics on all boats (was disabled in PhaseA for safe teleport)
@@ -514,11 +530,17 @@ namespace SailwindCoop.Sync
                 // touch identical fields.
                 ApplyOwnership(boat, data.IsOwned);
 
-                // 9. Apply dirt texture
+                // 9. Apply dirt texture. Lookup MUST go through SaveableObject.GetCleanable(): the
+                // CleanableObject lives on the hull-mesh child (RequireComponent HullPlayerCollider +
+                // Renderer), never on the boat root, so GetComponent on the root silently returns null
+                // and the guest keeps a spotless hull while the host sees dirt (2026-07-02 report).
+                // Mirrors the collector (BoatStateCollector) and vanilla SaveableObject.Load.
                 if (data.DirtTexture != null && data.DirtTexture.Length > 0)
                 {
-                    var cleanable = boat.GetComponent<CleanableObject>();
-                    if (cleanable != null)
+                    var cleanable = boat.GetCleanable();
+                    if (cleanable == null)
+                        Plugin.Log.LogWarning($"[CLEANING:APPLY] No CleanableObject on {boat.gameObject.name}; dirt texture dropped");
+                    else
                     {
                         try
                         {
@@ -732,10 +754,17 @@ namespace SailwindCoop.Sync
                 if (item.InstanceId > 0) hostItemIds.Add(item.InstanceId);
             }
 
-            // First pass: spawn all items
+            // First pass: spawn all items. PER-ITEM ISOLATION (2026-07-02 rejoin lesson): a single
+            // throwing spawn (the kettle UpdateMaterial NRE) previously aborted the whole join at item
+            // 27/226 - log and continue, one corrupt item must never take the boat state down with it.
             foreach (var item in sortedItems)
             {
-                var instance = SpawnItem(boat, item, hostItemIds);
+                GameObject instance = null;
+                try { instance = SpawnItem(boat, item, hostItemIds); }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogError($"[SYNC-DEBUG] SpawnItem FAILED for id={item.InstanceId}, prefab={item.PrefabIndex}: {e}");
+                }
                 if (instance != null && item.InstanceId > 0)
                 {
                     // Check for duplicate IDs
@@ -804,10 +833,16 @@ namespace SailwindCoop.Sync
             var spawnedInstances = new Dictionary<int, GameObject>();
             var itemIds = new List<int>();
 
-            // First pass: spawn all items
+            // First pass: spawn all items (per-item isolation - see SpawnItems; one bad item must not
+            // abort the join).
             foreach (var item in sortedItems)
             {
-                var instance = SpawnWorldItem(item);
+                GameObject instance = null;
+                try { instance = SpawnWorldItem(item); }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogError($"[WORLD-SYNC-DEBUG] SpawnWorldItem FAILED for id={item.InstanceId}, prefab={item.PrefabIndex}: {e}");
+                }
                 if (instance != null && item.InstanceId > 0)
                 {
                     // Check for duplicate IDs
@@ -1044,6 +1079,12 @@ namespace SailwindCoop.Sync
             if (saveable != null)
             {
                 saveable.Load(saveData);
+                // Load() sets amount (cooked >= 1) but the material was baked in Awake pre-Load; refresh so
+                // a cooked-state item doesn't render raw (crate-unseal precedent). MUST be exception-
+                // guarded: CookableFoodKettle's private Awake HIDES CookableFood.Awake, leaving
+                // renderer/materials/foodState null, so UpdateMaterial NREs on every KETTLE - unguarded,
+                // that single item aborted the ENTIRE join coroutine (2026-07-02 empty-ship rejoin).
+                ItemSyncManager.SafeRefreshCookedMaterial(instance.gameObject, instance.name);
             }
 
             // Also set ItemRigidbody position to prevent physics glitches
@@ -1323,103 +1364,15 @@ namespace SailwindCoop.Sync
             // the join coroutine). With recovering==true the FOM forces instantShifting, so reparenting
             // a transform that is already at its final world position is FOM-safe.
             //
-            // We replicate vanilla PlayerEmbarkDisembarkTrigger.EnterBoat (decomp lines 174-194):
-            //   playerController.parent = boatWalkCollider   (here: charController/ovrController transform)
-            //   playerObserver.parent   = actualBoat=boatModel (here: observerMirror transform)
-            // both with worldPositionStays:true so the on-deck pose set above is preserved. charController
-            // and ovrController are the SAME GameObject (PlayerControllerMirror wires both off one
-            // transform), so reparenting player.transform carries the OVR controller along - matching
-            // vanilla, which reparents playerController exactly once. We also set the static
-            // PlayerEmbarkDisembarkTrigger.embarked flag (EnterBoat sets this, decomp line 185): it gates
-            // the later on-land disembark in LateUpdate (decomp line 138), so without it vanilla ExitBoat
-            // would never fire when the guest walks ashore. We deliberately leave GameState.currentBoat /
-            // lastBoat as the join already set them (BoatStateApplicator ~208-209) and do NOT touch the
-            // player layer or BoatEmbarkCollider.ToggleBoatCapsuleCol: EnterBoat itself changes neither,
-            // and the guest is teleported straight onto the deck rather than crossing the EmbarkCol that
-            // would have zeroed the capsule radius, so there is nothing to restore.
+            // The actual transfer lives in ForceEmbarkLocalPlayer (extracted for the cluster-A embark
+            // self-heal watchdog in PlayerSyncManager) - GameState.lastBoat is the boat ROOT the join set
+            // at ~208-209 (actualBoat.parent = SaveableObject root), which is exactly the helper's input.
             if (isOnBoat && GameState.currentBoat != null)
             {
-                Transform boatModel = GameState.currentBoat;        // actualBoat (visual boat / mesh parent)
-                Transform walkCol = null;
-                Transform boatRoot = GameState.lastBoat;            // SaveableObject root (actualBoat.parent)
-                if (boatRoot != null)
+                if (!ForceEmbarkLocalPlayer(GameState.lastBoat))
                 {
-                    var boatRefs = boatRoot.GetComponent<BoatRefs>();
-                    if (boatRefs != null)
-                    {
-                        // Resolve walkCol the way the rest of the mod does (ItemSyncManager ~415-418).
-                        var embarkCol = boatRefs.GetComponentInChildren<BoatEmbarkCollider>();
-                        walkCol = embarkCol != null && embarkCol.walkCollider != null
-                            ? embarkCol.walkCollider
-                            : boatRefs.walkCol;
-                    }
-                }
-
-                if (walkCol != null)
-                {
-                    // FALL-THROUGH FIX: boatModel (the VISUAL hull, sea level) and walkCol (the PHYSICS walk
-                    // collider) are authored ~205m apart in WORLD space but share the SAME boat-LOCAL coordinate
-                    // for a given deck spot. The OLD line did SetParent(walkCol, worldPositionStays:TRUE), which
-                    // KEPT the sea-level world position and baked in the ~205m gap -> the controller stood 205m
-                    // UNDER the deck collider and fell through whenever the host was aboard a boat. Vanilla
-                    // EnterBoat transfers by LOCAL coordinate instead: express the on-deck world pose as a
-                    // boatModel-local coord, then re-apply that SAME local coord under walkCol -> the controller
-                    // lands ON the physics deck. (At a dock the two frames coincide, so dock/land joins worked.)
-                    {
-                        var pc = player.transform;
-                        // worldPositionStays:TRUE is load-bearing - it PRESERVES the on-deck WORLD pose (set
-                        // above) and captures it as a boatModel-LOCAL coord. With FALSE, Unity keeps the stale
-                        // _shifting-world-local numbers and reinterprets them under boatModel = garbage (flings
-                        // the controller hundreds of metres off). This makes the transfer byte-identical to
-                        // vanilla EnterBoat / PlayerEmbarkerNew.SyncToWalkCol.
-                        pc.SetParent(boatModel, true);                                    // capture on-deck world pose as boatModel-local
-                        var deckLocalPos = pc.localPosition; var deckLocalRot = pc.localRotation;
-                        pc.SetParent(walkCol, true);                                      // into the physics-deck frame (world pose preserved)
-                        pc.localPosition = deckLocalPos; pc.localRotation = deckLocalRot;  // re-apply SAME local coord -> on the deck collider
-                    }
-                    // playerObserver -> actualBoat (boatModel)
-                    if (Refs.observerMirror != null)
-                        Refs.observerMirror.transform.SetParent(boatModel, true);
-                    // Mirror EnterBoat's embarked=true so on-land ExitBoat can later fire.
-                    PlayerEmbarkDisembarkTrigger.embarked = true;
-
-                    // GUEST-UNDER-MAP fix: the reparent above matches vanilla PlayerEmbark(), but the
-                    // component that CONTINUOUSLY positions the controller - PlayerEmbarkerNew - is never
-                    // told it's embarked. Its private currentBoat stays null, so its LateUpdate runs
-                    // SyncToWorld() (charController.position = observerMirror.position) instead of
-                    // SyncToWalkCol(). Combined with PlayerControllerMirror's raw local-number copy across
-                    // the walkCol vs boatModel frames (~200m apart while underway), that bakes in a large,
-                    // stable offset and the guest's first-person camera ends up ~200m under the deck (the
-                    // physics frame; orbit cam uses the visual boat so it looked fine). Arm PlayerEmbarkerNew
-                    // exactly like vanilla PlayerEmbark() (currentBoat = EmbarkBoat(worldBoat, walkCol),
-                    // embarked, frameDelay) so SyncToWalkCol() reconciles the frames every frame. Pre-existing
-                    // bug (only bites when the boat is underway/helmed at join, so walkCol != boatModel);
-                    // dock joins coincided the frames and worked.
-                    var embarker = player.GetComponent<PlayerEmbarkerNew>()
-                                   ?? UnityEngine.Object.FindObjectOfType<PlayerEmbarkerNew>();
-                    if (embarker != null)
-                    {
-                        var et = HarmonyLib.Traverse.Create(embarker);
-                        et.Field("currentBoat").SetValue(new EmbarkBoat(boatModel, walkCol)); // worldBoat=visual boat, walkCol=physics
-                        et.Field("embarked").SetValue(true);
-                        et.Field("frameDelay").SetValue(0);   // 0 not 1: SyncToWalkCol must run the very next LateUpdate (no gravity window)
-                        // Drive one reconcile NOW so the controller is in the walkCol frame before the first
-                        // PlayerControllerMirror copy. Guarded: a vanilla-field change must never break the join.
-                        try { et.Method("SyncToWalkCol").GetValue(); }
-                        catch (System.Exception e) { Plugin.Log.LogWarning($"[PLAYER:TELEPORT] one-shot SyncToWalkCol failed (non-fatal): {e.Message}"); }
-                        Plugin.Log.LogInfo("[PLAYER:TELEPORT] Armed PlayerEmbarkerNew (SyncToWalkCol) so the guest stays on deck");
-                    }
-                    else
-                    {
-                        Plugin.Log.LogWarning("[PLAYER:TELEPORT] PlayerEmbarkerNew not found; guest may sit in the physics frame (under map)");
-                    }
-
-                    Plugin.Log.LogInfo($"[PLAYER:TELEPORT] Embarked guest onto boat (walkCol={walkCol.name}, boatModel={boatModel.name})");
-                }
-                else
-                {
-                    // Could not resolve the walk collider; leave the player parented to _shifting world
-                    // (no worse than the previous behaviour) and log so this is diagnosable.
+                    // Could not resolve the boat root / walk collider; leave the player parented to
+                    // _shifting world (no worse than the previous behaviour) and log so this is diagnosable.
                     Plugin.Log.LogWarning("[PLAYER:TELEPORT] isOnBoat but could not resolve walkCol; guest NOT embarked - they will be left behind if the host sails");
                 }
             }
@@ -1428,6 +1381,131 @@ namespace SailwindCoop.Sync
             // Setting its world position directly messes up its local position.
 
             Plugin.Log.LogInfo($"[PLAYER:TELEPORT] Final: charController={player.transform.position}");
+        }
+
+        /// <summary>
+        /// A (guest-world-pinned): force the LOCAL player into fully-embarked state on the given boat
+        /// ROOT (SaveableObject, the BoatRefs holder). Extracted VERBATIM from the join force-embark
+        /// block in TeleportPlayer so the embark self-heal watchdog (PlayerSyncManager) reuses the
+        /// exact same dual-frame transfer instead of forking the most bug-prone code in the mod.
+        ///
+        /// We replicate vanilla PlayerEmbarkDisembarkTrigger.EnterBoat (decomp lines 174-194):
+        ///   playerController.parent = boatWalkCollider   (here: charController/ovrController transform)
+        ///   playerObserver.parent   = actualBoat=boatModel (here: observerMirror transform)
+        /// both with worldPositionStays:true so the caller's on-deck world pose is preserved (the join
+        /// teleport just set it; the watchdog heals in place, so it is a visual no-op). charController
+        /// and ovrController are the SAME GameObject (PlayerControllerMirror wires both off one
+        /// transform), so reparenting player.transform carries the OVR controller along - matching
+        /// vanilla, which reparents playerController exactly once. We also set the static
+        /// PlayerEmbarkDisembarkTrigger.embarked flag (EnterBoat sets this, decomp line 185): it gates
+        /// the later on-land disembark in LateUpdate (decomp line 138), so without it vanilla ExitBoat
+        /// would never fire when the guest walks ashore. We do NOT touch the player layer or
+        /// BoatEmbarkCollider.ToggleBoatCapsuleCol: EnterBoat itself changes neither, and the player is
+        /// already standing on the deck rather than crossing the EmbarkCol that would have zeroed the
+        /// capsule radius, so there is nothing to restore.
+        ///
+        /// Returns false (having changed nothing) when boatModel/walkCol cannot be resolved.
+        /// </summary>
+        internal static bool ForceEmbarkLocalPlayer(Transform boatRoot)
+        {
+            var player = Refs.charController;
+            if (player == null || boatRoot == null) return false;
+
+            var boatRefs = boatRoot.GetComponent<BoatRefs>();
+            if (boatRefs == null) return false;
+
+            // actualBoat (visual boat / mesh parent). BoatRefs.boatModel is the authoritative reference;
+            // at join it is the same transform GameState.currentBoat was set to (~208-209), so join
+            // behavior is unchanged. Fall back to GameState.currentBoat only if the ref is unwired.
+            Transform boatModel = boatRefs.boatModel != null ? boatRefs.boatModel : GameState.currentBoat;
+
+            // Resolve walkCol the way the rest of the mod does (ItemSyncManager ~415-418).
+            var embarkCol = boatRefs.GetComponentInChildren<BoatEmbarkCollider>();
+            Transform walkCol = embarkCol != null && embarkCol.walkCollider != null
+                ? embarkCol.walkCollider
+                : boatRefs.walkCol;
+
+            if (boatModel == null || walkCol == null) return false;
+
+            // FALL-THROUGH FIX: boatModel (the VISUAL hull, sea level) and walkCol (the PHYSICS walk
+            // collider) are authored ~205m apart in WORLD space but share the SAME boat-LOCAL coordinate
+            // for a given deck spot. The OLD line did SetParent(walkCol, worldPositionStays:TRUE), which
+            // KEPT the sea-level world position and baked in the ~205m gap -> the controller stood 205m
+            // UNDER the deck collider and fell through whenever the host was aboard a boat. Vanilla
+            // EnterBoat transfers by LOCAL coordinate instead: express the on-deck world pose as a
+            // boatModel-local coord, then re-apply that SAME local coord under walkCol -> the controller
+            // lands ON the physics deck. (At a dock the two frames coincide, so dock/land joins worked.)
+            {
+                var pc = player.transform;
+                // worldPositionStays:TRUE is load-bearing - it PRESERVES the current WORLD pose and
+                // captures it as a boatModel-LOCAL coord. With FALSE, Unity keeps the stale
+                // _shifting-world-local numbers and reinterprets them under boatModel = garbage (flings
+                // the controller hundreds of metres off). This makes the transfer byte-identical to
+                // vanilla EnterBoat / PlayerEmbarkerNew.SyncToWalkCol.
+                pc.SetParent(boatModel, true);                                    // capture on-deck world pose as boatModel-local
+                var deckLocalPos = pc.localPosition; var deckLocalRot = pc.localRotation;
+                pc.SetParent(walkCol, true);                                      // into the physics-deck frame (world pose preserved)
+                pc.localPosition = deckLocalPos; pc.localRotation = deckLocalRot;  // re-apply SAME local coord -> on the deck collider
+            }
+            // playerObserver -> actualBoat (boatModel)
+            if (Refs.observerMirror != null)
+                Refs.observerMirror.transform.SetParent(boatModel, true);
+            // Mirror EnterBoat's embarked=true so on-land ExitBoat can later fire.
+            PlayerEmbarkDisembarkTrigger.embarked = true;
+
+            // Restore the boat root's capsule collider (review finding): the WATCHDOG caller's player
+            // typically DID cross the EmbarkCol during the on/off cycles that wedged the vanilla
+            // machines, and OnTriggerEnter zeroed the boat capsule radius; vanilla's own EnterBoat call
+            // site restores it (PlayerEmbarkDisembarkTrigger.cs:146), and with embarked forced true the
+            // vanilla restore branch can never run. Harmless no-op when the radius was never zeroed
+            // (the join-path caller).
+            var embarkColForCapsule = boatRefs.GetComponentInChildren<BoatEmbarkCollider>();
+            if (embarkColForCapsule != null)
+            {
+                try { embarkColForCapsule.ToggleBoatCapsuleCol(newState: true); }
+                catch (System.Exception e) { Plugin.Log.LogWarning($"[EMBARK] could not restore boat capsule collider: {e.Message}"); }
+            }
+
+            // GUEST-UNDER-MAP fix: the reparent above matches vanilla PlayerEmbark(), but the
+            // component that CONTINUOUSLY positions the controller - PlayerEmbarkerNew - is never
+            // told it's embarked. Its private currentBoat stays null, so its LateUpdate runs
+            // SyncToWorld() (charController.position = observerMirror.position) instead of
+            // SyncToWalkCol(). Combined with PlayerControllerMirror's raw local-number copy across
+            // the walkCol vs boatModel frames (~200m apart while underway), that bakes in a large,
+            // stable offset and the guest's first-person camera ends up ~200m under the deck (the
+            // physics frame; orbit cam uses the visual boat so it looked fine). Arm PlayerEmbarkerNew
+            // exactly like vanilla PlayerEmbark() (currentBoat = EmbarkBoat(worldBoat, walkCol),
+            // embarked, frameDelay) so SyncToWalkCol() reconciles the frames every frame. Pre-existing
+            // bug (only bites when the boat is underway/helmed at join, so walkCol != boatModel);
+            // dock joins coincided the frames and worked.
+            var embarker = player.GetComponent<PlayerEmbarkerNew>()
+                           ?? UnityEngine.Object.FindObjectOfType<PlayerEmbarkerNew>();
+            if (embarker != null)
+            {
+                var et = HarmonyLib.Traverse.Create(embarker);
+                et.Field("currentBoat").SetValue(new EmbarkBoat(boatModel, walkCol)); // worldBoat=visual boat, walkCol=physics
+                et.Field("embarked").SetValue(true);
+                et.Field("frameDelay").SetValue(0);   // 0 not 1: SyncToWalkCol must run the very next LateUpdate (no gravity window)
+                // Drive one reconcile NOW so the controller is in the walkCol frame before the first
+                // PlayerControllerMirror copy. Guarded: a vanilla-field change must never break the caller.
+                try { et.Method("SyncToWalkCol").GetValue(); }
+                catch (System.Exception e) { Plugin.Log.LogWarning($"[PLAYER:TELEPORT] one-shot SyncToWalkCol failed (non-fatal): {e.Message}"); }
+                Plugin.Log.LogInfo("[PLAYER:TELEPORT] Armed PlayerEmbarkerNew (SyncToWalkCol) so the guest stays on deck");
+            }
+            else
+            {
+                Plugin.Log.LogWarning("[PLAYER:TELEPORT] PlayerEmbarkerNew not found; guest may sit in the physics frame (under map)");
+            }
+
+            // Keep GameState coherent with the embark (vanilla EnterBoat sets currentBoat=actualBoat and
+            // lastBoat=actualBoat.parent). At join these were already set to exactly these values before
+            // this ran, so the join path is unchanged; on a watchdog heal they may be stale/null and the
+            // rest of the mod (push/control sync, PlayerSyncManager's boat-frame send) reads them.
+            GameState.currentBoat = boatModel;
+            GameState.lastBoat = boatRoot;
+
+            Plugin.Log.LogInfo($"[PLAYER:TELEPORT] Embarked guest onto boat (walkCol={walkCol.name}, boatModel={boatModel.name})");
+            return true;
         }
 
         /// <summary>

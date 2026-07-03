@@ -28,8 +28,10 @@ namespace SailwindCoop.Patches
                 var prefab = shipItem.GetComponent<SaveablePrefab>();
                 VerboseLogger.Log("TRADING", "LOCAL", $"PickUpItem called, item={shipItem.name}, instanceId={prefab?.instanceId}");
 
-                // LAZY ID CORRELATION: Always send ItemPickedUp - it establishes shared identity.
-                // Do not skip shop items here; the pickup packet is what drives ID correlation for them.
+                // LAZY ID CORRELATION: send ItemPickedUp - it establishes shared identity. Do not skip
+                // SOLD shop items here; the pickup packet is what drives ID correlation for them.
+                // (UNSOLD shop items are a vanilla-local INSPECTION and are gated inside OnLocalPickup -
+                // broadcasting them made receivers Sell() the item for free.)
                 ItemSyncManager.Instance?.OnLocalPickup(shipItem, -1);
             }
         }
@@ -95,6 +97,13 @@ namespace SailwindCoop.Patches
             if (__instance != null && __instance.sold && __instance.currentWalkCol == null
                 && !GameState.recovering && __instance.gameObject.layer != 26
                 && !MissionPatches.AbandoningMission   // an abandon's cargo-good destroys are intentional, not a LOD cull
+                // STOVE-FUEL exemption (2026-07-02 "-17300/3" stove counter): the comment below claims no
+                // real destroy happens far from the camera, but fuel BURNOUT is a SIM-initiated destroy -
+                // StoveFuel.Update runs `UnregisterBurntFuel(); DestroyItem();` EVERY FRAME until the object
+                // dies. Suppressing it leaves an immortal burnt fuel whose per-frame UnregisterBurntFuel
+                // decrements the stove's fuel count without floor (~60/s into deep negatives). A burnt
+                // fuel's destroy is legitimate at ANY distance - never eat it.
+                && !(__instance.GetComponent<StoveFuel>()?.inserted == true)
                 && Camera.main != null
                 && Vector3.Distance(Camera.main.transform.position, __instance.transform.position) > 300f)
             {
@@ -209,6 +218,14 @@ namespace SailwindCoop.Patches
             private static Vector3 _originalPosition;
             [System.ThreadStatic]
             private static int _prefabIndex;
+            // Whether the buyer ALREADY held the item when Sell() started. Discriminates the two purchase
+            // flows: point-at-buy (held==null at ENTER; Sell's own pointedAtBy.PickUpItem fires the pickup
+            // broadcast) vs inspect-then-buy-in-hand (held!=null at ENTER; NO pickup ever fires after the
+            // purchase, so Postfix must retro-send one). Checking held in Postfix alone can't tell them
+            // apart - it is non-null in BOTH by then, and retro-sending on the point-at-buy flow would
+            // double-broadcast the pickup.
+            [System.ThreadStatic]
+            private static bool _heldAtSellEnter;
 
             [HarmonyPrefix]
             public static void Prefix(ShipItem __instance)
@@ -219,6 +236,7 @@ namespace SailwindCoop.Patches
                 // Capture original position BEFORE item moves to player's hands
                 _originalPosition = __instance.transform.position;
                 _prefabIndex = prefab?.prefabIndex ?? 0;
+                _heldAtSellEnter = __instance.held != null;
 
                 // Mark as just purchased EARLY to prevent pickup race
                 // This ensures OnPickUpItem skips sync even if it runs before Postfix
@@ -251,11 +269,28 @@ namespace SailwindCoop.Patches
                     VerboseLogger.Log("TRADING", "DIAG", $"Skipping ItemSpawned for shop item - using lazy ID correlation");
                 }
 
-                // ShopItemBought is now disabled (handled by Sell() in OnRemoteItemPickupRequest)
+                // ShopItemBought is now disabled (receiver is a deliberate no-op; the ItemPickedUp-driven
+                // Sell() in OnRemoteItemPickedUp is the purchase propagation)
                 // Keeping the send for backwards compatibility but receiver ignores it
                 if (_prefabIndex > 0)
                 {
                     ItemSyncManager.Instance?.OnLocalShopItemBought(_prefabIndex, _originalPosition);
+                }
+
+                // INSPECT-THEN-BUY-IN-HAND retro-send (2026-07-02 free-item fix, step 4): with unsold-item
+                // inspection pickups now suppressed (ItemSyncManager.OnLocalPickup gate), the ONE purchase
+                // flow left with no pickup broadcast is buying an item you are ALREADY holding - vanilla
+                // Sell() skips pointedAtBy.PickUpItem when held (ShipItem.cs:514-517), so no pickup event
+                // fires after the purchase and the other machines would never learn the sale. Retro-send
+                // the pickup NOW, carrying the Prefix-captured TABLE position instead of the in-hand pose:
+                // receivers' prefab+position correlation (maxDist=3) must hit their copy, which still sits
+                // on the shop table at dist~0 - the hand pose would correlate to nothing (or the wrong
+                // item). Receivers then Sell() their copy via the normal ItemPickedUp purchase propagation.
+                // Effectively host-buy-only: a guest's purchases route via ShopTradeRequest, whose Sell runs
+                // under IsApplyingRemoteState (already excluded above).
+                if (_heldAtSellEnter && __instance.held != null)
+                {
+                    ItemSyncManager.Instance?.OnLocalPickup(__instance, -1, _originalPosition);
                 }
             }
         }

@@ -2192,6 +2192,13 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.IsBuying);
             writer.Write(packet.CurrencyIndex); // Must match ReadShopTradeRequest order
             writer.Write(packet.PrefabIndex);   // Must match ReadShopTradeRequest order
+            // v0.2.20 appended item-state fields - order MUST mirror ReadShopTradeRequest exactly.
+            writer.Write(packet.ItemAmount);
+            writer.Write(packet.ItemHealth);
+            writer.Write(packet.FoodDried);
+            writer.Write(packet.FoodSmoked);
+            writer.Write(packet.FoodSalted);
+            writer.Write(packet.FoodSpoiled);
         }
 
         public static ShopTradeRequestPacket ReadShopTradeRequest(BinaryReader reader)
@@ -2206,7 +2213,14 @@ namespace SailwindCoop.Networking.Packets
                 Price = reader.ReadInt32(),
                 IsBuying = reader.ReadBoolean(),
                 CurrencyIndex = reader.ReadInt32(),
-                PrefabIndex = reader.ReadInt32()
+                PrefabIndex = reader.ReadInt32(),
+                // v0.2.20 appended item-state fields - order MUST mirror WriteShopTradeRequest exactly.
+                ItemAmount = reader.ReadSingle(),
+                ItemHealth = reader.ReadSingle(),
+                FoodDried = reader.ReadSingle(),
+                FoodSmoked = reader.ReadSingle(),
+                FoodSalted = reader.ReadSingle(),
+                FoodSpoiled = reader.ReadSingle()
             };
         }
 
@@ -2216,6 +2230,7 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.Reason);
             writer.Write(packet.PriceAmount);
             writer.Write(packet.CurrencyIndex);
+            writer.Write(packet.SpawnedItemId); // v0.2.20 appended - must mirror ReadShopTradeResult
         }
 
         public static ShopTradeResultPacket ReadShopTradeResult(BinaryReader reader)
@@ -2225,7 +2240,8 @@ namespace SailwindCoop.Networking.Packets
                 Success = reader.ReadBoolean(),
                 Reason = reader.ReadByte(),
                 PriceAmount = reader.ReadInt32(),
-                CurrencyIndex = reader.ReadInt32()
+                CurrencyIndex = reader.ReadInt32(),
+                SpawnedItemId = reader.ReadInt32() // v0.2.20 appended - must mirror WriteShopTradeResult
             };
         }
 
@@ -2237,6 +2253,32 @@ namespace SailwindCoop.Networking.Packets
         public static GuestJoinCompletePacket ReadGuestJoinComplete(BinaryReader reader)
         {
             return new GuestJoinCompletePacket();
+        }
+
+        public static void WritePingRequest(BinaryWriter writer, PingRequestPacket packet)
+        {
+            writer.Write(packet.SendTime);
+        }
+
+        public static PingRequestPacket ReadPingRequest(BinaryReader reader)
+        {
+            return new PingRequestPacket
+            {
+                SendTime = reader.ReadSingle()
+            };
+        }
+
+        public static void WritePingReply(BinaryWriter writer, PingReplyPacket packet)
+        {
+            writer.Write(packet.SendTime);
+        }
+
+        public static PingReplyPacket ReadPingReply(BinaryReader reader)
+        {
+            return new PingReplyPacket
+            {
+                SendTime = reader.ReadSingle()
+            };
         }
 
         public static void WriteShopItemBought(BinaryWriter writer, ShopItemBoughtPacket packet)

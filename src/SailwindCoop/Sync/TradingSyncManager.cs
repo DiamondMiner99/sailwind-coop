@@ -766,7 +766,7 @@ namespace SailwindCoop.Sync
         /// reject drives the guest's item-restore + "Not enough money." toast; success releases (destroys)
         /// the guest's parked optimistic copy.
         /// </summary>
-        private void SendShopTradeResult(SteamId target, bool success, byte reason, int currencyIndex, int amount)
+        private void SendShopTradeResult(SteamId target, bool success, byte reason, int currencyIndex, int amount, int spawnedItemId = 0)
         {
             if (!Plugin.IsHost) return;
             var packet = new ShopTradeResultPacket
@@ -774,7 +774,8 @@ namespace SailwindCoop.Sync
                 Success = success,
                 Reason = reason,
                 PriceAmount = amount,
-                CurrencyIndex = currencyIndex
+                CurrencyIndex = currencyIndex,
+                SpawnedItemId = spawnedItemId // v0.2.20: buyer auto-picks the authoritative copy (0 = none)
             };
             Plugin.NetworkManager.SendReliable(target, PacketType.ShopTradeResult, w =>
                 PacketSerializer.WriteShopTradeResult(w, packet));
@@ -793,8 +794,8 @@ namespace SailwindCoop.Sync
 
             if (packet.Success)
             {
-                VerboseLogger.Log("TRADING", "APPLY", $"ShopTradeResult success, amount={packet.PriceAmount}");
-                SailwindCoop.Patches.EconomyPatches.ShopkeeperSellItemPatch.ResolvePendingStallBuy(true);
+                VerboseLogger.Log("TRADING", "APPLY", $"ShopTradeResult success, amount={packet.PriceAmount}, spawnedItemId={packet.SpawnedItemId}");
+                SailwindCoop.Patches.EconomyPatches.ShopkeeperSellItemPatch.ResolvePendingStallBuy(true, packet.SpawnedItemId);
             }
             else
             {
@@ -871,7 +872,7 @@ namespace SailwindCoop.Sync
                 // Spawn BEFORE confirming - if we confirmed first and the spawn then degraded (bad prefab
                 // slot / exception), the guest would have already destroyed its parked copy: money charged,
                 // item nowhere. On spawn failure refund the deduction, reject, and resync.
-                if (!SpawnAuthoritativeStallItem(sender, packet))
+                if (!SpawnAuthoritativeStallItem(sender, packet, out int spawnedItemId))
                 {
                     PlayerGold.currency[currency] += packet.Price;
                     VerboseLogger.Log("TRADING", "REJECT", $"ShopBuy authoritative spawn failed; refunded {packet.Price} to currency {currency}");
@@ -881,7 +882,8 @@ namespace SailwindCoop.Sync
                 }
                 // Confirm the buy so the requester destroys its parked optimistic copy (the
                 // authoritative ItemSpawned from SpawnAuthoritativeStallItem is the canonical item).
-                SendShopTradeResult(sender, true, 0, currency, packet.Price);
+                // spawnedItemId (0 on the no-prefab degrade path) lets the buyer auto-pick it up.
+                SendShopTradeResult(sender, true, 0, currency, packet.Price, spawnedItemId);
             }
             else
             {
@@ -910,17 +912,18 @@ namespace SailwindCoop.Sync
         /// POSITION (floating origin): packet.ShopkeeperPos is a world coord in the GUEST's
         /// floating-origin frame. FloatingOriginManager.outCurrentOffset is per-client, so instantiating at that
         /// raw value in the HOST's frame (and then OnLocalItemSpawned subtracting the host offset) puts the item
-        /// in the ocean/underground when host and guest aren't co-located. We resolve the host's OWN local
-        /// shopkeeper near the packet position (reusing TryUpdateIslandEconomy's pattern) and spawn there. If the
-        /// host isn't co-located (no local shopkeeper found), we fall back to the BUYER's tracked avatar position
-        /// (RemotePlayerManager) - which is already maintained in the HOST's frame - so the item appears at/near
-        /// the buyer on every client, never at a cross-frame world coord.
+        /// in the ocean/underground when host and guest aren't co-located. We spawn at the BUYER's tracked
+        /// avatar position (RemotePlayerManager, maintained in the HOST's frame) so the item appears at the
+        /// buyer's feet on every client; the host's OWN co-located shopkeeper (TryUpdateIslandEconomy's
+        /// nearest-shopkeeper pattern) is only the fallback when the avatar is unknown, then the local player -
+        /// never a raw cross-frame world coord.
         ///
         /// Then mark sold, register to save + as missionless, and OnLocalItemSpawned broadcasts the existing
         /// ItemSpawned packet to all peers (incl. the buyer, who suppressed its optimistic copy) - no duplicate.
         /// </summary>
-        private bool SpawnAuthoritativeStallItem(SteamId sender, ShopTradeRequestPacket packet)
+        private bool SpawnAuthoritativeStallItem(SteamId sender, ShopTradeRequestPacket packet, out int spawnedItemId)
         {
+            spawnedItemId = 0; // 0 = nothing spawned (degrade path / failure); buyer skips auto-pickup
             // Use the RAW prefab index directly. prefabIndex 0 is the directory's null slot.
             int prefabIndex = packet.PrefabIndex;
             if (prefabIndex <= 0)
@@ -952,43 +955,69 @@ namespace SailwindCoop.Sync
                 return false;
             }
 
-            // Floating origin: resolve a frame-correct spawn position.
+            // Floating origin: resolve a frame-correct spawn position. The BUYER's tracked avatar (already
+            // maintained in the HOST's frame) is the PRIMARY anchor - the item belongs at the buyer's feet,
+            // not on the NPC. The host's co-located shopkeeper is only the fallback when the avatar is
+            // unknown, then the local player as a last resort. (Previously shopkeeper-first: with host and
+            // buyer at the same port every buy landed on the fixed NPC coords and never near the buyer.)
             var guestShopkeeperPos = new Vector3(packet.ShopkeeperPosX, packet.ShopkeeperPosY, packet.ShopkeeperPosZ);
             Vector3 spawnPos;
-            if (TryResolveLocalShopkeeperPos(guestShopkeeperPos, out var localShopkeeperPos))
+            var avatarPos = SailwindCoop.Player.RemotePlayerManager.Instance?.GetLastKnownPosition(sender) ?? Vector3.zero;
+            if (avatarPos != Vector3.zero)
             {
-                // Host is co-located: use the host's OWN local shopkeeper transform (host frame).
+                spawnPos = avatarPos + Vector3.up;
+            }
+            else if (TryResolveLocalShopkeeperPos(guestShopkeeperPos, out var localShopkeeperPos))
+            {
+                // No tracked avatar but the host is co-located: the host's OWN local shopkeeper transform
+                // (host frame) is still port-correct.
                 spawnPos = localShopkeeperPos + Vector3.up;
             }
             else
             {
-                // Host not co-located: spawn at the BUYER's avatar position (already tracked in the host frame),
-                // so the item lands at/near the buyer on every client instead of a cross-frame ocean coord.
-                var avatarPos = SailwindCoop.Player.RemotePlayerManager.Instance?.GetLastKnownPosition(sender) ?? Vector3.zero;
-                if (avatarPos == Vector3.zero)
-                {
-                    // Last resort (no avatar yet / unknown): the guest's own avatar isn't tracked - keep the item
-                    // near the local player so it's at least reachable rather than at world origin.
-                    avatarPos = Refs.charController != null
-                        ? Refs.charController.transform.position
-                        : (FloatingOriginManager.instance != null ? FloatingOriginManager.instance.outCurrentOffset : Vector3.zero);
-                    VerboseLogger.Log("TRADING", "WARN", $"ShopBuy: no local shopkeeper and no avatar for {sender}; spawning near local player");
-                }
-                spawnPos = avatarPos + Vector3.up;
+                // Last resort (no avatar and not co-located): keep the item near the local player so it's
+                // at least reachable rather than at a cross-frame world coord.
+                var fallbackPos = Refs.charController != null
+                    ? Refs.charController.transform.position
+                    : (FloatingOriginManager.instance != null ? FloatingOriginManager.instance.outCurrentOffset : Vector3.zero);
+                VerboseLogger.Log("TRADING", "WARN", $"ShopBuy: no avatar for {sender} and no local shopkeeper; spawning near local player");
+                spawnPos = fallbackPos + Vector3.up;
             }
 
             try
             {
                 var spawned = Object.Instantiate(prefab, spawnPos, Quaternion.identity);
-                spawned.GetComponent<ShipItem>().sold = true;
+                var shipItem = spawned.GetComponent<ShipItem>();
+                shipItem.sold = true;
+
+                // v0.2.20: reproduce the bought DISPLAY item's state on the pristine prefab. "Cooked" is
+                // amount>=1 on the raw prefab (CookInShop), not a prefab variant; without this every cooked
+                // fish arrives raw. Apply BEFORE OnLocalItemSpawned so the broadcast ItemSpawnedPacket
+                // (BuildItemSpawnedPacket reads item.amount/health) carries the state to every peer.
+                shipItem.amount = packet.ItemAmount;
+                shipItem.health = packet.ItemHealth;
+                var foodState = spawned.GetComponent<FoodState>();
+                if (foodState != null)
+                {
+                    foodState.dried = packet.FoodDried;
+                    foodState.smoked = packet.FoodSmoked;
+                    foodState.salted = packet.FoodSalted;
+                    foodState.spoiled = packet.FoodSpoiled;
+                }
+                // Awake baked the raw material before we set amount - refresh (crate-unseal precedent,
+                // ItemSyncManager.ApplyCrateItem). Guarded: kettles NRE in UpdateMaterial
+                // (CookableFoodKettle.Awake hides the base init) - see SafeRefreshCookedMaterial doc.
+                ItemSyncManager.SafeRefreshCookedMaterial(spawned.gameObject, spawned.name);
+
                 spawned.GetComponent<SaveablePrefab>().RegisterToSave();
                 spawned.GetComponent<Good>()?.RegisterAsMissionless();
 
                 // Broadcast the spawned item to all peers (existing ItemSpawned packet) - includes the buyer, whose
                 // optimistic vanilla copy was suppressed in EconomyPatches so only this authoritative one remains.
-                ItemSyncManager.Instance?.OnLocalItemSpawned(spawned.GetComponent<ShipItem>());
+                ItemSyncManager.Instance?.OnLocalItemSpawned(shipItem);
 
-                VerboseLogger.Log("TRADING", "SPAWN", $"ShopBuy authoritative item spawned: prefab={prefabIndex} ({prefab.name}), good={packet.GoodIndex}, pos={spawnPos}, id={spawned.GetComponent<SaveablePrefab>()?.instanceId}");
+                spawnedItemId = spawned.GetComponent<SaveablePrefab>()?.instanceId ?? 0;
+                VerboseLogger.Log("TRADING", "SPAWN", $"ShopBuy authoritative item spawned: prefab={prefabIndex} ({prefab.name}), good={packet.GoodIndex}, pos={spawnPos}, id={spawnedItemId}, amount={packet.ItemAmount}");
                 return true;
             }
             catch (System.Exception ex)

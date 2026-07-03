@@ -1231,6 +1231,8 @@ namespace SailwindCoop.Sync
             _unsealingCrateIds.Clear();
             _pendingDropTerminals.Clear();
             _skippedDropsWhileHeld.Clear();
+            _justLocallyDestroyed.Clear();
+            _recentlyRemoteDestroyed.Clear();
         }
 
         /// <summary>
@@ -1272,11 +1274,20 @@ namespace SailwindCoop.Sync
 
         #region Local Events (called from patches)
 
+        // Vanilla keeps the owning ShopArea private on ShipItem; it is the discriminator between an
+        // INSPECTION pickup (unsold + shopArea, purely local in vanilla) and a real syncable pickup.
+        // Cached FieldRef (not per-call Traverse) because OnLocalPickup/OnLocalDrop run on every grab.
+        private static readonly HarmonyLib.AccessTools.FieldRef<ShipItem, ShopArea> ShopAreaRef =
+            HarmonyLib.AccessTools.FieldRefAccess<ShipItem, ShopArea>("shopArea");
+
         /// <summary>
         /// Called when local player picks up an item.
         /// Host: records and broadcasts. Guest: sends request.
+        /// positionOverride: when set, the packet carries THIS world position instead of the item's
+        /// transform (used by the inspect-then-buy retro-send, which must advertise the shop TABLE
+        /// position the other machines' copies still sit at - see ShipItemSellPatch.Postfix).
         /// </summary>
-        public void OnLocalPickup(ShipItem item, int inventorySlot = -1)
+        public void OnLocalPickup(ShipItem item, int inventorySlot = -1, Vector3? positionOverride = null)
         {
             if (IsApplyingRemoteState) return;
             if (item == null) return;
@@ -1285,6 +1296,21 @@ namespace SailwindCoop.Sync
             if (prefab == null) return;
 
             int instanceId = prefab.instanceId;
+
+            // INSPECTION GATE (2026-07-02 free-item exploit): picking up an UNSOLD shop item is legal
+            // vanilla INSPECTION - purchase only ever happens via OnAltActivate -> Shopkeeper.TryToSellItem,
+            // and vanilla resolves the put-back purely locally (OnDrop -> ReturnToShopPos, never networked).
+            // Broadcasting the inspection made every receiver's handler treat it as a purchase and Sell() the
+            // item for FREE (no wallet deduction), permanently minting it on that machine. So inspection stays
+            // purely local: no broadcast, no id churn for the shared id-0 vendor pool. The WasJustPurchased
+            // check keeps the point-at-buy auto-pickup syncing (Sell's Prefix marks it BEFORE sold is set, so
+            // this gate can't swallow the same-frame purchase pickup); the shopArea!=null guard keeps any odd
+            // unsold-but-not-in-a-shop item syncable exactly as before.
+            if (!item.sold && !WasJustPurchased(instanceId) && ShopAreaRef(item) != null)
+            {
+                VerboseLogger.ItemLocal($"Inspection pickup of unsold shop item {item.name} - not broadcast (vanilla resolves inspection locally)");
+                return;
+            }
 
             // SEND-SIDE HARDENING: never broadcast id=0. Unsold vendor-table items all share instanceId==0;
             // if we broadcast 0, receivers that look up by id match an ARBITRARY first id-0 item (wrong prefab).
@@ -1297,13 +1323,29 @@ namespace SailwindCoop.Sync
                 Plugin.Log.LogInfo($"[ITEM:PICKUP] Assigned new ID {instanceId} to {item.name}");
             }
 
+            // The retro-send IS a shop purchase, but Sell's Prefix could not mark it: table items carry
+            // instanceId 0 there and MarkItemAsJustPurchased(0) is a no-op. Mark the freshly-minted id now,
+            // or the host branch below would miss isShopPurchase and send an ItemSpawned backfill -
+            // DUPLICATING the item on guests whose table copy the ItemPickedUp correlation is meant to claim.
+            if (positionOverride.HasValue)
+            {
+                MarkItemAsJustPurchased(instanceId);
+            }
+
             // Calculate position for lazy ID correlation
             // Use boat-local if on boat, world position if on land
             Vector3 position;
             string boatName = "";
             bool isLocalPosition = false;
 
-            if (item.currentActualBoat != null)
+            if (positionOverride.HasValue)
+            {
+                // Inspect-then-buy retro-send: the item is in the buyer's HAND, but receivers must
+                // correlate against the pose their copy still has - the shop table (world frame; shop
+                // tables are never boat-parented, so this is always a land-style position).
+                position = positionOverride.Value;
+            }
+            else if (item.currentActualBoat != null)
             {
                 // On boat - use local position
                 boatName = item.currentActualBoat.name;
@@ -1372,6 +1414,31 @@ namespace SailwindCoop.Sync
 
             var prefab = item.GetComponent<SaveablePrefab>();
             if (prefab == null) return;
+
+            // INSPECTION GATE, drop side (symmetric to OnLocalPickup): the pickup of an unsold shop item
+            // was never broadcast, so the release must not be either - vanilla OnDrop -> ReturnToShopPos
+            // lerps it back onto the table purely locally, and a drop packet here would land the release
+            // POSE on machines that never saw a pickup (the "bought item on the floor" half of the free-item
+            // report). Also keeps the drop-settle terminal from arming for inspection drops.
+            if (!item.sold && ShopAreaRef(item) != null)
+            {
+                VerboseLogger.ItemLocal($"Inspection drop of unsold shop item {item.name} - not broadcast (vanilla ReturnToShopPos handles it locally)");
+                return;
+            }
+
+            // K3: the item was just LOCALLY destroyed (e.g. a fishing hook consumed by the rod attach) and
+            // this "drop" is only GoPointer releasing the consumed held reference - broadcasting it would
+            // pair a contradictory ItemDropped with the ItemDestroyed already on the wire and resurrect a
+            // phantom on receivers via the drop backfill. Suppress it at the source.
+            if (_justLocallyDestroyed.TryGetValue(prefab.instanceId, out float destroyedAt))
+            {
+                if (Time.time - destroyedAt <= JustDestroyedDropSuppressWindow)
+                {
+                    VerboseLogger.ItemLocal($"Skipping drop sync for item {prefab.instanceId} - just locally destroyed");
+                    return;
+                }
+                _justLocallyDestroyed.Remove(prefab.instanceId); // stale entry - stop it shadowing a reused id
+            }
 
             // Skip drop sync if item is in inventory slot
             // (Game calls DropItem when item enters inventory, but it's not a real drop)
@@ -1844,18 +1911,35 @@ namespace SailwindCoop.Sync
 
                 // If this is a shop item, call game's built-in purchase method
                 // Handles: sold=true, reparent to world, save registration, OnBuy()
+                // KEPT (unlike the host request-path Sell, removed 2026-07-02): with inspection pickups
+                // no longer broadcast at the sender, an ItemPickedUp for a locally-unsold item can only
+                // mean the sender REALLY bought it (or our sold flag is stale) - this IS the legitimate
+                // purchase propagation / self-heal.
                 if (!item.sold)
                 {
                     item.Sell();
                     VerboseLogger.ItemApply($"Called Sell() on shop item {item.name}");
                 }
 
+                // DELIBERATELY DO NOT null currentlyStayedEmbarkCol here (review finding): a remote-held
+                // item keeps its boat latch, exactly like a vanilla LOCALLY-held item does (the layer-26
+                // gate pins frameCounter at 0 for local holds; for a remote hold the equivalent
+                // protection is stayed == currentBoatCollider, which holds because collider-disable
+                // freezes both). Nulling stayed here opened vanilla ExtraFixedUpdate's ExitBoat branch
+                // (!stayed && currentActualBoat && frameCounter>1) ~2 fixed frames into EVERY remote
+                // carry of a latched deck item - silently removing the cargo from the HOST's BoatMass
+                // mid-carry. Staleness is instead handled where it matters: ClearBoatLatch on land-drop
+                // applies, and the boat-drop apply re-seeds stayed/currentBoatCollider consistently.
+
                 // INVENTORY SLOT HANDLING:
                 // When item is in remote player's inventory (slot >= 0), hide it entirely.
                 // When item is in hand (slot == -1), show it and position at hand.
                 if (packet.InventorySlot >= 0)
                 {
-                    // Item is in remote player's inventory - hide it
+                    // Item is in remote player's inventory - hide it.
+                    // G: a fishing rod's bobber/line lives OUTSIDE the rod hierarchy (world-parented);
+                    // park it kinematic+inactive BEFORE the hide or it falls through the earth.
+                    FishingSyncManager.SyncExternalRodParts(item, stowed: true);
                     item.gameObject.SetActive(false);
                     VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} hidden (in remote inventory slot {packet.InventorySlot})");
                 }
@@ -1863,6 +1947,8 @@ namespace SailwindCoop.Sync
                 {
                     // Item is in hand - make sure it's visible and set up physics
                     item.gameObject.SetActive(true);
+                    // G: restore the rod's external bobber/line if a previous slot update parked it.
+                    FishingSyncManager.SyncExternalRodParts(item, stowed: false);
 
                     // REMOTE HELD ITEM PHYSICS FIX:
                     // When a player holds an item locally, the game sets held=GoPointer which triggers:
@@ -1923,7 +2009,45 @@ namespace SailwindCoop.Sync
         /// calls ItemRigidbody.ExitBoat, and detaches hangables); always also clear currentBoatCollider
         /// afterwards to cover an item that carries a stale collider WITHOUT being latched (the state the
         /// old manual clears left behind).
+        ///
+        /// ALSO null currentlyStayedEmbarkCol + reset frameCounter (2026-07-02 dock-fall-through
+        /// regression, unmasked by the v0.2.21 currentBoatCollider clear above): while an item is remotely
+        /// held its colliders are disabled, and Unity 2019 fires NO OnTriggerExit on disable, so
+        /// currentlyStayedEmbarkCol FREEZES at its pre-pickup value (the boat's EmbarkCol for an item
+        /// lifted off a deck). With currentBoatCollider now honestly nulled, ShipItem.ExtraFixedUpdate's
+        /// gate `stayed != currentBoatCollider && frameCounter > 1` sees stale-non-null vs null and fires a
+        /// SPURIOUS EnterBoat ~2 fixed frames after a land-drop apply - teleporting the rigidbody to the
+        /// boat's ~205m-offset PHYSICS frame at the dock-point's boat-local coords (empty water beside the
+        /// physics hull), i.e. cargo "falls through the dock". Clearing stayed too (mirroring vanilla
+        /// OnEnterInventory, ShipItem.cs:383) removes the mismatch; a GENUINE overlap still re-latches
+        /// because the drop apply re-enables the item's own trigger before positioning, so a fresh
+        /// OnTriggerEnter re-populates stayed normally.
         /// </summary>
+        private static readonly HarmonyLib.AccessTools.FieldRef<ShipItem, Collider> StayedEmbarkColRef =
+            HarmonyLib.AccessTools.FieldRefAccess<ShipItem, Collider>("currentlyStayedEmbarkCol");
+        private static readonly HarmonyLib.AccessTools.FieldRef<ShipItem, Collider> CurrentBoatColliderRef =
+            HarmonyLib.AccessTools.FieldRefAccess<ShipItem, Collider>("currentBoatCollider");
+
+        /// <summary>
+        /// Refresh a spawned/loaded item's cooked-food material WITHOUT letting it throw. Vanilla
+        /// CookableFoodKettle declares a private Awake() that HIDES CookableFood.Awake(), so kettles
+        /// never initialize renderer/rawMaterial/blendedMaterial/foodState and CookableFood.UpdateMaterial
+        /// NREs deterministically (UpdateMaterial also derefs foodState unguarded for foods without a
+        /// FoodState). Unguarded, one kettle in the join snapshot aborted the ENTIRE join coroutine -
+        /// empty ship, "purchase the ship" prompt, reefed sails (2026-07-02 rejoin report). The material
+        /// refresh is cosmetic; a failure must never propagate.
+        /// </summary>
+        internal static void SafeRefreshCookedMaterial(GameObject go, string itemName)
+        {
+            var cookable = go != null ? go.GetComponent<CookableFood>() : null;
+            if (cookable == null) return;
+            try { cookable.UpdateMaterial(); }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[ITEM] UpdateMaterial skipped for {itemName}: {e.Message} (expected for kettles - CookableFoodKettle hides the base Awake)");
+            }
+        }
+
         internal static void ClearBoatLatch(ShipItem item)
         {
             if (item == null) return;
@@ -1945,8 +2069,13 @@ namespace SailwindCoop.Sync
                     }
                 }
             }
-            try { HarmonyLib.Traverse.Create(item).Field("currentBoatCollider").SetValue(null); }
-            catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not clear currentBoatCollider on {item.name}: {e.Message}"); }
+            try
+            {
+                CurrentBoatColliderRef(item) = null;
+                StayedEmbarkColRef(item) = null;   // see doc comment: prevents the spurious delayed EnterBoat
+                item.frameCounter = 0;             // restart the vanilla ~2-frame dwell from a clean baseline
+            }
+            catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not clear boat-latch fields on {item.name}: {e.Message}"); }
         }
 
         public void OnRemoteItemDropped(ItemDroppedPacket packet, SteamId sender = default)
@@ -1963,6 +2092,20 @@ namespace SailwindCoop.Sync
             {
                 VerboseLogger.ItemApply($"ItemDropped IGNORED: id={packet.ItemInstanceId} from {sender} but holder is {recordedHolder}");
                 return;
+            }
+
+            // K3 receiver hardening: a drop for an id destroyed within the last ~2s is the contradictory
+            // half of a destroy+drop pair (hook consumed by a rod attach, stove-fuel burnout, ...). Skip it
+            // ENTIRELY - apply, the peer-missing ItemSpawned backfill below (which would resurrect the
+            // pending-destroy object as a phantom), and the relay (the pair is equally bogus downstream).
+            if (_recentlyRemoteDestroyed.TryGetValue(packet.ItemInstanceId, out float remoteDestroyedAt))
+            {
+                if (Time.time - remoteDestroyedAt <= RemoteDestroyedDropSkipWindow)
+                {
+                    VerboseLogger.ItemApply($"Skipping ItemDropped for recently destroyed item {packet.ItemInstanceId}");
+                    return;
+                }
+                _recentlyRemoteDestroyed.Remove(packet.ItemInstanceId);
             }
 
             // STAR host-relay: after the host validates a guest's drop, forward it to the OTHER guests so the
@@ -2067,6 +2210,10 @@ namespace SailwindCoop.Sync
                 // Re-enable item if it was hidden (in inventory)
                 item.gameObject.SetActive(true);
 
+                // G: a rod dropped straight out of a remote inventory must get its parked external
+                // bobber/line back (positioning below moves the rod; the bobber re-snaps via its joint).
+                FishingSyncManager.SyncExternalRodParts(item, stowed: false);
+
                 // Clear the fake held reference we set during pickup
                 item.held = null;
 
@@ -2122,6 +2269,30 @@ namespace SailwindCoop.Sync
                     item.currentActualBoat = boatModel;
                     item.currentWalkCol = walkCol;
 
+                    // Also set the PRIVATE vanilla latch pair to a CONSISTENT state (2026-07-02 deck-drop
+                    // seabed bug, mirror of the ClearBoatLatch case): this branch used to set only the
+                    // public fields, leaving vanilla's trigger-tracked stayed/currentBoatCollider at
+                    // whatever they froze at while the item's colliders were disabled during the carry.
+                    // If stayed was stale-NULL (item never latched on this machine, e.g. loaded from the
+                    // dock), ShipItem.ExtraFixedUpdate's other branch (`!stayed && currentActualBoat &&
+                    // frameCounter > 1`) fired a spurious vanilla ExitBoat ~2 fixed frames after this
+                    // apply, un-parenting the rigidbody to the world frame while the boat sailed on - the
+                    // deck-dropped item then sank to the seabed. With stayed == currentBoatCollider (and
+                    // frameCounter reset) the dwell counter stays at 0, so neither the spurious EnterBoat
+                    // (double BoatMass.AddItem) nor the spurious ExitBoat can fire; real trigger events
+                    // resume from this baseline once the item's colliders are re-enabled below.
+                    var embarkTrigger = embarkCol != null ? embarkCol.GetComponent<Collider>() : null;
+                    if (embarkTrigger != null)
+                    {
+                        try
+                        {
+                            StayedEmbarkColRef(item) = embarkTrigger;
+                            CurrentBoatColliderRef(item) = embarkTrigger;
+                            item.frameCounter = 0;
+                        }
+                        catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not set boat-latch fields on dropped boat item {packet.ItemInstanceId}: {e.Message}"); }
+                    }
+
                     // 2. Parent ShipItem to visual boat (boatModel)
                     item.transform.SetParent(boatModel, worldPositionStays: false);
 
@@ -2169,6 +2340,20 @@ namespace SailwindCoop.Sync
                         // the rb is parented to walkCol, so the mapping is correct immediately.)
                         try { HarmonyLib.Traverse.Create(item.itemRigidbodyC).Field("onBoat").SetValue(true); }
                         catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not set onBoat on dropped boat item {packet.ItemInstanceId}: {e.Message}"); }
+
+                        // Register the cargo's WEIGHT (review finding): vanilla EnterBoat's third job -
+                        // besides parenting and onBoat - is BoatMass.AddItem. Pre-batch this apply relied
+                        // on the spurious auto-EnterBoat a couple frames later to do it; the latch seeding
+                        // above suppresses that EnterBoat FOREVER (stayed == currentBoatCollider), so
+                        // without this call every guest-loaded crate is weightless on the physics-
+                        // authoritative machine and the boat sails as if the hold were empty. AddItem
+                        // dedups internally, so a racing real EnterBoat cannot double-add.
+                        try
+                        {
+                            var boatMass = boatModel.parent != null ? boatModel.parent.GetComponent<BoatMass>() : null;
+                            boatMass?.AddItem(item.itemRigidbodyC);
+                        }
+                        catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not add dropped boat item {packet.ItemInstanceId} to BoatMass: {e.Message}"); }
 
                         VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} ItemRigidbody: parent={walkCol.name}, localPos={packet.Position}");
                     }
@@ -2262,14 +2447,16 @@ namespace SailwindCoop.Sync
                     {
                         if (packet.InventorySlot >= 0)
                         {
-                            // Moving to inventory - hide
+                            // Moving to inventory - hide (G: park the rod's world-parented bobber first)
+                            FishingSyncManager.SyncExternalRodParts(existingItem, stowed: true);
                             existingItem.gameObject.SetActive(false);
                             VerboseLogger.ItemApply($"Host hiding guest item {packet.ItemInstanceId} (moved to inventory slot {packet.InventorySlot})");
                         }
                         else
                         {
-                            // Moving to hand - show
+                            // Moving to hand - show (G: restore the rod's parked bobber after)
                             existingItem.gameObject.SetActive(true);
+                            FishingSyncManager.SyncExternalRodParts(existingItem, stowed: false);
                             VerboseLogger.ItemApply($"Host showing guest item {packet.ItemInstanceId} (moved to hand)");
                         }
                     }
@@ -2379,6 +2566,25 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // INSPECTION-STEAL GUARD (2026-07-02 free-item exploit): this path used to run
+            // `if (!item.sold) item.Sell()` after approval - minting the shop item for FREE (there is no
+            // wallet deduction anywhere on the pickup-request path). It was meant as legit-purchase
+            // propagation, but a guest's real purchases route host-authoritatively via ShopTradeRequest,
+            // and with inspection pickups now suppressed at the sender (OnLocalPickup gate) a request that
+            // resolves to an UNSOLD shop item can only be a stale/desynced sender. Mirror the phantom-grab
+            // guard above: deny and push the authoritative state so the requester heals instead of the host
+            // minting a free item. (The guest-side Sell() in OnRemoteItemPickedUp stays: an ItemPickedUp for
+            // a locally-unsold item there means the HOST really bought it - that is the purchase propagation.)
+            if (!item.sold && ShopAreaRef(item) != null)
+            {
+                VerboseLogger.ItemApply($"Denying pickup - item {item.name} id={packet.ItemInstanceId} is an UNSOLD shop item (would mint it free); resyncing requester");
+                SendItemPickupDenied(packet.ItemInstanceId, 0, sender);
+                var unsoldPrefab = item.GetComponent<SaveablePrefab>();
+                if (unsoldPrefab != null && unsoldPrefab.instanceId != 0)
+                    SendItemResync(unsoldPrefab.instanceId, sender);
+                return;
+            }
+
             // Always register - whether found by ID or correlation
             _itemRegistry[packet.ItemInstanceId] = packet.PrefabIndex;
 
@@ -2406,20 +2612,19 @@ namespace SailwindCoop.Sync
                 VerboseLogger.ItemApply($"Disconnected hangable item {packet.ItemInstanceId} from hook (guest pickup)");
             }
 
-            // If this is a shop item, call game's built-in purchase method
-            // Handles: sold=true, reparent to world, save registration, OnBuy()
-            if (!item.sold)
-            {
-                item.Sell();
-                VerboseLogger.ItemApply($"Called Sell() on shop item {item.name}");
-            }
+            // NOTE: the old `if (!item.sold) item.Sell()` purchase-propagation block was REMOVED here -
+            // it minted unpaid items on every guest inspection pickup. Unsold shop items are now denied
+            // above (inspection-steal guard); anything reaching this point is either sold or not a shop
+            // item, so there is nothing to Sell.
 
             // INVENTORY SLOT HANDLING (host processing guest request):
             // When item is in guest's inventory (slot >= 0), hide it entirely.
             // When item is in hand (slot == -1), show it and position at hand.
             if (packet.InventorySlot >= 0)
             {
-                // Item is in guest's inventory - hide it
+                // Item is in guest's inventory - hide it (G: park the rod's world-parented bobber BEFORE
+                // the hide, or it stays a live non-kinematic rigidbody and falls through the earth)
+                FishingSyncManager.SyncExternalRodParts(item, stowed: true);
                 item.gameObject.SetActive(false);
                 VerboseLogger.ItemApply($"Host hiding guest item {packet.ItemInstanceId} (in inventory slot {packet.InventorySlot})");
             }
@@ -2427,6 +2632,8 @@ namespace SailwindCoop.Sync
             {
                 // Item is in hand - make sure it's visible and set up physics
                 item.gameObject.SetActive(true);
+                // G: restore the rod's parked bobber if an earlier stow parked it.
+                FishingSyncManager.SyncExternalRodParts(item, stowed: false);
 
                 // REMOTE HELD ITEM PHYSICS FIX (see detailed comment in OnRemoteItemPickedUp):
                 // Disable ItemRigidbody component to prevent game from resetting physics settings.
@@ -2697,12 +2904,31 @@ namespace SailwindCoop.Sync
             });
         }
 
+        // K3/K4 destroy+drop same-frame contradiction: vanilla hook-attach (ShipItemFishingRod.OnItemClick)
+        // destroys the HELD hook, then GoPointer releases the now-consumed held item, so the mod used to
+        // broadcast ItemDestroyed AND ItemDropped for the same id in the same frame. On the receiver the
+        // ordered pair applied destroy (deferred to end of frame), then the drop's peer-missing backfill
+        // still FOUND the pending-destroy object and re-broadcast ItemSpawned -> a PHANTOM copy on the
+        // machine that already destroyed its own -> every later pickup request denied reason=1.
+        // _justLocallyDestroyed suppresses the drop broadcast at the SOURCE (~1s window);
+        // _recentlyRemoteDestroyed hardens the RECEIVER by skipping both the drop apply and the backfill
+        // for an id destroyed within the last ~2s. (Also silences the stove-fuel destroy+drop noise.)
+        private readonly Dictionary<int, float> _justLocallyDestroyed = new Dictionary<int, float>();
+        private readonly Dictionary<int, float> _recentlyRemoteDestroyed = new Dictionary<int, float>();
+        private const float JustDestroyedDropSuppressWindow = 1f;
+        private const float RemoteDestroyedDropSkipWindow = 2f;
+
         /// <summary>
         /// Called when an item is destroyed locally.
         /// </summary>
         public void OnLocalItemDestroyed(int instanceId)
         {
             if (IsApplyingRemoteState) return;
+
+            // K3: remember the destroy so the same-frame GoPointer release of this (consumed) item can't
+            // also broadcast a contradictory ItemDropped (see field doc above). Recorded even when the
+            // broadcast below is suppressed - the item is gone locally either way, so any drop is bogus.
+            _justLocallyDestroyed[instanceId] = Time.time;
 
             // Don't broadcast ItemDestroyed for items recently synced from remote.
             // This prevents echo back when guest's cleanup destroys host-dropped items.
@@ -2926,6 +3152,11 @@ namespace SailwindCoop.Sync
 
                 saveable.Load(saveData);
 
+                // Load() sets amount (cooked >= 1) but the material was baked in Awake pre-Load; refresh so
+                // a cooked-state item doesn't render raw (crate-unseal precedent). Guarded: kettles NRE
+                // in UpdateMaterial (CookableFoodKettle.Awake hides the base init) - see SafeRefresh doc.
+                SafeRefreshCookedMaterial(instance.gameObject, instance.name);
+
                 VerboseLogger.ItemApply($"SpawnWorldItem: final pos={instance.transform.position}");
             }
         }
@@ -2949,6 +3180,11 @@ namespace SailwindCoop.Sync
             if (Plugin.IsHost)
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ItemDestroyed, w =>
                     PacketSerializer.WriteItemDestroyed(w, packet));
+
+            // K3 receiver hardening: remember the destroy (even when the item isn't found locally -
+            // Unity's Destroy is end-of-frame deferred, and the id is dead either way) so a stale/same-frame
+            // ItemDropped for this id can't resurrect it via the drop apply or its ItemSpawned backfill.
+            _recentlyRemoteDestroyed[packet.ItemInstanceId] = Time.time;
 
             var item = FindItemByInstanceId(packet.ItemInstanceId);
             if (item == null)
@@ -3092,6 +3328,16 @@ namespace SailwindCoop.Sync
             {
                 item.health = packet.NewHealth;
                 try { item.UpdateLookText(); } catch { } // refresh the displayed level (e.g. barrel %)
+
+                // K4: rod health IS its hook state (attach sets health=1, detach 0). Refresh the private
+                // hookVisuals via vanilla UpdateHook so a synced attach shows the hook on this machine
+                // (the DetachHook side is already covered by FishEscape/HookConsumed).
+                if (item is ShipItemFishingRod)
+                {
+                    try { HarmonyLib.Traverse.Create(item).Method("UpdateHook").GetValue(); }
+                    catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] UpdateHook failed on rod {packet.ItemInstanceId}: {e.Message}"); }
+                }
+
                 VerboseLogger.ItemApply($"Updated health for item {packet.ItemInstanceId} to {packet.NewHealth}");
             }
             finally
@@ -4059,6 +4305,9 @@ namespace SailwindCoop.Sync
 
             // Re-enable item if it was hidden (in inventory)
             item.gameObject.SetActive(true);
+
+            // G: a leaver's inventory-stashed rod gets its parked external bobber/line restored too.
+            FishingSyncManager.SyncExternalRodParts(item, stowed: false);
 
             // Clear the fake held reference we set during pickup
             item.held = null;
