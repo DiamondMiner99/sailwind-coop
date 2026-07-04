@@ -14,6 +14,40 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.24 - 2026-07-04
+
+> Fix batch from the first public-player reports (thanks to both reporters!). No network
+> format change: v0.2.22/v0.2.23 peers can still join, but everyone should update - the
+> rope and anchor fixes only protect machines that run them.
+
+### Fixed
+- **Sails/winches "letting out as if W is held" for the whole crew.** Rope changes are now
+  only broadcast when the local player is actually operating that winch (or carrying the
+  anchor). Previously ANY local rope movement - including gamepad stick drift feeding a
+  grabbed winch, load-time sail defaults, and a join race - was imposed on everyone at
+  10Hz (ropes are last-writer-wins). This also stops a rejoining player's stale rig from
+  clobbering the host's sail trim.
+- **Gamepad stick drift amplified into winch/wheel input (vanilla bug).** The game adds
+  controller stick input to the pointer path unscaled and the winch divides by frame time,
+  so ~2% idle drift became full let-out. New `ControllerDeadzone` config (default 0.15,
+  0 disables) filters sub-deadzone stick input.
+- **Steering wheel visually turned while the rudder is straight (guest).** After a guest
+  releases the wheel, a reliable authoritative helm state is now always sent (and applied
+  even mid-grip when final), so the wheel cannot stay snapped to a stale angle until the
+  host touches it.
+- **Docking line stretched miles into the ocean / unusable.** Three-part fix: dock moorings
+  are matched ignoring the earth-curvature-sunk island height (which made far docks resolve
+  10km underwater), a failed dock resolve now safely stows the rope instead of leaving it
+  diverged, and corrupted saves that already contain a seabed rope self-heal on load (this
+  one is a latent vanilla bug that co-op made routine).
+- **Anchor drop/raise never synced.** The anchor state channel had been silently dead in
+  every session (the game reparents the anchor out of the boat hierarchy, so every lookup
+  missed). Anchor set/release and join-time anchor state now actually replicate.
+
+### Changed
+- Verbose logs (F8) now use per-session timestamped filenames (keeping the newest 10)
+  instead of overwriting one file - the old behavior destroyed bug evidence twice.
+
 ## v0.2.23 - 2026-07-03
 
 > Security fix + the 2026-07-03 playtest fix batch + two new crew features. Joining

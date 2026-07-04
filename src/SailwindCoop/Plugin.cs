@@ -1,4 +1,4 @@
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
@@ -26,7 +26,7 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.23";
+        public const string PluginVersion = "0.2.24";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -39,6 +39,11 @@ namespace SailwindCoop
         // THIS machine's feed lines and quiet coin cue, never what the host broadcasts.
         public static ConfigEntry<bool> SpendingFeedConfig { get; private set; }
         public static ConfigEntry<float> SpendingFeedVolumeConfig { get; private set; }
+        // Controller stick-drift deadzone (vanilla bug mitigation): vanilla feeds the RAW analog stick into
+        // the pointer's keyboard delta with no deadzone and no deltaTime scaling; the winch then divides by
+        // deltaTime, amplifying idle stick drift ~20-60x into a constant let-out on any grabbed winch.
+        // Read by ControlPatches.ControllerDeadzonePatch; 0 disables.
+        public static ConfigEntry<float> ControllerDeadzoneConfig { get; private set; }
 
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
@@ -149,6 +154,19 @@ namespace SailwindCoop
                 new ConfigDescription(
                     "Volume of the quiet coin sound played for OTHER crew members' trades (your own trades already play the vanilla gold sound at full volume).",
                     new AcceptableValueRange<float>(0f, 1f)));
+
+            // Controller stick-drift deadzone: vanilla GoPointerMovement.ApplyKeyboardRotation adds the raw
+            // gamepad stick axes to keyboardDelta UNSCALED by deltaTime (the W/S key terms ARE dt-scaled),
+            // and GPButtonRopeWinch.Update divides that delta BY deltaTime - so a tiny idle stick drift
+            // becomes a constant let-out on any grabbed winch (and a slow wheel creep). Strip sub-deadzone
+            // stick input before consumers read it (ControlPatches.ControllerDeadzonePatch).
+            ControllerDeadzoneConfig = Config.Bind(
+                "Coop",
+                "ControllerDeadzone",
+                0.15f,
+                new ConfigDescription(
+                    "Suppress gamepad stick input below this magnitude before it feeds winches and the steering wheel (vanilla has no deadzone, so idle stick drift slowly lets sails out / creeps the wheel). 0 disables.",
+                    new AcceptableValueRange<float>(0f, 0.9f)));
 
             try
             {

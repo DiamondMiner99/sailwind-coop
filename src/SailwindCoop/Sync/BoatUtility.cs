@@ -81,16 +81,49 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
+        /// Resolve a boat's Anchor WITHOUT a child search. Vanilla Anchor.Awake reparents the anchor
+        /// OUT of the boat hierarchy (transform.parent = transform.parent.parent.parent), so
+        /// boat.GetComponentInChildren&lt;Anchor&gt;() is ALWAYS null after Awake - the reason anchor
+        /// set/release sync was silently dead. Resolve through the boat root's serialized references
+        /// instead: BoatMooringRopes.anchor (public serialized field on the boat root, vanilla uses it
+        /// in AnyRopeMoored), falling back to the registered RopeControllerAnchor's joint object (the
+        /// joint sits on the anchor itself; RopeControllerAnchor.RegisterToBoat wires it at Start),
+        /// then a child search as a last resort (covers pre-Awake calls during load).
+        /// </summary>
+        public static Anchor GetAnchor(SaveableObject boat)
+        {
+            if (boat == null) return null;
+
+            var mooring = boat.GetComponent<BoatMooringRopes>();
+            if (mooring != null)
+            {
+                if (mooring.anchor != null) return mooring.anchor;
+
+                var anchorCtrl = mooring.GetAnchorController();
+                var joint = anchorCtrl != null ? anchorCtrl.joint : null;
+                if (joint != null)
+                {
+                    var viaJoint = joint.GetComponent<Anchor>();
+                    if (viaJoint != null) return viaJoint;
+                }
+            }
+
+            // Pre-Awake (anchor still parented under the boat) or unusual hierarchies.
+            return boat.GetComponentInChildren<Anchor>(true);
+        }
+
+        /// <summary>
         /// Check if a boat is currently anchored.
         /// </summary>
         public static bool IsBoatAnchored(SaveableObject boat)
         {
-            var anchor = boat?.GetComponentInChildren<Anchor>();
+            var anchor = GetAnchor(boat);
             if (anchor == null) return false;
 
-            // Anchor sets isKinematic when deployed
-            var anchorRb = anchor.GetComponent<Rigidbody>();
-            return anchorRb != null && anchorRb.isKinematic;
+            // IsSet() is the authoritative vanilla flag. (The old isKinematic read was both unreachable -
+            // the child search always returned null - and wrong: ExtraFixedUpdate also sets
+            // isKinematic=true while the anchor item is merely HELD.)
+            return anchor.IsSet();
         }
 
         /// <summary>

@@ -1,4 +1,4 @@
-# ⛵ Sailwind Co-op
+﻿# â›µ Sailwind Co-op
 
 **Crew a single ship with your friends in [Sailwind](https://store.steampowered.com/app/1764530/Sailwind/).**
 
@@ -7,12 +7,12 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.2.23-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-v0.2.24-blue)](../../releases)
 [![game](https://img.shields.io/badge/Sailwind-v0.38-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> ### ⚠️ This is an early alpha. Back up your saves.
+> ### âš ï¸ This is an early alpha. Back up your saves.
 > The mod is under active development and has been played in real 2-5 player sessions, but
 > it can still crash, freeze, or desync. Always copy your save folder before a session.
 > See **[KNOWN-ISSUES.md](KNOWN-ISSUES.md)** for the honest current state.
@@ -69,12 +69,12 @@ Steam must be running (the mod uses Steam friend invites and Steam P2P networkin
 ### Quick install (recommended)
 
 1. Download the latest **`SailwindCoop-vX.Y.Z.zip`** from the [Releases](../../releases) page.
-2. Find your Sailwind folder: in Steam, right-click **Sailwind → Manage → Browse local files**.
+2. Find your Sailwind folder: in Steam, right-click **Sailwind â†’ Manage â†’ Browse local files**.
 3. **Extract the zip straight into that folder** (the one with `Sailwind.exe`), choosing **overwrite** if asked.
    You should now see `winhttp.dll` and a `BepInEx` folder sitting next to `Sailwind.exe`.
 4. Launch the game. That's it. The bundle includes the BepInEx mod loader, so there's nothing else to install.
 
-**Linux / Steam Deck:** set Sailwind's launch options (right-click Sailwind → Properties → Launch Options) to:
+**Linux / Steam Deck:** set Sailwind's launch options (right-click Sailwind â†’ Properties â†’ Launch Options) to:
 ```
 WINEDLLOVERRIDES="winhttp=n,b" %command%
 ```
@@ -97,7 +97,7 @@ between releases, so a stale build on one machine will break the session for eve
 ### Start a session
 
 1. Everyone launches Sailwind. The **host** loads their world and boards their boat.
-2. **Host:** press `Esc` → **Host Co-op** to open a lobby, then **Invite Friend** and pick someone.
+2. **Host:** press `Esc` â†’ **Host Co-op** to open a lobby, then **Invite Friend** and pick someone.
    Keep inviting to fill the crew (up to the configured cap).
 3. **Crew:** accept the Steam invite. You can be at the title screen (your latest save auto-loads)
    or already in your own game; either way you're teleported onto the host's deck.
@@ -106,8 +106,8 @@ between releases, so a stale build on one machine will break the session for eve
 
 Order matters a little, but the mod is built so nobody gets stranded:
 
-- **Host:** `Esc` → **Close Lobby** (or just quit). The host's game keeps running and saves normally.
-- **Crew:** `Esc` → **Leave Lobby** or **Quit Game**. A guest is returned to a warning and the game
+- **Host:** `Esc` â†’ **Close Lobby** (or just quit). The host's game keeps running and saves normally.
+- **Crew:** `Esc` â†’ **Leave Lobby** or **Quit Game**. A guest is returned to a warning and the game
   closes, by design, so a guest never lingers on the host's save. **Your own solo save is left untouched.**
 
 ### Controls
@@ -136,8 +136,9 @@ MaxPlayers = 8
 
 **Capturing logs for a bug report (please do this):**
 - The standard BepInEx log is `BepInEx/LogOutput.log` (always written).
-- The mod's rich per-subsystem log is `BepInEx/SailwindCoop-verbose.log`, but it's **only written
-  while debug mode is on**. Press **`F8`** at the start of a session on **every** machine to enable it.
+- The mod's rich per-subsystem log is `BepInEx/SailwindCoop-verbose-<timestamp>.log` (one timestamped
+  file per session, most recent ~10 kept), but it's **only written while debug mode is on**. Press
+  **`F8`** at the start of a session on **every** machine to enable it.
   When reporting an issue, grab both files from **both** the host and the affected crewmate.
 
 **A crewmate can't see the host / connection issues:**

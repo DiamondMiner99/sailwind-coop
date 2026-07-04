@@ -1,5 +1,6 @@
 using System;
 using HarmonyLib;
+using UnityEngine;
 
 namespace SailwindCoop.Patches
 {
@@ -41,6 +42,69 @@ namespace SailwindCoop.Patches
                 return null; // suppress -> SaveLoadManager.LoadGame's loop continues to the next object
             }
             return __exception; // not a co-op load: rethrow (vanilla behavior preserved)
+        }
+    }
+
+    /// <summary>
+    /// ABSURD-MOORING-ROPE HEAL (vanilla latent bug, made routine by the co-op phantom quit-save).
+    /// Vanilla saves every object at <c>transform.position - outCurrentOffset</c> (SaveLoadManager.cs ~240).
+    /// A rope moored via vanilla MoorTo is PARENTED TO THE DOCK CLEAT, and IslandHorizon.ApplyNewHorizon
+    /// sinks far island roots by -(d^2/(2*515662))-2*camY every LateUpdate (uncapped, ~-10km at 100km) -
+    /// so a rope moored at a far island gets its VIEW-DEPENDENT render Y persisted. On load, a was-moored
+    /// rope (extraSetting=true) is restored at that raw position with parent=null and NO spring
+    /// (SaveableObject.Load ~143-148): a loose physical rope object kilometers away / on the seabed, with
+    /// the boat's LineRenderer stretching to it.
+    ///
+    /// Heal: a POSTFIX SWEEP after SaveLoadManager.LoadGame completes (not a per-object Load postfix - the
+    /// load loop's object order is registration order, so a rope can load BEFORE its boat and a per-object
+    /// distance check against the boat's pre-load position would false-positive a legit moored rope).
+    /// Detects a detached (parent==null, the was-moored restore signature), unmoored rope whose distance
+    /// from its own boat rigidbody exceeds 50m (vanilla max rope length is sqrt(maxLength=900)=30m, decomp
+    /// PickupableBoatMooringRope.cs Awake:83, so a legitimately restored moored rope is always well inside
+    /// 50m) or whose Y is below -50 (far under any sea level). On detection: restow on the hanger and clear
+    /// the was-moored flag. A legit near-dock restore is untouched (it sits at the cleat at sea level and
+    /// re-moors via the vanilla OnTriggerEnter path). Runs for BOTH the co-op phantom load and normal solo
+    /// saves (no SuppressLoadErrors gate) since the underlying bug is vanilla's.
+    /// </summary>
+    [HarmonyPatch(typeof(SaveLoadManager), "LoadGame", new Type[] { typeof(int) })]
+    public static class MooringRopeLoadHealPatch
+    {
+        static void Postfix()
+        {
+            try
+            {
+                foreach (var rope in UnityEngine.Object.FindObjectsOfType<PickupableBoatMooringRope>())
+                {
+                    if (rope == null || rope.IsMoored()) continue;
+                    if (rope.transform.parent != null) continue; // only the was-moored detached restore
+
+                    var boatRb = rope.GetBoatRigidbody();
+                    if (boatRb == null) continue;
+
+                    float distFromBoat = Vector3.Distance(rope.transform.position, boatRb.transform.position);
+                    float ropeY = rope.transform.position.y;
+                    if (distFromBoat <= 50f && ropeY >= -50f) continue; // sane restore - leave for vanilla re-moor
+
+                    // Restow on the hanger: re-parent to the private initialParent (captured in the rope's
+                    // Awake) before ResetRopePos() restores the hanger-local pos/rot. No spring exists at
+                    // load time (IsMoored() checked above), so no Unmoor() is needed.
+                    var initialParent = Traverse.Create(rope).Field("initialParent").GetValue<UnityEngine.Transform>();
+                    if (initialParent != null) rope.transform.parent = initialParent;
+                    rope.ResetRopePos();
+
+                    // Clear the "was moored" persistence flag so the heal sticks across the next save.
+                    var saveable = rope.GetComponent<SaveableObject>();
+                    if (saveable != null) saveable.extraSetting = false;
+
+                    Plugin.Log.LogInfo($"[SaveHeal] mooring rope '{rope.name}' restored at an absurd position " +
+                                       $"(distFromBoat={distFromBoat:F0}m, y={ropeY:F0}); restowed on hanger and cleared " +
+                                       $"was-moored flag (vanilla far-island horizon-sink save bug)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[SaveHeal] mooring rope sanity sweep failed: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 

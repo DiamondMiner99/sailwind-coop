@@ -137,11 +137,29 @@ namespace SailwindCoop.Sync
         // only ever fires for ropes THIS client actually moved.
         private float[] _ropeLastChangeTime = new float[0];
         private bool[] _ropeFinalSent = new bool[0];
+        // Length as of the last OPERATED send: the terminal must ship this captured value, not the live
+        // currentLength at sweep time - by then unoperated drift (stick drift, reef forcing) may have moved
+        // the rope again, and a reliable IsFinal would export that contamination to the whole crew.
+        private float[] _ropeLastSentLength = new float[0];
         private const float RopeTerminalDebounce = 0.3f;
 
         // Cache anchor rope index per boat for debug logging
         private Dictionary<string, int> _anchorRopeIndices = new Dictionary<string, int>();
         private HashSet<string> _loggedBoatRopes = new HashSet<string>();
+
+        // OPERATED-ROPE GATE (field report: sails "unfold as if holding W" on the OTHER machine, stopping
+        // when the peer disconnects and resuming on rejoin): ropes are last-writer-wins with no lease, so
+        // ANY guest-local rope movement (controller stick drift feeding a grabbed winch, load-time reef
+        // forcing, join-race stale defaults on the first discovery tick) used to be broadcast at 10Hz plus
+        // a reliable settle terminal and imposed on the whole crew. Only broadcast a rope change when THIS
+        // machine's player is actually operating that rope: the GPButtonRopeWinch whose `rope` field drives
+        // it is grabbed by the local pointer, or (anchor rope) the local player is carrying the anchor item,
+        // which vanilla Anchor.ExtraFixedUpdate pays rope out for while held. The winch map and anchor are
+        // cached per boat and rebuilt on the same trigger as the _lastRopeLengths resize (boat change).
+        private readonly Dictionary<RopeController, GPButtonRopeWinch> _ropeWinchMap =
+            new Dictionary<RopeController, GPButtonRopeWinch>();
+        private Anchor _ropeCacheAnchor;
+        private string _ropeCacheBoatName;
 
         private void PollBoatControls()
         {
@@ -159,17 +177,20 @@ namespace SailwindCoop.Sync
                 LogRopeDiscovery(boatName, boat, ropes);
             }
 
-            // Resize cache if needed
-            if (_lastRopeLengths.Length != ropes.Length)
+            // Resize cache if needed. Also triggers on a boat CHANGE with the same rope count - the
+            // rope->winch map must never alias another boat's winches, and the length cache is per-boat.
+            if (_lastRopeLengths.Length != ropes.Length || _ropeCacheBoatName != boatName)
             {
                 _lastRopeLengths = new float[ropes.Length];
                 _ropeLastChangeTime = new float[ropes.Length];
                 _ropeFinalSent = new bool[ropes.Length];
+                _ropeLastSentLength = new float[ropes.Length];
                 for (int j = 0; j < ropes.Length; j++)
                 {
                     _lastRopeLengths[j] = -1f;
                     _ropeFinalSent[j] = true; // no pending terminal for a freshly-(re)discovered rope
                 }
+                BuildRopeWinchMap(boat, boatName);
             }
 
             for (int i = 0; i < ropes.Length; i++)
@@ -182,27 +203,44 @@ namespace SailwindCoop.Sync
                 // Only send if changed
                 if (Mathf.Abs(rope.currentLength - _lastRopeLengths[i]) > 0.001f)
                 {
+                    // ALWAYS stamp the change-detection cache, even for changes we won't send: a later
+                    // grab must only diff movement made WHILE grabbed, never a stale accumulated delta.
                     _lastRopeLengths[i] = rope.currentLength;
+
+                    // OPERATED-ROPE GATE: only broadcast changes the local player is actually making
+                    // (winch grabbed / anchor carried). Unoperated local movement (stick drift, load-time
+                    // reef forcing, join-race defaults) must never be imposed on the crew (see field docs).
+                    if (!IsLocalOperatingRope(rope))
+                    {
+                        // DebugMode gate here, not just inside the logger: sustained drift hits this at
+                        // 10Hz per rope and the interpolation would allocate every tick.
+                        if (DebugMode.Enabled)
+                            VerboseLogger.ControlLocal($"Rope change SUPPRESSED (not operated locally), boat={boatName}, idx={i}, name={ropeName}, len={rope.currentLength:F3}, run={GameInput.GetKey(InputName.Run)}");
+                        continue;
+                    }
 
                     // Extra logging for anchor rope
                     bool isAnchor = rope is RopeControllerAnchor;
                     if (isAnchor)
                     {
-                        var anchor = boat.GetComponentInChildren<Anchor>();
+                        var anchor = BoatUtility.GetAnchor(boat);
                         var anchorRb = anchor?.GetComponent<Rigidbody>();
                         VerboseLogger.ControlLocal($"ANCHOR rope changed, boat={boatName}, idx={i}, name={ropeName}, len={rope.currentLength:F3}, anchorKinematic={anchorRb?.isKinematic}");
                     }
 
-                    OnLocalRopeChanged(boatName, i, ropeName, rope.currentLength, false);
+                    OnLocalRopeChanged(boatName, i, ropeName, rope.currentLength, false,
+                        $"grabbed=true, run={GameInput.GetKey(InputName.Run)}");
                     _ropeLastChangeTime[i] = Time.time;  // arm the settle-terminal debounce
                     _ropeFinalSent[i] = false;
+                    _ropeLastSentLength[i] = rope.currentLength;
                 }
             }
 
             // Rope settle-terminal sweep. Once a rope has been idle for RopeTerminalDebounce since its
             // last LOCAL change, send ONE reliable terminal so a dropped final unreliable delta self-heals.
-            // Only fires for ropes this client moved (a remote apply updates _lastRopeLengths above, so the
-            // change-detector never arms the debounce for host-driven ropes).
+            // Only fires for ropes this client SENT while operating them: the debounce is armed exclusively
+            // by the operated-send branch above (remote applies stamp _lastRopeLengths and suppressed local
+            // changes skip the arm), so an unoperated rope never earns a terminal either.
             for (int i = 0; i < ropes.Length; i++)
             {
                 if (_ropeFinalSent[i]) continue;
@@ -210,7 +248,9 @@ namespace SailwindCoop.Sync
                 var settledRope = ropes[i];
                 if (settledRope == null) { _ropeFinalSent[i] = true; continue; }
                 _ropeFinalSent[i] = true;
-                OnLocalRopeChanged(boatName, i, settledRope.gameObject.name, settledRope.currentLength, true);
+                // Ship the length captured at the last operated send, NOT the live value (see field docs).
+                OnLocalRopeChanged(boatName, i, settledRope.gameObject.name, _ropeLastSentLength[i], true,
+                    $"grabbed={IsLocalOperatingRope(settledRope)}, run={GameInput.GetKey(InputName.Run)}");
             }
 
             // Poll steering wheel
@@ -256,7 +296,7 @@ namespace SailwindCoop.Sync
                 if (rope is RopeControllerAnchor)
                 {
                     _anchorRopeIndices[boatName] = i;
-                    var anchor = boat.GetComponentInChildren<Anchor>();
+                    var anchor = BoatUtility.GetAnchor(boat);
                     var anchorRb = anchor?.GetComponent<Rigidbody>();
                     var joint = anchor?.GetComponent<ConfigurableJoint>();
                     VerboseLogger.ControlLocal($"  [{i}] {ropeType} name={ropeName} (ANCHOR) len={rope.currentLength:F3}, jointLimit={joint?.linearLimit.limit:F2}, kinematic={anchorRb?.isKinematic}");
@@ -268,15 +308,73 @@ namespace SailwindCoop.Sync
             }
         }
 
+        // === Operated-rope detection (see _ropeWinchMap field docs) ===
+
+        /// <summary>
+        /// Rebuild the rope->winch map and cached Anchor for the current boat. Called on the same trigger
+        /// as the _lastRopeLengths resize (rope count OR boat change), so a stale map can never alias
+        /// another boat's winches. GPButtonRopeWinch.rope is the public vanilla field pointing at the
+        /// RopeController the winch drives.
+        /// </summary>
+        private void BuildRopeWinchMap(SaveableObject boat, string boatName)
+        {
+            _ropeWinchMap.Clear();
+            _ropeCacheBoatName = boatName;
+            var winches = boat.GetComponentsInChildren<GPButtonRopeWinch>(true);
+            foreach (var winch in winches)
+            {
+                if (winch != null && winch.rope != null && !_ropeWinchMap.ContainsKey(winch.rope))
+                    _ropeWinchMap[winch.rope] = winch;
+            }
+            // BoatUtility.GetAnchor, NOT GetComponentInChildren: vanilla Anchor.Awake reparents the
+            // anchor out of the boat hierarchy, so a child search is always null after Awake.
+            _ropeCacheAnchor = BoatUtility.GetAnchor(boat);
+            VerboseLogger.ControlLocal($"Rope winch map rebuilt for {boatName}: {_ropeWinchMap.Count} winches, anchor={(_ropeCacheAnchor != null)}");
+        }
+
+        /// <summary>
+        /// True if THIS machine's local player is currently operating <paramref name="rope"/>: the winch
+        /// driving it is grabbed by the local pointer (same read-only vanilla grab test as
+        /// IsHostSteeringWheel - stickyClickedBy/isClicked/rotHandle are only ever set by the LOCAL
+        /// GoPointer), or the rope is the anchor rope and the local player is carrying the anchor item
+        /// (vanilla Anchor.ExtraFixedUpdate pays rope out while held; PickupableItem.held is likewise
+        /// local-pointer-only). A rope with no winch (map miss) is never operated - unoperated ropes must
+        /// never broadcast.
+        /// </summary>
+        private bool IsLocalOperatingRope(RopeController rope)
+        {
+            if (_ropeWinchMap.TryGetValue(rope, out var winch) && winch != null)
+            {
+                if (HelmStickyClickedByRef(winch) != null
+                    || HelmIsClickedRef(winch)
+                    || (winch.rotHandle != null && winch.rotHandle.IsGrabbed()))
+                    return true;
+            }
+            if (rope is RopeControllerAnchor)
+            {
+                // Lazy re-resolve: the anchor may not be resolvable at map-build time on a freshly
+                // spawned boat (BoatMooringRopes.anchor unset + RopeControllerAnchor not yet registered).
+                if (_ropeCacheAnchor == null)
+                {
+                    var boat = BoatUtility.GetCurrentBoat();
+                    if (boat != null && boat.gameObject.name == _ropeCacheBoatName)
+                        _ropeCacheAnchor = BoatUtility.GetAnchor(boat);
+                }
+                if (_ropeCacheAnchor != null && _ropeCacheAnchor.held != null)
+                    return true;
+            }
+            return false;
+        }
+
         // === Rope Sync ===
 
         // Use index as primary identifier (consistent within same boat instance)
         // Name is sent for debugging and potential future use
-        public void OnLocalRopeChanged(string boatName, int ropeIndex, string ropeName, float length, bool isFinal)
+        public void OnLocalRopeChanged(string boatName, int ropeIndex, string ropeName, float length, bool isFinal, string diag = null)
         {
             if (!Plugin.IsMultiplayer) return;
 
-            VerboseLogger.ControlSend($"RopeState, boat={boatName}, idx={ropeIndex}, name={ropeName}, len={length:F3}, final={isFinal}");
+            VerboseLogger.ControlSend($"RopeState, boat={boatName}, idx={ropeIndex}, name={ropeName}, len={length:F3}, final={isFinal}{(diag != null ? ", " + diag : "")}");
 
             var packet = new RopeStatePacket
             {
@@ -342,7 +440,8 @@ namespace SailwindCoop.Sync
         private class PendingRope { public RopeStatePacket Packet; public float Deadline; public float NextTry; }
         private readonly Dictionary<string, PendingRope> _pendingRopes = new Dictionary<string, PendingRope>();
         // 0: retry every 10Hz tick so the seed applies in the SAME tick the controllers appear (RetryPendingRopes
-        // runs before PollBoatControls) and the discovery poll broadcasts the seeded values. TTL still bounds it.
+        // runs before PollBoatControls, so the discovery poll stamps the seeded values into its cache instead of
+        // treating them as local changes; the operated-rope gate suppresses any broadcast either way). TTL bounds it.
         private const float PendingRopeRetryInterval = 0f;
         private const float PendingRopeTtl = 15f;
 
@@ -438,7 +537,7 @@ namespace SailwindCoop.Sync
             // Extra logging for anchor rope
             if (rope is RopeControllerAnchor)
             {
-                var anchor = boat.GetComponentInChildren<Anchor>();
+                var anchor = BoatUtility.GetAnchor(boat);
                 var anchorRb = anchor?.GetComponent<Rigidbody>();
                 var joint = anchor?.GetComponent<ConfigurableJoint>();
 
@@ -555,7 +654,12 @@ namespace SailwindCoop.Sync
             // BUT only trust local prediction if we actually HOLD the lease. A guest grabbing a wheel
             // another crew member is steering is denied by the host; in that case apply the correction so its
             // wheel follows the authoritative rudder instead of diverging for the whole grab.
-            if (IsHostSteeringWheel(wheel) && !IsHelmDenied(packet.BoatName)) return;
+            // AUTHORITATIVE SETTLE: a terminal HelmState (IsFinal=true - lease sweep / join seed) always
+            // applies, even while this machine's player is grabbing the wheel. Guest prediction runs on
+            // unreliable HelmInput deltas and can drift; the reliable final absolute is the value everyone
+            // must converge to, so it beats local prediction. Non-final corrections stay suppressed while
+            // steering so the stream doesn't yank the wheel out of the local steerer's hands.
+            if (!packet.IsFinal && IsHostSteeringWheel(wheel) && !IsHelmDenied(packet.BoatName)) return;
 
             // Set the currentInput value for game logic
             wheel.currentInput = packet.Input;
@@ -673,12 +777,14 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Host: periodically release helm leases whose holder has gone idle past HelmLeaseTimeout. The lazy
         /// release inside TryAcquireHelmLease only fires when ANOTHER sender's input arrives; a passive
-        /// passenger never triggers it, so for a boat the host is NOT standing on (where the helm relay is the
-        /// ONLY HelmState source and it is unreliable) a dropped final relay would leave passengers on a stale
-        /// wheel angle until someone steers that wheel again. On expiry we send ONE reliable terminal
-        /// HelmState{IsFinal=true} so they converge, then drop the lease. Boats the host IS on are already
-        /// covered by PollBoatControls, so we only emit the terminal state for off-host boats; the lease is
-        /// dropped either way (the next input simply re-grants from scratch).
+        /// passenger never triggers it, so a dropped final unreliable relay would leave passengers on a stale
+        /// wheel angle until someone steers that wheel again. On expiry we ALWAYS send ONE reliable terminal
+        /// HelmState{IsFinal=true} - the host's own current boat included: the ex-steering guest there
+        /// predicted locally off unreliable HelmInput deltas and may have drifted, and PollBoatControls only
+        /// re-sends when currentInput CHANGES, so without this terminal no authoritative absolute ever
+        /// reaches it after release (the stuck-diverged-wheel visual). OnRemoteHelmChanged lets IsFinal
+        /// packets through even on a locally-held wheel. The lease is then dropped (the next input simply
+        /// re-grants from scratch).
         /// </summary>
         private void SweepStaleHelmLeases()
         {
@@ -689,28 +795,22 @@ namespace SailwindCoop.Sync
                 if (Time.time - kvp.Value > HelmLeaseTimeout) expired.Add(kvp.Key);
             if (expired.Count == 0) return;
 
-            string currentBoat = BoatUtility.GetCurrentBoat()?.gameObject.name;
             foreach (var boatName in expired)
             {
-                // Off the host's current boat the relay is the only (unreliable) HelmState source - send one
-                // reliable terminal angle so passengers converge. On the host's own boat PollBoatControls handles it.
-                if (boatName != currentBoat)
+                var boats = BoatUtility.FindAllBoats();
+                if (boats.TryGetValue(boatName, out var boat))
                 {
-                    var boats = BoatUtility.FindAllBoats();
-                    if (boats.TryGetValue(boatName, out var boat))
+                    var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
+                    if (wheel != null)
                     {
-                        var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
-                        if (wheel != null)
-                        {
-                            float finalInput = wheel.currentInput;
-                            Plugin.NetworkManager.SendToAllReliable(PacketType.HelmState, w =>
-                                PacketSerializer.WriteHelmState(w, new HelmStatePacket
-                                {
-                                    BoatName = boatName,
-                                    Input = finalInput,
-                                    IsFinal = true
-                                }));
-                        }
+                        float finalInput = wheel.currentInput;
+                        Plugin.NetworkManager.SendToAllReliable(PacketType.HelmState, w =>
+                            PacketSerializer.WriteHelmState(w, new HelmStatePacket
+                            {
+                                BoatName = boatName,
+                                Input = finalInput,
+                                IsFinal = true
+                            }));
                     }
                 }
                 _helmLeaseHolder.Remove(boatName);
@@ -1041,10 +1141,19 @@ namespace SailwindCoop.Sync
             }
 
             var boats = BoatUtility.FindAllBoats();
-            if (!boats.TryGetValue(packet.BoatName, out var boat)) return;
+            if (!boats.TryGetValue(packet.BoatName, out var boat))
+            {
+                Plugin.Log.LogWarning($"AnchorEvent DROPPED: no boat named '{packet.BoatName}' " +
+                    $"({boats.Count} boats known) - sender/receiver name mismatch?");
+                return;
+            }
 
-            var anchor = boat.GetComponentInChildren<Anchor>();
-            if (anchor == null) return;
+            var anchor = BoatUtility.GetAnchor(boat);
+            if (anchor == null)
+            {
+                Plugin.Log.LogWarning($"AnchorEvent DROPPED: no Anchor resolvable on boat '{packet.BoatName}'");
+                return;
+            }
 
             var rb = anchor.GetComponent<Rigidbody>();
             var joint = anchor.GetComponent<ConfigurableJoint>();
@@ -1159,7 +1268,7 @@ namespace SailwindCoop.Sync
 
                 if (packet.IsMoored)
                 {
-                    var dock = FindClosestDockMooring(packet.DockPosition);
+                    var dock = FindClosestDockMooring(packet.DockPosition, out float nearestMissDist);
                     if (dock != null)
                     {
                         // Release any prior dock SpringJoint before re-mooring. Vanilla MoorTo
@@ -1185,7 +1294,12 @@ namespace SailwindCoop.Sync
                     }
                     else
                     {
-                        VerboseLogger.ControlApply($"Mooring FAILED: no dock near {packet.DockPosition}");
+                        // Dock resolve MISS. Do NOT leave the rope diverged (sender: moored, us: half-applied) -
+                        // that is the "rope stretched kilometers to a horizon-sunk island" class. Stow it
+                        // deterministically; guarded so an already-stowed rope is untouched.
+                        Plugin.Log.LogWarning($"Mooring FAILED: no dock near {packet.DockPosition} (5m XZ radius, " +
+                                              $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); stowing rope {packet.RopeIndex} instead of leaving it diverged");
+                        BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
                     }
                 }
                 else
@@ -1226,7 +1340,11 @@ namespace SailwindCoop.Sync
             }
         }
 
-        private GPButtonDockMooring FindClosestDockMooring(Vector3 realPosition)
+        // Matches on X/Z ONLY: island (and thus dock) Y is VIEW-DEPENDENT - vanilla
+        // IslandHorizon.ApplyNewHorizon rewrites far island roots' Y every LateUpdate for earth-curvature
+        // rendering (~-10km at 100km range, camera-height dependent even locally), so a 3D match misses
+        // any far dock. X/Z are stable and unique enough within a 5m radius.
+        private GPButtonDockMooring FindClosestDockMooring(Vector3 realPosition, out float nearestMissDist)
         {
             // Convert from real (offset-independent) to local coordinates
             // Sender subtracted their offset, we add ours to get correct local position
@@ -1236,10 +1354,14 @@ namespace SailwindCoop.Sync
             var docks = FindObjectsOfType<GPButtonDockMooring>();
             GPButtonDockMooring closest = null;
             float closestDist = 5f; // Max 5m search radius
+            nearestMissDist = float.PositiveInfinity;
 
             foreach (var dock in docks)
             {
-                var dist = Vector3.Distance(dock.transform.position, localPosition);
+                var delta = dock.transform.position - localPosition;
+                delta.y = 0f; // horizon-sunk island Y is meaningless; match in the horizontal plane only
+                var dist = delta.magnitude;
+                if (dist < nearestMissDist) nearestMissDist = dist;
                 if (dist < closestDist)
                 {
                     closestDist = dist;
@@ -1368,6 +1490,10 @@ namespace SailwindCoop.Sync
             _lastRopeLengths = new float[0];
             _ropeLastChangeTime = new float[0];   // drop rope settle-terminal tracking
             _ropeFinalSent = new bool[0];
+            _ropeLastSentLength = new float[0];
+            _ropeWinchMap.Clear();                // per-boat winch/anchor cache dies with the session
+            _ropeCacheAnchor = null;
+            _ropeCacheBoatName = null;
             _anchorRopeIndices.Clear();
             _loggedBoatRopes.Clear();
             _helmLeaseHolder.Clear();

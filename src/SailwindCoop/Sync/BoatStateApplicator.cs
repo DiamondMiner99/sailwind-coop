@@ -1193,8 +1193,12 @@ namespace SailwindCoop.Sync
         /// </summary>
         public static void ApplyAnchorState(SaveableObject boat, bool isAnchored, float ropeLength)
         {
-            var anchor = boat.GetComponentInChildren<Anchor>();
-            if (anchor == null) return;
+            var anchor = BoatUtility.GetAnchor(boat);
+            if (anchor == null)
+            {
+                Plugin.Log.LogWarning($"ApplyAnchorState SKIPPED: no Anchor resolvable on boat '{boat?.gameObject.name}'");
+                return;
+            }
 
             // Resolve the anchor rope controller (the visual + joint-limit driver). Prefer BoatMooringRopes'
             // registered anchor controller; fall back to a child search.
@@ -1602,7 +1606,7 @@ namespace SailwindCoop.Sync
 
                 if (data.IsMoored)
                 {
-                    var dock = FindClosestDockMooring(data.DockPosition);
+                    var dock = FindClosestDockMooring(data.DockPosition, out float nearestMissDist);
                     if (dock != null)
                     {
                         Plugin.Log.LogInfo($"  Rope {i}: Found dock {dock.name} at {dock.transform.position}, mooring...");
@@ -1639,7 +1643,13 @@ namespace SailwindCoop.Sync
                     }
                     else
                     {
-                        Plugin.Log.LogWarning($"  Rope {i}: Could not find dock mooring near {data.DockPosition} (5m radius)");
+                        // Dock resolve MISS. Do NOT leave the rope diverged (host: moored, guest: half-applied
+                        // mid-state) - that is how a guest ends up with a LineRenderer stretched kilometers to a
+                        // horizon-sunk island. Deterministically stow the rope back on its hanger instead, but
+                        // only if it is actually moored/out of place - never disturb an already-stowed rope.
+                        Plugin.Log.LogWarning($"  Rope {i}: Could not find dock mooring near {data.DockPosition} (5m XZ radius, " +
+                                              $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); stowing rope instead of leaving it diverged");
+                        StowRopeIfDisplaced(rope, $"Rope {i}");
                     }
                 }
                 else
@@ -1652,8 +1662,13 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Find the closest dock mooring point to a given position.
         /// Position is in real (offset-independent) coordinates.
+        /// Matches on X/Z ONLY: the Y of both the serialized dockPos and the local dock transform is
+        /// VIEW-DEPENDENT - vanilla IslandHorizon.ApplyNewHorizon rewrites every far island root's Y each
+        /// LateUpdate for earth-curvature rendering (uncapped, ~-10km at 100km range, and shifts with the
+        /// local camera height even for near islands). A 3D match therefore misses any far dock and is
+        /// fragile even locally; X/Z are stable and unique enough within a 5m radius.
         /// </summary>
-        private static GPButtonDockMooring FindClosestDockMooring(Vector3 realPosition)
+        private static GPButtonDockMooring FindClosestDockMooring(Vector3 realPosition, out float nearestMissDist)
         {
             // Convert from real to local coords for comparison with dock.transform.position
             var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
@@ -1662,10 +1677,14 @@ namespace SailwindCoop.Sync
             var docks = Object.FindObjectsOfType<GPButtonDockMooring>();
             GPButtonDockMooring closest = null;
             float closestDist = 5f; // Max 5m search radius
+            nearestMissDist = float.PositiveInfinity;
 
             foreach (var dock in docks)
             {
-                var dist = Vector3.Distance(dock.transform.position, localPosition);
+                var delta = dock.transform.position - localPosition;
+                delta.y = 0f; // horizon-sunk island Y is meaningless; match in the horizontal plane only
+                var dist = delta.magnitude;
+                if (dist < nearestMissDist) nearestMissDist = dist;
                 if (dist < closestDist)
                 {
                     closestDist = dist;
@@ -1674,6 +1693,47 @@ namespace SailwindCoop.Sync
             }
 
             return closest;
+        }
+
+        /// <summary>
+        /// Deterministic safe-failure stow for a mooring rope whose dock could not be resolved locally.
+        /// NEVER unmoors a rope that is locally moored: a dock-resolve miss can be transient (dock objects
+        /// inactive during island streaming, dockPos drift on a relay) and the local spring is more likely
+        /// correct than the unresolvable packet - unmooring here would cut a correctly-moored boat loose.
+        /// Only a rope that is NOT moored and NOT on its hanger (the diverged half-applied / detached save
+        /// restore state) gets restowed, re-parenting first: a was-moored save restore leaves parent==null
+        /// (decomp SaveableObject.cs Load), and ResetRopePos() writes LOCAL position (decomp
+        /// PickupableBoatMooringRope.cs), so without the re-parent the rope would teleport to hull-local
+        /// coords in WORLD space - i.e. near the world origin.
+        /// </summary>
+        internal static void StowRopeIfDisplaced(PickupableBoatMooringRope rope, string logTag)
+        {
+            if (rope == null) return;
+
+            if (rope.IsMoored())
+            {
+                Plugin.Log.LogInfo($"{logTag}: rope is locally moored; leaving it in place (not unmooring on a dock-resolve miss)");
+                return;
+            }
+            if (rope.IsAtInitialPos())
+            {
+                return; // already stowed on its hanger - nothing to do
+            }
+
+            // Re-attach to the hanger before ResetRopePos (which sets LOCAL pos/rot) so a detached rope
+            // is restored relative to the boat, not the world origin.
+            if (rope.transform.parent == null)
+            {
+                var initialParent = Traverse.Create(rope).Field("initialParent").GetValue<Transform>();
+                if (initialParent != null) rope.transform.parent = initialParent;
+            }
+            rope.ResetRopePos();
+
+            // Make sure the "was moored" persistence flag cannot survive a stow.
+            var saveable = rope.GetComponent<SaveableObject>();
+            if (saveable != null) saveable.extraSetting = false;
+
+            Plugin.Log.LogInfo($"{logTag}: stowed displaced rope back on hanger");
         }
     }
 }
