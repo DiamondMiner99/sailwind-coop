@@ -30,8 +30,8 @@ file it as a GitHub issue.
       require F8-logging to be on first.)
 - [ ] Know where the logs are (collect *both* files from *every* machine after a session):
   - `BepInEx/LogOutput.log` - **always** written; the place errors land even without F8.
-  - `BepInEx/SailwindCoop-verbose.log` - **only while F8-logging is on**, and **overwritten each
-    session**, so copy it before relaunching.
+  - `BepInEx/SailwindCoop-verbose-<timestamp>.log` - **only while F8-logging is on**. One timestamped
+    file per session (the newest file is the latest session); only the most recent ~10 are kept.
 
 ### Recording results
 
@@ -42,7 +42,7 @@ For anything that misbehaves, capture:
 - Whether it's **reproducible**.
 
 Then file a GitHub issue with the log files attached (at minimum `BepInEx/LogOutput.log` from
-both machines; `SailwindCoop-verbose.log` too if F8 logging was on).
+both machines; the session's `SailwindCoop-verbose-<timestamp>.log` too if F8 logging was on).
 
 ---
 
@@ -331,7 +331,7 @@ The recurring question for almost every check below: **"Does what guest A does s
 
 ## Appendix B - Log lines worth grepping
 
-After a bad session, search **both** `LogOutput.log` and `SailwindCoop-verbose.log` on **both** machines:
+After a bad session, search **both** `LogOutput.log` and the session's `SailwindCoop-verbose-<timestamp>.log` on **both** machines:
 
 | Line | Severity | Meaning |
 |---|---|---|

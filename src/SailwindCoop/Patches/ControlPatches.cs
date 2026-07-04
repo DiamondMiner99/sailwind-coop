@@ -250,7 +250,61 @@ namespace SailwindCoop.Patches
             }
         }
 
+        // === CONTROLLER STICK-DRIFT DEADZONE (config-gated vanilla bug mitigation) ===
+        // Vanilla GoPointerMovement.ApplyKeyboardRotation (decomp ~77-98) adds GetPrimaryVertical()/
+        // GetPrimaryHorizontal() to keyboardDelta UNSCALED by Time.deltaTime (the MoveUp/MoveDown key terms
+        // ARE dt-scaled), and GPButtonRopeWinch.Update then DIVIDES the delta by Time.deltaTime - so idle
+        // gamepad stick drift is amplified ~20-60x into a constant let-out on any grabbed winch (and a slow
+        // wheel creep via GetKeyboardDelta().x). Postfix: when a stick axis is below the configured
+        // deadzone, ADD BACK exactly the term vanilla subtracted (y -= vertical * keyboardMult;
+        // x -= horizontal * keyboardMult * 0.05f), leaving key input untouched. Vanilla resets keyboardDelta
+        // at the top of ApplyKeyboardRotation every frame and consumers read GetKeyboardDelta() afterwards,
+        // so a postfix here filters the value before anything consumes it. NOT gated on IsMultiplayer - the
+        // drift bug is vanilla; ControllerDeadzone=0 disables the behavior entirely.
+
+        static readonly AccessTools.FieldRef<GoPointerMovement, Vector3> KeyboardDeltaRef =
+            AccessTools.FieldRefAccess<GoPointerMovement, Vector3>("keyboardDelta");
+
+        [HarmonyPatch(typeof(GoPointerMovement), "ApplyKeyboardRotation")]
+        public static class ControllerDeadzonePatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(GoPointerMovement __instance)
+            {
+                float deadzone = Plugin.ControllerDeadzoneConfig?.Value ?? 0f;
+                if (deadzone <= 0f) return;
+
+                float vertical = GameInput.GetPrimaryVertical();
+                float horizontal = GameInput.GetPrimaryHorizontal();
+                bool cullVertical = Mathf.Abs(vertical) < deadzone && vertical != 0f;
+                bool cullHorizontal = Mathf.Abs(horizontal) < deadzone && horizontal != 0f;
+                if (!cullVertical && !cullHorizontal) return;
+
+                ref Vector3 keyboardDelta = ref KeyboardDeltaRef(__instance);
+                if (cullVertical)
+                    keyboardDelta.y += vertical * __instance.keyboardMult;
+                if (cullHorizontal)
+                    keyboardDelta.x += horizontal * __instance.keyboardMult * 0.05f;
+            }
+        }
+
         // === ANCHOR PATCHES (event-based, these methods exist on Anchor class) ===
+
+        // Anchor.Awake reparents the anchor OUT of the boat hierarchy and stores the BOAT ROOT's
+        // SaveableObject in the private `boatSaveable` field (from joint.connectedBody). The old
+        // GetComponentInParent<SaveableObject>() resolved the anchor's OWN saveable (e.g. "anchor_M"),
+        // so the receiver's FindAllBoats lookup (keyed on boat ROOT names) missed and silently dropped
+        // every anchor event. Read boatSaveable instead; fall back to the joint's connected body.
+        static readonly AccessTools.FieldRef<Anchor, SaveableObject> AnchorBoatSaveableRef =
+            AccessTools.FieldRefAccess<Anchor, SaveableObject>("boatSaveable");
+
+        static SaveableObject ResolveAnchorBoat(Anchor anchor)
+        {
+            var boat = AnchorBoatSaveableRef(anchor);
+            if (boat != null) return boat;
+            var connected = anchor.GetComponent<ConfigurableJoint>()?.connectedBody;
+            return connected != null ? connected.GetComponent<SaveableObject>() : null;
+        }
 
         [HarmonyPatch(typeof(Anchor), "SetAnchor")]
         public static class AnchorSetPatch
@@ -262,8 +316,12 @@ namespace SailwindCoop.Patches
                 // Prevent feedback loop when applying remote state
                 if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return;
 
-                var boat = __instance.GetComponentInParent<SaveableObject>();
-                if (boat == null) return;
+                var boat = ResolveAnchorBoat(__instance);
+                if (boat == null)
+                {
+                    Plugin.Log.LogWarning("AnchorSetPatch: could not resolve boat root for anchor - event NOT sent");
+                    return;
+                }
 
                 var joint = __instance.GetComponent<ConfigurableJoint>();
                 var ropeLength = joint?.linearLimit.limit ?? 0f;
@@ -288,8 +346,12 @@ namespace SailwindCoop.Patches
                 // Prevent feedback loop when applying remote state
                 if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return;
 
-                var boat = __instance.GetComponentInParent<SaveableObject>();
-                if (boat == null) return;
+                var boat = ResolveAnchorBoat(__instance);
+                if (boat == null)
+                {
+                    Plugin.Log.LogWarning("AnchorReleasePatch: could not resolve boat root for anchor - event NOT sent");
+                    return;
+                }
 
                 var joint = __instance.GetComponent<ConfigurableJoint>();
                 var ropeLength = joint?.linearLimit.limit ?? 0f;

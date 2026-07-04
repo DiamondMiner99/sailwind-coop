@@ -505,7 +505,7 @@ namespace SailwindCoop.Sync
 
         private static float GetAnchorLength(SaveableObject boat)
         {
-            var anchor = boat.GetComponentInChildren<Anchor>();
+            var anchor = BoatUtility.GetAnchor(boat);
             if (anchor == null) return 0;
 
             var joint = anchor.GetComponent<ConfigurableJoint>();
@@ -536,6 +536,16 @@ namespace SailwindCoop.Sync
                     // Use rope's current world position when moored (the rope end is at the dock),
                     // converted to real coords for cross-region sync.
                     dockPos = rope.transform.position - offset;
+
+                    // Y SANITIZATION (wire format unchanged): the rope is parented to the dock cleat, and
+                    // vanilla IslandHorizon.ApplyNewHorizon sinks far island roots by -(d^2/(2*515662))-2*camY
+                    // every LateUpdate (uncapped; ~-10km at 100km), so this Y is a VIEW-DEPENDENT render value,
+                    // not a stable world coordinate (observed dockPos y=-10110 in a join snapshot). Receivers
+                    // on this build match docks by X/Z only, but older receivers (v0.2.22/23) still 3D-match
+                    // within 5m - replace Y with the boat's own Y (a moored boat floats at the dock, so this
+                    // is within a couple meters of the true cleat height) so at least LOCAL docks still
+                    // resolve for them instead of being off by kilometers.
+                    dockPos.y = boat.transform.position.y - offset.y;
                 }
 
                 data[i] = new NetworkMooringData

@@ -19,13 +19,22 @@ namespace SailwindCoop.Debug
         private static DateTime _lastBoatTransformLog = DateTime.MinValue;
         private const int ThrottleMs = 500;
 
+        // Per-session verbose logs: the old single fixed filename (append: false) meant every session
+        // OVERWROTE the previous log - which destroyed bug evidence twice. Each session gets a timestamped
+        // file instead, and the oldest are pruned so the folder never grows unbounded.
+        private const string LogFilePrefix = "SailwindCoop-verbose-";
+        // Verbose files run 10-50MB per play session - keep the folder small.
+        private const int MaxLogFiles = 5;
+
         public static void Initialize()
         {
             if (_initialized) return;
 
             try
             {
-                _logPath = Path.Combine(Paths.BepInExRootPath, "SailwindCoop-verbose.log");
+                PruneOldLogs();
+                var fileName = LogFilePrefix + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log";
+                _logPath = Path.Combine(Paths.BepInExRootPath, fileName);
                 _writer = new StreamWriter(_logPath, append: false) { AutoFlush = true };
                 _initialized = true;
 
@@ -36,6 +45,34 @@ namespace SailwindCoop.Debug
             {
                 Plugin.Log.LogError($"VerboseLogger failed to initialize: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Keep the newest (MaxLogFiles - 1) timestamped verbose logs so the session file about to be
+        /// created lands within the cap. The yyyyMMdd-HHmmss names sort chronologically by filename, so a
+        /// plain sort puts the oldest first. Best-effort: a locked/undeletable file never blocks logging.
+        /// </summary>
+        private static void PruneOldLogs()
+        {
+            try
+            {
+                // One-time cleanup of the pre-timestamp fixed-name log, which the prefix glob never matches.
+                var legacy = Path.Combine(Paths.BepInExRootPath, "SailwindCoop-verbose.log");
+                if (File.Exists(legacy))
+                {
+                    try { File.Delete(legacy); } catch { }
+                }
+
+                var files = Directory.GetFiles(Paths.BepInExRootPath, LogFilePrefix + "*.log");
+                if (files.Length < MaxLogFiles) return;
+                Array.Sort(files);
+                int deleteCount = files.Length - (MaxLogFiles - 1);
+                for (int i = 0; i < deleteCount; i++)
+                {
+                    try { File.Delete(files[i]); } catch { }
+                }
+            }
+            catch { }
         }
 
         public static void Shutdown()
