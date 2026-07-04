@@ -1,4 +1,4 @@
-﻿# â›µ Sailwind Co-op
+# ⛵ Sailwind Co-op
 
 **Crew a single ship with your friends in [Sailwind](https://store.steampowered.com/app/1764530/Sailwind/).**
 
@@ -12,7 +12,7 @@ the same boat, the same world, and the same voyage.
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> ### âš ï¸ This is an early alpha. Back up your saves.
+> ### ⚠️ This is an early alpha. Back up your saves.
 > The mod is under active development and has been played in real 2-5 player sessions, but
 > it can still crash, freeze, or desync. Always copy your save folder before a session.
 > See **[KNOWN-ISSUES.md](KNOWN-ISSUES.md)** for the honest current state.
@@ -69,12 +69,12 @@ Steam must be running (the mod uses Steam friend invites and Steam P2P networkin
 ### Quick install (recommended)
 
 1. Download the latest **`SailwindCoop-vX.Y.Z.zip`** from the [Releases](../../releases) page.
-2. Find your Sailwind folder: in Steam, right-click **Sailwind â†’ Manage â†’ Browse local files**.
+2. Find your Sailwind folder: in Steam, right-click **Sailwind → Manage → Browse local files**.
 3. **Extract the zip straight into that folder** (the one with `Sailwind.exe`), choosing **overwrite** if asked.
    You should now see `winhttp.dll` and a `BepInEx` folder sitting next to `Sailwind.exe`.
 4. Launch the game. That's it. The bundle includes the BepInEx mod loader, so there's nothing else to install.
 
-**Linux / Steam Deck:** set Sailwind's launch options (right-click Sailwind â†’ Properties â†’ Launch Options) to:
+**Linux / Steam Deck:** set Sailwind's launch options (right-click Sailwind → Properties → Launch Options) to:
 ```
 WINEDLLOVERRIDES="winhttp=n,b" %command%
 ```
@@ -97,7 +97,7 @@ between releases, so a stale build on one machine will break the session for eve
 ### Start a session
 
 1. Everyone launches Sailwind. The **host** loads their world and boards their boat.
-2. **Host:** press `Esc` â†’ **Host Co-op** to open a lobby, then **Invite Friend** and pick someone.
+2. **Host:** press `Esc` → **Host Co-op** to open a lobby, then **Invite Friend** and pick someone.
    Keep inviting to fill the crew (up to the configured cap).
 3. **Crew:** accept the Steam invite. You can be at the title screen (your latest save auto-loads)
    or already in your own game; either way you're teleported onto the host's deck.
@@ -106,8 +106,8 @@ between releases, so a stale build on one machine will break the session for eve
 
 Order matters a little, but the mod is built so nobody gets stranded:
 
-- **Host:** `Esc` â†’ **Close Lobby** (or just quit). The host's game keeps running and saves normally.
-- **Crew:** `Esc` â†’ **Leave Lobby** or **Quit Game**. A guest is returned to a warning and the game
+- **Host:** `Esc` → **Close Lobby** (or just quit). The host's game keeps running and saves normally.
+- **Crew:** `Esc` → **Leave Lobby** or **Quit Game**. A guest is returned to a warning and the game
   closes, by design, so a guest never lingers on the host's save. **Your own solo save is left untouched.**
 
 ### Controls
