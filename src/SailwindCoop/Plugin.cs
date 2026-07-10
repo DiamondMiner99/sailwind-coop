@@ -27,8 +27,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the in-progress v0.2.25 dev build; shows as 0.2.25 in the debug menu (distinct from 0.2.24).
-        public const string PluginVersion = "0.2.25";
+        // load. This is the in-progress v0.2.26 dev build (stranded-anchor fix); shows as 0.2.26 in the debug menu.
+        public const string PluginVersion = "0.2.26";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }

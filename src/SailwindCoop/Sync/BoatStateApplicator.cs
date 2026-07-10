@@ -1276,6 +1276,10 @@ namespace SailwindCoop.Sync
             var ropeCtrl = boat.GetComponent<BoatMooringRopes>()?.GetAnchorController()
                            ?? boat.GetComponentInChildren<RopeControllerAnchor>();
 
+            // STRANDED-ANCHOR GUARD: must run BEFORE SetAnchor below, which freezes the body kinematic
+            // at whatever world position it currently has (decomp Anchor.cs:249-261).
+            SnapStrandedAnchor(boat, anchor, ropeCtrl, isAnchored, ropeLength);
+
             // Drive currentLength (normalized) so the rope's own Update() sets the matching joint.linearLimit.limit
             // and the visible rope length, keeping the visual coupled to the anchored state. The wire length is the
             // absolute joint limit; normalize it back through the rope's maxLength (default ~50).
@@ -1843,6 +1847,53 @@ namespace SailwindCoop.Sync
             if (saveable != null) saveable.extraSetting = false;
 
             Plugin.Log.LogInfo($"{logTag}: stowed displaced rope back on hanger");
+        }
+
+        /// <summary>
+        /// Snap an anchor body that is impossibly far from its boat back to the hull before anchor
+        /// state is applied. The join/recovery applicator teleports the BOAT transform, but nothing
+        /// ever repositions the ANCHOR body: vanilla ResetAnchor only zeroes currentLength (decomp
+        /// RopeControllerAnchor.cs:41-45, no position write) and SetAnchor freezes the body kinematic
+        /// AT ITS CURRENT WORLD POSITION (decomp Anchor.cs:249-261). So a guest whose local pre-join
+        /// boat sat at their own island got the anchor frozen kinematic THERE - kilometers away - and
+        /// the ConfigurableJoint (linearLimit = host rope length) then hard-tethered the synced boat
+        /// to that stranded point: the "anchor rope stretched to the horizon / ship pivots around the
+        /// rope" report (GH #5 follow-up, DarthDino92 2026-07-10; host holding the anchor during the
+        /// join sidestepped it because IsAnchored=false skips SetAnchor - confirming this mechanism).
+        /// Threshold mirrors the v0.2.25 dockline stretch guard: anything beyond maxLength + 50m is
+        /// impossible geometry (the rope physically cannot span it), so a legit locally-simulated
+        /// anchor is never touched. Runs on both the join/recovery path (ApplyAnchorState) and the
+        /// runtime relay path (ControlSyncManager.OnRemoteAnchorChanged).
+        /// </summary>
+        internal static void SnapStrandedAnchor(SaveableObject boat, Anchor anchor, RopeControllerAnchor ropeCtrl, bool isAnchored, float ropeLength)
+        {
+            if (boat == null || anchor == null) return;
+
+            var hawse = ropeCtrl != null ? ropeCtrl.transform.position : boat.transform.position;
+            float span = Vector3.Distance(anchor.transform.position, hawse);
+            float maxLen = ropeCtrl != null && ropeCtrl.maxLength > 0f ? ropeCtrl.maxLength : 50f;
+            if (span <= maxLen + 50f) return;
+
+            // Anchored: place it most of the rope length straight down (approximates the host's
+            // seabed drop and keeps the joint inside its limit). Not anchored: hang it at the hawse;
+            // the zeroed joint limit reels it in from there instead of yanking it across the map.
+            float drop = isAnchored ? Mathf.Clamp(ropeLength, 0f, maxLen) * 0.75f : 0.5f;
+            var snapped = hawse + Vector3.down * drop;
+
+            anchor.transform.position = snapped;
+            var rb = anchor.GetComponent<Rigidbody>();
+            if (rb != null)
+            {
+                rb.position = snapped; // transform writes alone don't reliably move the physics pose
+                if (!rb.isKinematic)
+                {
+                    rb.velocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+            }
+
+            Plugin.Log.LogWarning($"[ANCHOR] anchor was stranded {span:F0}m from boat '{boat.gameObject.name}' " +
+                                  $"(stale pre-teleport position); snapped to hull (drop={drop:F1}m) before applying anchored={isAnchored}");
         }
     }
 }

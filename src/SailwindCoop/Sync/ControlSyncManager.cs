@@ -1171,6 +1171,11 @@ namespace SailwindCoop.Sync
                 // (line ~131 forces isKinematic=held whenever !set), so the relayed anchor never actually
                 // set/released on a guest. The AnchorSet/Release patches short-circuit on IsApplyingRemoteState,
                 // so invoking the vanilla methods here does NOT echo. Only transition when the state differs.
+                // Stranded-anchor guard: never let SetAnchor freeze the body kinematic at an impossible
+                // position (a stale pre-teleport pose left over from a bad join). See SnapStrandedAnchor.
+                var anchorRopeCtrl = boat.GetComponent<BoatMooringRopes>()?.GetAnchorController();
+                BoatStateApplicator.SnapStrandedAnchor(boat, anchor, anchorRopeCtrl, packet.IsSet, packet.RopeLength);
+
                 bool currentlySet = anchor.IsSet();
                 if (packet.IsSet && !currentlySet)
                     AccessTools.Method(typeof(Anchor), "SetAnchor")?.Invoke(anchor, null);

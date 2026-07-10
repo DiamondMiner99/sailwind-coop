@@ -14,6 +14,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.26 - 2026-07-10
+
+> **Hotfix.** No network change - fully compatible with v0.2.25 crews, but the fix runs on
+> the machine that sees the bug, so anyone who saw it should update.
+
+### Fixed
+- **Anchor rope stretched endlessly toward a distant island for joining players** (the
+  island seemed to change every restart or boat recovery), with the ship appearing to
+  pivot or drift around the rope. If the host's anchor was down when a guest joined, the
+  guest's copy of the anchor was frozen at the spot where the GUEST's own save last was -
+  kilometers away - and the anchor joint physically tethered the boat to it. The anchor
+  now snaps back to the hull before its state is applied. Thanks DarthDino92 for the
+  report and for finding the host-holds-the-anchor workaround that confirmed the cause!
+
 ## v0.2.25 - 2026-07-10
 
 > **Major update.** Additive network change: v0.2.24 players can still join, but several
