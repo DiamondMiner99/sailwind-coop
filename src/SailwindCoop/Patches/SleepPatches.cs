@@ -165,6 +165,15 @@ namespace SailwindCoop.Patches
             private static float _lastBlockingLog;
             private static float _lastCapCheckLog;
 
+            // (v0.2.25) Throttle for the GUEST wake-suppression log below. Crash evidence: when the
+            // guest's boat lands submerged in storm seas during a 16x warp (SLEEP_SNAP after a packet
+            // backlog), vanilla physics fires Sleep.WakeUp dozens of times PER FixedUpdate - the
+            // suppression branch logged 5,280 lines in the final second before a hard freeze (each
+            // line was then a synchronous disk flush, see VerboseLogger). Uses realtimeSinceStartup,
+            // not Time.time: timeScale is 16x here and the point is capping REAL disk I/O.
+            // Diagnostics only - the suppression itself is unthrottled.
+            private static float _lastGuestSuppressLog;
+
             // __state: true iff THIS WakeUp actually proceeded (Prefix returned true) AND it
             // was a tavern sleep. The Postfix uses it to re-enable MouseLook after the REAL vanilla WakeUp
             // ran - covering the host-auto / host-manual / guest-manual tavern wakes that go through
@@ -198,7 +207,13 @@ namespace SailwindCoop.Patches
                     GuestManualWake = false;
                     if (!Plugin.IsHost && !guestManual)
                     {
-                        VerboseLogger.SleepEvent("Guest auto/physics wake suppressed during co-op sleep (host drives wake)");
+                        // (v0.2.25) Throttled to 1 line / 2s of REALTIME - this fires per physics
+                        // contact while submerged at 16x and the unthrottled flood froze a guest.
+                        if (Time.realtimeSinceStartup - _lastGuestSuppressLog > 2f)
+                        {
+                            _lastGuestSuppressLog = Time.realtimeSinceStartup;
+                            VerboseLogger.SleepEvent("Guest auto/physics wake suppressed during co-op sleep (host drives wake)");
+                        }
                         _blockedThisCall = true;
                         return false;
                     }

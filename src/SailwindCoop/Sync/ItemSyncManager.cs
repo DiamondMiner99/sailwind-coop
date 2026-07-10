@@ -92,6 +92,22 @@ namespace SailwindCoop.Sync
         private Dictionary<int, int> _itemRegistry = new Dictionary<int, int>();
 
         /// <summary>
+        /// (v0.2.25) Host-only: per-guest count of ItemPickupDenied reason=1 (unknown id) replies, keyed
+        /// by the requested instanceId. A guest re-requesting the SAME unknown id over and over (x18
+        /// observed in the v0.2.24 logs) is the ghost-item signature - a local-only item (phantom-save
+        /// cache residual) the host was never told about, which the guest can grab forever but never
+        /// actually hold. Past GhostPurgeDenyThreshold denies the host sends GhostItemPurge so that guest
+        /// destroys its local copy and the loop ends. Bounded: inner maps are capped (oldest-agnostic
+        /// wholesale clear at GhostPurgeMaxTrackedIds - re-counting a live ghost from 0 just delays its
+        /// purge by 2 denies), entries are removed once a purge fires, the leaver's map is dropped on
+        /// disconnect, and everything is cleared in Reset().
+        /// </summary>
+        private Dictionary<SteamId, Dictionary<int, int>> _unknownPickupDenyCounts = new Dictionary<SteamId, Dictionary<int, int>>();
+        private const int GhostPurgeDenyThreshold = 2;   // purge on the deny AFTER this many (i.e. the 3rd)
+        private const int GhostPurgeMaxTrackedIds = 64;  // per-guest cap; clear wholesale beyond this
+        private const float GhostPurgeSafetyRadius = 50f; // (v0.2.25) same-prefab live item within this of the request pos -> correlation failure, not a ghost; skip the purge
+
+        /// <summary>
         /// Track items just purchased to skip redundant pickup sync.
         /// Key: instanceId, Value: time when marked
         /// </summary>
@@ -1242,6 +1258,7 @@ namespace SailwindCoop.Sync
             _skippedDropsWhileHeld.Clear();
             _justLocallyDestroyed.Clear();
             _recentlyRemoteDestroyed.Clear();
+            _unknownPickupDenyCounts.Clear(); // (v0.2.25) ghost-purge deny counters are per-session
         }
 
         /// <summary>
@@ -1352,7 +1369,10 @@ namespace SailwindCoop.Sync
                 // Inspect-then-buy retro-send: the item is in the buyer's HAND, but receivers must
                 // correlate against the pose their copy still has - the shop table (world frame; shop
                 // tables are never boat-parented, so this is always a land-style position).
-                position = positionOverride.Value;
+                // (v0.2.25) Offset-independent like every other land send path (drop/spawn/resync):
+                // subtract the sender's FloatingOrigin offset; the receiver re-adds its OWN.
+                var overrideOffset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
+                position = positionOverride.Value - overrideOffset;
             }
             else if (item.currentActualBoat != null)
             {
@@ -1363,8 +1383,14 @@ namespace SailwindCoop.Sync
             }
             else
             {
-                // On land - use world position
-                position = item.transform.position;
+                // On land - use world position, converted to offset-independent coords.
+                // (v0.2.25) This branch used to send the RAW local world position, unlike every other
+                // land send path (drop/spawn/resync all send pos - outCurrentOffset and receivers add
+                // their own offset back). After any floating-origin shift the two machines' raw world
+                // frames differ by hundreds of metres, so the host's position-correlation for a guest's
+                // land pickup could never match. Mirror the other paths: subtract the sender's offset.
+                var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
+                position = item.transform.position - offset;
             }
 
             VerboseLogger.ItemLocal($"Pickup, item={item.name}, id={instanceId}, slot={inventorySlot}, boat={boatName}, pos={position}, sold={item.sold}");
@@ -1866,10 +1892,16 @@ namespace SailwindCoop.Sync
 
             if (item == null)
             {
-                // LAZY ID CORRELATION: Find nearest item of same type near the position
+                // LAZY ID CORRELATION: Find nearest item of same type near the position.
+                // (v0.2.25) Land positions on the wire are offset-independent (sender subtracted its
+                // FloatingOrigin offset - see OnLocalPickup); add OUR offset back before comparing
+                // against local raw world transforms, mirroring the drop/resync receive paths.
+                var correlatePos = packet.Position;
+                if (!packet.IsLocalPosition)
+                    correlatePos += FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
                 item = FindItemByPrefabNearPosition(
                     packet.PrefabIndex,
-                    packet.Position,
+                    correlatePos,
                     packet.ParentBoatName,
                     packet.IsLocalPosition
                 );
@@ -2477,13 +2509,21 @@ namespace SailwindCoop.Sync
             // prefab/position correlation below, which is stable.
             ShipItem item = packet.ItemInstanceId != 0 ? FindItemByInstanceId(packet.ItemInstanceId) : null;
 
+            // (v0.2.25) Land positions on the wire are offset-independent (sender subtracted its
+            // FloatingOrigin offset - see OnLocalPickup); add the HOST's offset back before comparing
+            // against local raw world transforms (mirrors the drop/resync receive paths). Also reused
+            // by the ghost-purge safety check below.
+            var correlatePos = packet.Position;
+            if (!packet.IsLocalPosition)
+                correlatePos += FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
+
             if (item == null)
             {
                 // LAZY ID CORRELATION: Find nearest item of same type near the position
                 // This handles items that exist locally but haven't been synced yet
                 item = FindItemByPrefabNearPosition(
                     packet.PrefabIndex,
-                    packet.Position,
+                    correlatePos,
                     packet.ParentBoatName,
                     packet.IsLocalPosition
                 );
@@ -2519,6 +2559,14 @@ namespace SailwindCoop.Sync
             {
                 VerboseLogger.ItemApply($"Denying pickup - no matching item found for prefab={packet.PrefabIndex} near pos={packet.Position}");
                 SendItemPickupDenied(packet.ItemInstanceId, 1, sender);
+                // GHOST-ITEM SELF-CLEAN (v0.2.25): reason=1 means the host has NO item under this id and
+                // couldn't correlate one either - the requester is grabbing a local-only ghost (e.g. a
+                // phantom-save cache residual streamed in on v0.2.24). The deny alone doesn't help: the
+                // guest's copy stays grabbable and the same id comes back again and again (x18 observed).
+                // After the threshold, tell THAT guest to destroy its local copy (targeted, additive
+                // packet - old clients just keep the deny loop, no worse than before).
+                RecordUnknownPickupDeny(packet.ItemInstanceId, sender, packet.PrefabIndex,
+                    correlatePos, packet.ParentBoatName, packet.IsLocalPosition);
                 return;
             }
 
@@ -2682,6 +2730,134 @@ namespace SailwindCoop.Sync
                     VerboseLogger.ItemApply($"Replaying skipped ItemDropped for denied item {packet.ItemInstanceId}");
                     OnRemoteItemDropped(skipped.Packet);
                 }
+            }
+        }
+
+        /// <summary>
+        /// (v0.2.25) Host bookkeeping for a reason=1 (unknown id) pickup deny. Counts denies per
+        /// (guest, instanceId); past GhostPurgeDenyThreshold it sends that guest a targeted
+        /// GhostItemPurge so the guest destroys its local ghost copy and stops re-requesting.
+        /// The threshold (not purge-on-first-deny) is deliberate: a race where the guest requests an id
+        /// the host is about to learn (e.g. an ItemPickedUp/ItemSpawned still in flight) legitimately
+        /// produces a one-off reason=1; only the REPEATED same-id deny is the ghost signature.
+        /// (v0.2.25) SAFETY: even past the threshold, the purge is skipped when the host DOES have a
+        /// live item of the same prefab within a generous radius of the request position - a repeated
+        /// miss next to a real same-type item is more likely a CORRELATION failure (offset drift,
+        /// contested id, tight 3m radius) than a true ghost, and purging would delete the guest's only
+        /// copy of a real item. hostFramePos is already in the HOST's frame (caller applied offsets).
+        /// </summary>
+        private void RecordUnknownPickupDeny(int instanceId, SteamId sender, int prefabIndex,
+            Vector3 hostFramePos, string boatName, bool isLocalPosition)
+        {
+            if (!Plugin.IsHost) return;
+            if (instanceId == 0) return; // unsold vendor-table items all share id 0 - never a purge target
+
+            if (!_unknownPickupDenyCounts.TryGetValue(sender, out var perId))
+            {
+                perId = new Dictionary<int, int>();
+                _unknownPickupDenyCounts[sender] = perId;
+            }
+            // Bound the per-guest map: a wholesale clear past the cap is fine (a still-live ghost merely
+            // re-counts from 0 and gets purged 2 denies later) and keeps this allocation-trivial.
+            if (perId.Count > GhostPurgeMaxTrackedIds) perId.Clear();
+
+            perId.TryGetValue(instanceId, out var count);
+            count++;
+            if (count <= GhostPurgeDenyThreshold)
+            {
+                perId[instanceId] = count;
+                return;
+            }
+
+            // (v0.2.25) Correlation-failure guard: a live host item of the SAME prefab near the request
+            // position means the guest is probably grabbing a REAL item we just failed to correlate -
+            // don't purge; keep the counter at the threshold so a later deny re-runs this check.
+            var nearbyReal = FindItemByPrefabNearPosition(prefabIndex, hostFramePos, boatName,
+                isLocalPosition, maxDistance: GhostPurgeSafetyRadius, logMissAsError: false);
+            if (nearbyReal != null)
+            {
+                perId[instanceId] = GhostPurgeDenyThreshold;
+                VerboseLogger.ItemApply($"GhostItemPurge SKIPPED for id={instanceId} -> {sender}: live host item " +
+                    $"{nearbyReal.name} (prefab={prefabIndex}) within {GhostPurgeSafetyRadius:F0}m of the request - " +
+                    $"likely a correlation failure on a real item, not a ghost");
+                return;
+            }
+
+            // 3rd+ deny for the same id from the same guest: ghost confirmed. Purge and forget the
+            // counter (if the guest somehow still has the item - e.g. it was held so the guest-side
+            // guard skipped the destroy - the count simply rebuilds and a purge fires again).
+            perId.Remove(instanceId);
+            VerboseLogger.ItemSend($"GhostItemPurge, id={instanceId} -> {sender} (unknown-id pickup denied {count}x)");
+            Plugin.NetworkManager.SendReliable(sender, PacketType.GhostItemPurge, w =>
+                PacketSerializer.WriteGhostItemPurge(w, new GhostItemPurgePacket { ItemInstanceId = instanceId }));
+        }
+
+        /// <summary>
+        /// (v0.2.25) Guest: the host repeatedly denied our pickup of this id as UNKNOWN and is telling us
+        /// to destroy our local copy - it is a ghost (local-only, e.g. a phantom-save cache residual).
+        /// Deliberately conservative: only destroy an item that is genuinely loose and untracked on this
+        /// machine. Anything held, remotely carried, or that this client knows as a synced/recently-synced
+        /// item is left alone (a purge for such an id would indicate host/guest disagreement better healed
+        /// by the normal resync paths than by deleting an in-use object out of someone's hand).
+        /// </summary>
+        public void OnRemoteGhostItemPurge(GhostItemPurgePacket packet)
+        {
+            if (Plugin.IsHost) return;
+
+            VerboseLogger.ItemRecv($"GhostItemPurge, id={packet.ItemInstanceId}");
+
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (item == null)
+            {
+                VerboseLogger.ItemApply($"GhostItemPurge: item {packet.ItemInstanceId} not found locally (already gone) - nothing to purge");
+                return;
+            }
+
+            if (item.held != null)
+            {
+                VerboseLogger.ItemApply($"GhostItemPurge: SKIP - item {packet.ItemInstanceId} ({item.name}) is currently held locally");
+                return;
+            }
+            if (_remoteHeldItems.ContainsKey(packet.ItemInstanceId) || _heldItems.ContainsKey(packet.ItemInstanceId))
+            {
+                VerboseLogger.ItemApply($"GhostItemPurge: SKIP - item {packet.ItemInstanceId} ({item.name}) is tracked as held by a crew member");
+                return;
+            }
+            if (IsRecentlySynced(packet.ItemInstanceId))
+            {
+                VerboseLogger.ItemApply($"GhostItemPurge: SKIP - item {packet.ItemInstanceId} ({item.name}) was just synced from remote (not a ghost)");
+                return;
+            }
+
+            // (v0.2.25) SLOT HYGIENE: if any inventory slot still references the doomed item (e.g. a
+            // pocketed ghost whose SetActive(false) hid it from the held checks above), null the slot
+            // BEFORE DestroyItem so the UI never keeps a dangling currentItem to a destroyed object
+            // (mirrors the pocket/world dedup in BoatStateApplicator.SpawnWorldItems).
+            var invSlots = GPButtonInventorySlot.inventorySlots;
+            if (invSlots != null)
+            {
+                foreach (var slot in invSlots)
+                {
+                    if (slot != null && slot.currentItem == item)
+                    {
+                        slot.currentItem = null;
+                        VerboseLogger.ItemApply($"GhostItemPurge: cleared inventory slot referencing purged item {packet.ItemInstanceId}");
+                    }
+                }
+            }
+
+            // Wrapped so the local DestroyItem doesn't echo an ItemDestroyed broadcast for an id the
+            // host never knew (mirrors OnRemoteItemDestroyed's guard).
+            IsApplyingRemoteState = true;
+            try
+            {
+                _recentlyRemoteDestroyed[packet.ItemInstanceId] = Time.time; // block same-frame resurrection via a stale drop
+                item.DestroyItem();
+                VerboseLogger.ItemApply($"GhostItemPurge: destroyed local ghost item {packet.ItemInstanceId} ({item.name})");
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
             }
         }
 
@@ -3607,6 +3783,51 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
+        /// HUNG-STATE JOIN RESYNC (issue #4). The hung-lantern joint is NOT persisted (vanilla SaveablePrefab
+        /// never captures HangableItem.currentHook), and the join snapshot has no hang state - so a lantern
+        /// mounted on a hook BEFORE the guest joined spawns loose, falls off the wall, and vanishes (no model
+        /// -> no light -> nothing to interact with). Mirror ResyncNailedStateTo: after the join, replay an
+        /// ItemHung (existing packet, no wire change) for every currently-hanging item so the guest re-connects
+        /// the joint via OnRemoteItemHung -> HangableItem.ConnectJoint (which also snaps a fallen lantern back).
+        /// Host-only; call AFTER the nailed resync so the hook is kinematic/on-wall before the lantern re-hangs.
+        /// </summary>
+        public void ResyncHungStateTo(SteamId target)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+
+            int sent = 0;
+            foreach (var hangable in Object.FindObjectsOfType<HangableItem>())
+            {
+                if (hangable == null || !hangable.IsHanging()) continue;
+
+                var itemPrefab = hangable.GetComponent<SaveablePrefab>();
+                if (itemPrefab == null || itemPrefab.instanceId == 0) continue; // id==0 = unaddressable
+
+                // The hung hook is the private HangableItem.currentHook collider; resolve its ShipItem +
+                // SaveablePrefab the same way OnLocalItemHung / OnConnectJoint do.
+                var hookCol = HarmonyLib.Traverse.Create(hangable).Field("currentHook").GetValue<Collider>();
+                var hookItem = hookCol != null ? hookCol.GetComponent<ShipItem>() : null;
+                var hookPrefab = hookItem != null ? hookItem.GetComponent<SaveablePrefab>() : null;
+                if (hookPrefab == null || hookPrefab.instanceId == 0) continue;
+
+                var packet = new ItemHungPacket
+                {
+                    ItemInstanceId = itemPrefab.instanceId,
+                    HookInstanceId = hookPrefab.instanceId
+                };
+
+                VerboseLogger.ItemSend($"ItemHung (join resync), item={itemPrefab.instanceId}, hook={hookPrefab.instanceId}, target={target}");
+
+                Plugin.NetworkManager.SendReliable(target, PacketType.ItemHung, w =>
+                    PacketSerializer.WriteItemHung(w, packet));
+                sent++;
+            }
+
+            if (sent > 0)
+                Plugin.Log.LogInfo($"[ITEMS] Hung-state resync to {target}: {sent} item(s) resent");
+        }
+
+        /// <summary>
         /// Find a tobacco material by looking for any ShipItemTobacco with matching type.
         /// </summary>
         private Material FindTobaccoMaterial(int tobaccoType)
@@ -4377,6 +4598,9 @@ namespace SailwindCoop.Sync
             // Drop the leaver's per-peer synced-id set too, so it doesn't leak across the
             // session and a future joiner reusing the SteamId starts clean. Other peers' sets are untouched.
             _syncedItemIds.Remove(leaver);
+
+            // (v0.2.25) Drop the leaver's ghost-purge deny counters too - same per-peer hygiene.
+            _unknownPickupDenyCounts.Remove(leaver);
 
             // Forget this carrier's synced held-item slot so its item visual stops following a now-gone
             // avatar. Other carriers' slots are untouched. At N=1 this clears the single slot.

@@ -19,6 +19,15 @@ namespace SailwindCoop.Debug
         private static DateTime _lastBoatTransformLog = DateTime.MinValue;
         private const int ThrottleMs = 500;
 
+        // (v0.2.25) Flush pacing. AutoFlush=true made EVERY line a synchronous disk flush - measured
+        // 110-148ms/frame of packet-handler cost on a guest during a 16x sleep, and a 5,280-line log
+        // burst in the final second hard-froze the client. The writer now buffers and we flush at most
+        // once per second from the write path (realtime stamp below), plus on Shutdown (close /
+        // OnDestroy / application quit) so at worst ~1s of tail is lost on a hard crash instead of the
+        // log itself becoming the crash.
+        private static float _lastFlushRealtime;
+        private const float FlushIntervalSeconds = 1f;
+
         // Per-session verbose logs: the old single fixed filename (append: false) meant every session
         // OVERWROTE the previous log - which destroyed bug evidence twice. Each session gets a timestamped
         // file instead, and the oldest are pruned so the folder never grows unbounded.
@@ -35,7 +44,9 @@ namespace SailwindCoop.Debug
                 PruneOldLogs();
                 var fileName = LogFilePrefix + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log";
                 _logPath = Path.Combine(Paths.BepInExRootPath, fileName);
-                _writer = new StreamWriter(_logPath, append: false) { AutoFlush = true };
+                // (v0.2.25) AutoFlush=false: per-line synchronous flushes were the freeze/crash vector
+                // under log bursts (see flush-pacing comment above). Log() paces explicit flushes.
+                _writer = new StreamWriter(_logPath, append: false) { AutoFlush = false };
                 _initialized = true;
 
                 var role = Plugin.LobbyManager?.IsHost == true ? "Host" : "Guest";
@@ -99,6 +110,16 @@ namespace SailwindCoop.Debug
             {
                 var timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
                 _writer.WriteLine($"[{timestamp}] [{system}:{direction}] {message}");
+
+                // (v0.2.25) Paced flush: at most once per FlushIntervalSeconds of REALTIME (immune to
+                // the 16x sleep timescale). A cheap float compare per line - no allocation - replacing
+                // the old per-line AutoFlush disk hit. Shutdown() flushes the final tail.
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (now - _lastFlushRealtime >= FlushIntervalSeconds)
+                {
+                    _lastFlushRealtime = now;
+                    _writer.Flush();
+                }
             }
             catch { }
         }

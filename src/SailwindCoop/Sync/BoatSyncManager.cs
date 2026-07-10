@@ -80,6 +80,13 @@ namespace SailwindCoop.Sync
         /// </summary>
         public static bool IsJoinInProgress { get; set; }
 
+        /// (v0.2.25) True once THIS machine has received a BoatWorldState join snapshot from the host.
+        /// Distinct from _hasReceivedState, which per-packet BoatTransform updates also set: the guest
+        /// join-state WATCHDOG (Plugin.GuestJoinWatchdog) needs proof the host actually ADMITTED us and
+        /// sent the full snapshot, not merely that some transform packet leaked through. Never true on a
+        /// host (only guests receive BoatWorldState). Cleared in Reset() so a later session re-arms it.
+        public static bool HasReceivedWorldState { get; private set; }
+
         private void Awake()
         {
             if (Instance != null)
@@ -113,7 +120,11 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void SendBoatTransform()
         {
-            if (Time.time - _lastSyncTime < SyncInterval) return;
+            // (v0.2.25) SyncInterval is scaled up (rate halved) while the host drives a co-op sleep:
+            // Time.time runs 16x under the warp, so unscaled this channel alone floods guests and
+            // (with the other high-freq channels) saturated a guest's packet budget - the backlog
+            // delayed transforms ~3.5s and triggered the 175-200m SLEEP_SNAP crash chain.
+            if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.HostSleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
             // Symmetric to the guest's ApplyBoatTransform shipyard guard. While the HOST is
@@ -395,6 +406,10 @@ namespace SailwindCoop.Sync
         {
             VerboseLogger.BoatRecv($"BoatWorldState, boats={packet.Boats.Length}, currentBoat={packet.CurrentBoatName}");
 
+            // (v0.2.25) Mark the join snapshot as ARRIVED before applying it (apply may bail early if the
+            // boat lookup fails, but arrival alone proves the host admitted us - the watchdog must stand down).
+            HasReceivedWorldState = true;
+
             BoatStateApplicator.ApplyWorldState(packet);
 
             // Initialize interpolation target
@@ -468,6 +483,7 @@ namespace SailwindCoop.Sync
             _targetVelocity = Vector3.zero;
             _targetAngularVelocity = Vector3.zero;
             IsJoinInProgress = false;
+            HasReceivedWorldState = false; // (v0.2.25) re-arm the guest join-state watchdog for the next session
 
             // Clear cache
             _cachedBoatTransform = null;

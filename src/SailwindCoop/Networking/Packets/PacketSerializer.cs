@@ -2287,6 +2287,19 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteGhostItemPurge(BinaryWriter writer, GhostItemPurgePacket packet)
+        {
+            writer.Write(packet.ItemInstanceId); // Must mirror ReadGhostItemPurge order
+        }
+
+        public static GhostItemPurgePacket ReadGhostItemPurge(BinaryReader reader)
+        {
+            return new GhostItemPurgePacket
+            {
+                ItemInstanceId = reader.ReadInt32()
+            };
+        }
+
         public static void WriteGuestJoinComplete(BinaryWriter writer, GuestJoinCompletePacket packet)
         {
             // No payload: the packet type plus the transport-level sender SteamId carry everything.

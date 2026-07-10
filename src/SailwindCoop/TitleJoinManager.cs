@@ -28,15 +28,18 @@ namespace SailwindCoop
         /// vanilla crash-on-corruption behavior.</summary>
         public static bool SuppressLoadErrors;
 
-        /// <summary>Begin auto-load-then-join for a guest accepting an invite at the title screen.</summary>
-        public static void Begin(SteamId lobbyId)
+        /// <summary>Begin auto-load-then-join for a guest accepting an invite at the title screen.
+        /// (v0.2.25) hostId keys the phantom co-op save per host; at the title screen we haven't
+        /// entered the lobby yet (no Lobby.Owner), so callers pass the friend whose invite/game the
+        /// guest is joining through (OnGameLobbyJoinRequested's friendId) - the host in practice.</summary>
+        public static void Begin(SteamId lobbyId, SteamId hostId)
         {
             if (_busy) { Plugin.Log.LogInfo("[TitleJoin] already in progress, ignoring"); return; }
             if (Plugin.Instance == null) { Plugin.Log.LogWarning("[TitleJoin] no plugin instance"); return; }
-            Plugin.Instance.StartCoroutine(AutoLoadThenJoin(lobbyId));
+            Plugin.Instance.StartCoroutine(AutoLoadThenJoin(lobbyId, hostId));
         }
 
-        private static IEnumerator AutoLoadThenJoin(SteamId lobbyId)
+        private static IEnumerator AutoLoadThenJoin(SteamId lobbyId, SteamId hostId)
         {
             _busy = true;
             try
@@ -55,7 +58,7 @@ namespace SailwindCoop
                 // is never written). On success SaveSlots.currentSlot is now 99, so the vanilla LoadGame
                 // below loads the PHANTOM world (valid world + persisted needs) and every later save is
                 // structurally redirected to the phantom file - never a real slot.
-                if (!CoopSave.EnterCoopSaveContext(out bool didCreate))
+                if (!CoopSave.EnterCoopSaveContext(hostId.Value, out bool didCreate))
                 {
                     Plugin.Notify("Start or load a save once before joining co-op.", 7f);
                     yield break;

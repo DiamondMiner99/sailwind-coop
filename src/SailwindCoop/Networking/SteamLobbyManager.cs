@@ -29,6 +29,13 @@ namespace SailwindCoop.Networking
         // Ids the HOST invited via the in-game menu this lobby; the admission gate in
         // HandleLobbyMemberJoined only admits these (unless AllowCrewInvites). Cleared per lobby.
         private readonly HashSet<SteamId> _hostSentInvites = new HashSet<SteamId>();
+        // (v0.2.25) Members the HOST's admission gate actually ADMITTED (OnPlayerJoined fired for them).
+        // This is the authoritative host-side admission set: P2PNetworkManager consults it (IsAdmitted)
+        // before accepting a P2P session or dispatching packets. The v0.2.23/24 playtest logs proved that
+        // lobby-level refusal alone was NOT enough - the raw Steam P2P session still connected on both
+        // sides and every peer-based sync manager ran, so a REFUSED guest played an entire session
+        // half-initialized (no join snapshot, stale phantom-save needs). Host-side only; cleared per lobby.
+        private readonly HashSet<SteamId> _admittedMembers = new HashSet<SteamId>();
 
         public bool IsInLobby => _currentLobby.HasValue;
 
@@ -230,6 +237,7 @@ namespace SailwindCoop.Networking
                 lobby.SetJoinable(true);
 
                 _hostSentInvites.Clear();
+                _admittedMembers.Clear(); // (v0.2.25) fresh lobby = fresh admission set
                 _currentLobby = lobby;
                 InvalidateRoleCache();
 
@@ -291,6 +299,7 @@ namespace SailwindCoop.Networking
             _currentLobby.Value.Leave();
             _currentLobby = null;
             _hostSentInvites.Clear();
+            _admittedMembers.Clear(); // (v0.2.25) admission is per-lobby; never carry it across sessions
             InvalidateRoleCache();
 
             Plugin.Log.LogInfo($"Left lobby: {lobbyId}");
@@ -321,6 +330,17 @@ namespace SailwindCoop.Networking
             }
 
             return result;
+        }
+
+        /// (v0.2.25) HOST-side transport admission check. True only for peers the admission gate in
+        /// HandleLobbyMemberJoined actually let in (plus ourselves). P2PNetworkManager gates P2P session
+        /// accepts AND per-packet dispatch on this, so a lobby member the host REFUSED can no longer keep
+        /// a live P2P session and feed the host's sync managers (the v0.2.23/24 half-initialized-session
+        /// defect). Meaningless on a guest (the set is only populated by the host's gate) - callers must
+        /// only consult it when Plugin.IsHost.
+        public bool IsAdmitted(SteamId id)
+        {
+            return id == SteamClient.SteamId || _admittedMembers.Contains(id);
         }
 
         public int GetMemberCount()
@@ -370,29 +390,75 @@ namespace SailwindCoop.Networking
         {
             VerboseLogger.LobbyEvent($"Player joined: {friend.Name} ({friend.Id})");
 
-            // HOST ADMISSION GATE (2026-07-02): only the HOST's own invitees are admitted unless the
-            // host opted into AllowCrewInvites. Steam cannot kick a lobby member, but admission is what
-            // matters: an unadmitted member never gets OnPlayerJoined, so the host never peers with
-            // them and never sends the join state - their join times out and their mod warn-and-quits
-            // them. The gate runs only on the HOST (guests' handlers are visual/roster-side and follow
-            // the host's session state).
+            // HOST ADMISSION GATE (2026-07-02, refined 2026-07-04 for GH #2). Admit anyone the host
+            // legitimately let in; refuse only true strangers. A joiner is ADMITTED when ANY holds:
+            //   - they are on the HOST's own Steam friends list (friend.IsFriend). An overlay "Invite to
+            //     Game" - what players actually use, incl. the pause-menu Invite button (which calls
+            //     SteamFriends.OpenGameInviteOverlay) - can only reach a friend, so this is the NORMAL admit
+            //     path. Critically, the old gate only admitted _hostSentInvites, but InviteFriend() is never
+            //     called anywhere, so that set is ALWAYS EMPTY: with the default AllowCrewInvites=false the
+            //     old gate refused EVERY guest (incl. the host's own invited friend) = GH #2 "always spawns
+            //     at own start". The 2026-07-02 concern was a STRANGER to the host (a guest's friend) boarding
+            //     uninvited; such a person is not the host's friend, so !friend.IsFriend still bounces them.
+            //   - the host explicitly invited them via InviteFriend (_hostSentInvites), or
+            //   - the host set AllowCrewInvites (anyone a crew member invites may join).
+            // Steam gives the owner no kick, so ADMISSION (not removal) is the control: an unadmitted member
+            // never gets OnPlayerJoined, so the host never peers with them or sends join state. (v0.2.25)
+            // The host ALSO refuses their raw P2P session + drops their packets (P2PNetworkManager gates on
+            // IsAdmitted) - previously the transport still connected and sync managers ran half-initialized.
+            // On the refused GUEST's side, their join-state watchdog (Plugin.GuestJoinWatchdog) notices no
+            // join snapshot ever arrived, warns them the host didn't admit them, and quits them cleanly.
+            // (An older comment here claimed a warn-and-quit timeout already existed; it did not - an
+            // unadmitted guest silently played on. The watchdog is what makes that claim true.) Host-only gate.
             if (Plugin.IsHost
                 && Plugin.AllowCrewInvitesConfig?.Value != true
                 && friend.Id != SteamClient.SteamId
+                && !friend.IsFriend
                 && !_hostSentInvites.Contains(friend.Id))
             {
                 string name = string.IsNullOrEmpty(friend.Name) ? friend.Id.ToString() : friend.Name;
-                Plugin.Log.LogWarning($"[LOBBY] REFUSED admission for {name} ({friend.Id}): not invited by the host (a crew member invited them; enable AllowCrewInvites in the config to permit this)");
-                Plugin.Notify($"{name} tried to join but wasn't invited by you - not admitted. (Config: AllowCrewInvites)", 10f);
+                Plugin.Log.LogError($"[LOBBY] REFUSED admission for {name} ({friend.Id}): not on your Steam friends list and not invited by you. Add them as a Steam friend, or enable AllowCrewInvites in the config, to let them in.");
+                NotifyRefusedLoud(name);
                 return;
             }
 
+            // (v0.2.25) Record the admission so the transport layer can enforce it: P2PNetworkManager
+            // refuses P2P sessions from (and drops packets of) lobby members NOT in this set. Only
+            // meaningful on the host (guests never consult it - they only ever peer with the host).
+            if (Plugin.IsHost && friend.Id != SteamClient.SteamId)
+                _admittedMembers.Add(friend.Id);
+
             OnPlayerJoined?.Invoke(friend);
+        }
+
+        // GH #2: a single 10s toast was easy to miss (the refused host in the report never noticed), so a
+        // genuinely-refused stranger slipped past. Repeat a long toast a few times (~continuous 20s) and log
+        // at Error so a real crasher is obvious. Runs on the Unity main thread from the Steam callback pump,
+        // so StartCoroutine is safe; falls back to a single toast if the plugin MonoBehaviour isn't up yet.
+        private void NotifyRefusedLoud(string name)
+        {
+            string msg = $"{name} tried to join but isn't your Steam friend and wasn't invited by you - NOT admitted. (Config: Coop.AllowCrewInvites)";
+            if (Plugin.Instance != null)
+                Plugin.Instance.StartCoroutine(RepeatRefusalToast(msg));
+            else
+                Plugin.Notify(msg, 12f);
+        }
+
+        private System.Collections.IEnumerator RepeatRefusalToast(string msg)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                Plugin.Notify(msg, 12f);
+                yield return new UnityEngine.WaitForSecondsRealtime(4f);
+            }
         }
 
         private void HandleLobbyMemberLeave(Lobby lobby, Friend friend)
         {
             VerboseLogger.LobbyEvent($"Player left: {friend.Name} ({friend.Id})");
+            // (v0.2.25) Revoke transport admission on leave: if the same id later re-joins it must pass
+            // the admission gate again, and until then the host won't accept its P2P session/packets.
+            _admittedMembers.Remove(friend.Id);
             OnPlayerLeft?.Invoke(friend);
         }
 
@@ -432,7 +498,10 @@ namespace SailwindCoop.Networking
             if (!IsInLobby)
             {
                 VerboseLogger.LobbyEvent($"Joining via friends list");
-                RouteJoin(lobby.Id);
+                // (v0.2.25) friendId = whose game/invite the guest clicked through (the host in
+                // practice); keys the title-join phantom save per host (Lobby.Owner is unreadable
+                // before the lobby is actually entered).
+                RouteJoin(lobby.Id, friendId);
             }
             else
             {
@@ -443,10 +512,10 @@ namespace SailwindCoop.Networking
         // Accepting a co-op invite while still at the title menu: load a save FIRST, then join, so the guest
         // is fully in-world when the host sends boat state (reuses the proven in-game join path). If already
         // in-game, join immediately as before.
-        private void RouteJoin(SteamId lobbyId)
+        private void RouteJoin(SteamId lobbyId, SteamId hostId)
         {
             if (!GameState.playing)
-                TitleJoinManager.Begin(lobbyId);
+                TitleJoinManager.Begin(lobbyId, hostId);
             else
                 JoinLobby(lobbyId);
         }

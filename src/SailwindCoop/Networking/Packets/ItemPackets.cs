@@ -43,6 +43,18 @@ namespace SailwindCoop.Networking.Packets
         public byte Reason; // 0 = already held, 1 = doesn't exist
     }
 
+    /// <summary>
+    /// (v0.2.25) Host -> one guest: "destroy your local copy of this instanceId". Sent after the host
+    /// denies ItemPickupRequest with reason=1 (unknown id) for the SAME id more than twice from the
+    /// same guest - that repetition is the ghost-item signature (a local-only item the host was never
+    /// told about, e.g. a phantom-save cache residual). Targeted + additive: old clients drop it.
+    /// </summary>
+    [Serializable]
+    public struct GhostItemPurgePacket
+    {
+        public int ItemInstanceId;
+    }
+
     [Serializable]
     public struct ItemSpawnedPacket
     {

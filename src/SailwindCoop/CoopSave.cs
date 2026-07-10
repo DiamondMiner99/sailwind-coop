@@ -28,8 +28,17 @@ namespace SailwindCoop
 
         // Distinct on-disk names for the phantom slot. The SaveSlots patch rewrites slot-99 paths to
         // these so they can never collide with "/slot{0..5}.save".
-        private const string PhantomFileName = "coop_session.save";
-        private const string PhantomBackupPrefix = "coop_session_backup"; // + index + ".save"
+        // (v0.2.25) KEYED PER HOST: the phantom is now "coop_session_<hostSteamId64>.save" so a guest
+        // who plays with SEVERAL hosts doesn't carry one host's world/needs/pockets into another host's
+        // session (the cross-session id/prefab collisions behind the ghost-item reports). The legacy
+        // un-keyed "coop_session.save" is deliberately IGNORED for reuse (treated as no-phantom, so a
+        // fresh keyed phantom is seeded from the guest's solo save) and never deleted.
+        private static ulong _hostKey; // SteamID64 of the current session's host; 0 = not set (legacy name fallback)
+        private const string LegacyPhantomFileName = "coop_session.save";
+        private static string PhantomFileName =>
+            _hostKey != 0 ? $"coop_session_{_hostKey}.save" : LegacyPhantomFileName;
+        private static string PhantomBackupPrefix => // + index + ".save"
+            _hostKey != 0 ? $"coop_session_{_hostKey}_backup" : "coop_session_backup";
 
         // Idempotency guard so a single guest-leave doesn't write the phantom twice (the EndGuest path
         // fires both OnLobbyLeft and OnApplicationQuit). Reset when a new phantom context is entered.
@@ -54,6 +63,15 @@ namespace SailwindCoop
         /// </summary>
         public static bool ContextActive { get; private set; }
 
+        /// <summary>
+        /// True when the phantom co-op save for THIS session was freshly seeded from the guest's solo save
+        /// (first-ever join to this host), false when an existing phantom was reused (a returning guest).
+        /// The guest-side join wipe (BoatStateApplicator.ResetLocalSurvivalAndInventory) uses this to clear
+        /// the pockets ONLY on a fresh phantom - a returning guest keeps the inventory the phantom just
+        /// restored (issue #1: client inventory did not persist between sessions). Set in EnterCoopSaveContext.
+        /// </summary>
+        public static bool PhantomWasFreshlyCreated { get; private set; }
+
         /// <summary>Clear the guest co-op save context (called on teardown, e.g. OnDestroy/hot-reload), so a
         /// lingering currentSlot==99 can no longer redirect saves to the phantom file.</summary>
         public static void ClearContext() => ContextActive = false;
@@ -75,12 +93,17 @@ namespace SailwindCoop
         /// </summary>
         /// <param name="didCreate">True if a brand-new phantom was just bootstrapped (caller should then
         /// reset needs to baseline). False if a persisted phantom already existed.</param>
+        /// <param name="hostId">SteamID64 of the session's host (lobby owner / invite sender). Keys the
+        /// phantom file per host (v0.2.25) so different hosts' sessions never share one phantom. If a
+        /// keyed phantom doesn't exist yet, a legacy un-keyed coop_session.save is NOT reused - the
+        /// keyed file is freshly seeded from the guest's solo save (legacy file left on disk untouched).</param>
         /// <returns>True if the phantom context is ready (currentSlot set to 99); false if there is no
         /// phantom and no solo save to seed from (caller must block the join with a notify).</returns>
-        public static bool EnterCoopSaveContext(out bool didCreate)
+        public static bool EnterCoopSaveContext(ulong hostId, out bool didCreate)
         {
             didCreate = false;
 
+            _hostKey = hostId;         // (v0.2.25) key every phantom path below to THIS host
             _savedThisSession = false; // new session: allow one phantom save on this leave/quit
 
             string phantomPath = PhantomSavePath();
@@ -89,9 +112,19 @@ namespace SailwindCoop
                 // A persisted phantom already exists; reuse it (carries forward the guest's co-op needs).
                 SaveSlots.currentSlot = PhantomSlot;
                 ContextActive = true; // arm the redirect ONLY for the live guest session
+                PhantomWasFreshlyCreated = false; // reused -> returning guest keeps their persisted inventory
                 Plugin.Log.LogInfo($"[CoopSave] Reusing existing phantom save ({phantomPath}); currentSlot=99");
-                VerboseLogger.LobbyEvent("Phantom save: reusing existing coop_session.save (currentSlot=99)");
+                VerboseLogger.LobbyEvent($"Phantom save: reusing existing {Path.GetFileName(phantomPath)} (currentSlot=99)");
                 return true;
+            }
+
+            // (v0.2.25) MIGRATION: no keyed phantom for this host. A legacy un-keyed coop_session.save
+            // may exist from pre-keyed builds, but it could belong to ANY host - reusing it is exactly
+            // the cross-host contamination the keying fixes. So it is deliberately ignored (treated as
+            // "no phantom" -> fresh seed below) and left on disk; the user can delete it manually.
+            if (_hostKey != 0 && File.Exists(Path.Combine(Application.persistentDataPath, LegacyPhantomFileName)))
+            {
+                Plugin.Log.LogInfo($"[CoopSave] Legacy un-keyed {LegacyPhantomFileName} exists but is ignored (host-keyed phantoms since v0.2.25); seeding a fresh {PhantomFileName}");
             }
 
             // No phantom yet: seed one from the guest's most-recent solo slot (READ solo / WRITE phantom).
@@ -109,6 +142,7 @@ namespace SailwindCoop
                 didCreate = true;
                 SaveSlots.currentSlot = PhantomSlot;
                 ContextActive = true; // arm the redirect for the live guest session
+                PhantomWasFreshlyCreated = true; // fresh phantom -> clean-slate the pockets on this first join
                 Plugin.Log.LogInfo($"[CoopSave] Seeded new phantom save from solo slot {soloSlot} ({soloPath} -> {phantomPath}); currentSlot=99");
                 VerboseLogger.LobbyEvent($"Phantom save: created from solo slot {soloSlot} (currentSlot=99, will reset needs to baseline)");
                 return true;
@@ -180,7 +214,7 @@ namespace SailwindCoop
             // at end of frame. Don't claim "saved" here - if the frame never finishes (e.g. app already
             // tearing down), the phantom was NOT written.
             Plugin.Log.LogInfo($"[CoopSave] Phantom save STARTED (async, commits end-of-frame) -> {PhantomSavePath()}");
-            VerboseLogger.LobbyEvent("Phantom save: SaveCoopSession started DoSaveGame for coop_session.save (currentSlot=99, commits end-of-frame)");
+            VerboseLogger.LobbyEvent($"Phantom save: SaveCoopSession started DoSaveGame for {PhantomFileName} (currentSlot=99, commits end-of-frame)");
         }
 
         /// <summary>

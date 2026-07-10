@@ -14,6 +14,64 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.25 - 2026-07-10
+
+> **Major update.** Additive network change: v0.2.24 players can still join, but several
+> fixes and all new features only apply when everyone updates. Recommended: the whole crew
+> installs v0.2.25. Fixes every open GitHub issue from the public reports plus two fresh
+> playtest log batches (thanks Robin, Reto, and Fox!).
+
+### Added
+- **Crouching shows on player avatars.** Full squat pose driven by leg IK - hips drop, feet
+  stay planted. Crouch depth and pose are tunable in-game via Configuration Manager.
+- **Your inventory and vitals persist between sessions with the same host.** Log out, rejoin
+  later, keep your stuff. Session state is kept per host, so different hosts' worlds no
+  longer bleed into each other. (First join after updating starts fresh one time.)
+- **Dropped items and crates float again** (`Coop.RestoreItemBuoyancy`, default on). Items
+  floating is real vanilla behavior; the current Sailwind v0.38 build shipped a regression
+  that disables every item's water floater each physics frame, so everything sank - even in
+  singleplayer. This restores the pre-0.38 floating. Local-only; set false for the raw
+  current-build behavior.
+
+### Fixed
+- **Joining a friend works reliably again.** Since v0.2.23 the host silently refused every
+  guest (the admission list was never populated), leaving joiners half-connected in their own
+  world - the cause of "client spawns at their own location", "inventory lost between
+  sessions" showing as never-initialized state, and vitals that seemed to drain at different
+  rates (they were never synced up at join; actual drain rates are exactly vanilla). Hosts
+  now admit their Steam friends; strangers are still refused. If a join does fail, the guest
+  now gets a clear warning and returns to their own game after 45s instead of silently
+  playing a broken session - and the host ignores traffic from unadmitted senders entirely.
+- **Guest freeze/crash during crew sleep.** During 16x sleep a packet backlog caused huge
+  boat position snaps; the dunked boat then fired thousands of suppressed wake events per
+  second, each written to disk with a synchronous flush - freezing then crashing the guest
+  (reported "when we passed into aestrin-coloured waters": the storm there is what dunked
+  the snapped boat). The log is now throttled, verbose logging is buffered, and the host
+  thins its send rates during the sleep warp so the backlog never builds.
+- **Duplicate uninteractable items for guests (map, compass, lantern, mug...).** The game
+  lazily spawns each boat's default items from the guest's own local cache on top of the
+  host's synced copies. The cache is now flushed at join, and any residual ghost item
+  self-cleans after repeated failed grabs (guarded so it can never delete a real item).
+- **Boats the host hasn't visited yet no longer appear empty (or ghost-duplicated) to
+  guests** - the host now broadcasts items the game spawns lazily when walking up to a boat.
+- **Mooring ropes no longer stretch across the ocean for joining guests.** A geometrically
+  impossible moor (frame divergence at some docks) is stowed on that client instead.
+- **Lantern hooks and hanging lanterns now sync to joining players**, including the light.
+  (Hanging a lantern after a guest joined can still have an interaction quirk on the guest's
+  side - still investigating, logs welcome on issue #4.)
+- **Items picked up on land now sync correctly far from spawn.** Land pickups sent raw
+  world coordinates, so the host's position matching could never succeed at distance - a
+  long-standing source of "item denied"/desync reports.
+- **Guests no longer permanently lose the connection after a brief network hiccup** (the
+  host peer was dropped forever on a single failed-session callback).
+- Verbose log files are capped and no longer hammer the disk every line.
+
+### Notes for testers
+- Robin's "host runs out of sleep twice as fast": measured from the logs, both players
+  drained at exactly vanilla rates - the offset came from the broken join above (the
+  guest's vitals started wherever their stale session save left them). Also: alcohol
+  quadruples sleep drain in vanilla; drinkers tire fast.
+
 ## v0.2.24 - 2026-07-04
 
 > Fix batch from the first public-player reports (thanks to both reporters!). No network

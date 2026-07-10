@@ -17,6 +17,25 @@ namespace SailwindCoop.Sync
         private float _lastSyncTime;
         private GoPointer _cachedGoPointer;
 
+        // CROUCH (v0.2.25): cached vanilla PlayerCrouching (lives on Refs.ovrCameraRig) + its private
+        // initialHeight (the camera rig's standing local head height, captured in its Awake). Vanilla
+        // crouch is purely the head height lerping initialHeight <-> 0.2 (t = dt*9), so normalizing
+        // GetCurrentHeadHeight between those endpoints yields a smooth 0..1 crouch amount that already
+        // reflects every vanilla cancel path (bed, jump, swimming) - no extra state to track.
+        private PlayerCrouching _cachedCrouching;
+        private float _crouchStandingHeight = -1f;
+
+        // LOOK-LEAN: cached lookup of the vanilla MouseLook instances (up to two: static look1/look2) and a
+        // cached ref-accessor for their PRIVATE clamped vertical-look field `rotationY` (positive = looking UP,
+        // clamped ~[-60,60]). Only the VERTICAL controller ever changes rotationY (the horizontal-only MouseX
+        // instance keeps it 0), so SampleLocalLookPitchDeg takes the value with the largest |magnitude|.
+        private static readonly AccessTools.FieldRef<MouseLook, float> MouseLookRotationYRef =
+            AccessTools.FieldRefAccess<MouseLook, float>("rotationY");
+        private MouseLook[] _cachedMouseLooks;
+        // (v0.2.25) empty-scan throttle: earliest realtime a missed MouseLook re-scan may run again.
+        private float _nextMouseLookScanTime;
+        private const float MouseLookRescanInterval = 1.5f;
+
         // A (guest-world-pinned-underway): embark self-heal watchdog state. Vanilla runs TWO parallel
         // embark state machines (PlayerEmbarkDisembarkTrigger + PlayerEmbarkerNew) whose predicates can
         // deadlock during moored on/off cargo cycles (static embarked sticks true / no fresh EmbarkCol
@@ -200,6 +219,74 @@ namespace SailwindCoop.Sync
             return cc.height * 0.5f - cc.center.y;
         }
 
+        /// <summary>
+        /// CROUCH (v0.2.25): normalized 0..1 crouch amount for the LOCAL player, sampled from the vanilla
+        /// PlayerCrouching head-height lerp (standing initialHeight -> crouched 0.2). Sending the lerped
+        /// AMOUNT (not the bool) lets remote avatars reproduce the smooth stand/crouch transition even at
+        /// 20Hz. Returns 0 when the component/height isn't available yet (pre-load, degenerate rig).
+        /// </summary>
+        private float SampleCrouch01()
+        {
+            if (_cachedCrouching == null)
+            {
+                var rig = Refs.ovrCameraRig;
+                if (rig != null) _cachedCrouching = rig.GetComponent<PlayerCrouching>();
+                if (_cachedCrouching == null) return 0f;
+                // Private field, set once in PlayerCrouching.Awake (= rig localPosition.y while standing).
+                _crouchStandingHeight = Traverse.Create(_cachedCrouching).Field("initialHeight").GetValue<float>();
+            }
+            // Degenerate standing height (component not initialized, or a rig where standing ~ crouched):
+            // treat as not crouching rather than emitting garbage.
+            if (_crouchStandingHeight <= 0.3f) return 0f;
+            float head = _cachedCrouching.GetCurrentHeadHeight();
+            // currentHeadHeight starts at 0 and only lerps while GameState.playing; a raw 0 would
+            // normalize to FULL crouch, so treat the uninitialized band as standing (the real crouched
+            // endpoint is 0.2 and the lerp approaches it from above).
+            if (head < 0.1f) return 0f;
+            return Mathf.Clamp01(Mathf.InverseLerp(_crouchStandingHeight, 0.2f, head));
+        }
+
+        /// <summary>
+        /// LOOK-LEAN: the LOCAL player's clamped vertical look angle in degrees (~[-60,60]; positive = looking
+        /// UP), read from the vanilla MouseLook.rotationY private field. There can be up to two MouseLook
+        /// instances (static look1/look2); only the VERTICAL one ever moves rotationY (the horizontal-only
+        /// MouseX instance keeps it 0), so we take the value with the largest ABSOLUTE magnitude (0 when looking
+        /// straight = correct). Camera.main pitch is NOT usable here: in the ship-orbit camera Camera.main is the
+        /// orbit cam (not the head), whereas MouseLook.rotationY is camera-mode-independent. Returns 0 if no
+        /// MouseLook is loaded; re-finds when the cached instances go stale (scene change).
+        /// </summary>
+        private float SampleLocalLookPitchDeg()
+        {
+            if (_cachedMouseLooks == null || _cachedMouseLooks.Length == 0)
+            {
+                // (v0.2.25) EMPTY-SCAN THROTTLE: with no MouseLook loaded (menus/loading) this ran a
+                // full-scene FindObjectsOfType EVERY call (20Hz), allocating and scanning for nothing.
+                // Cache the miss and rescan at most once per interval (realtime, load-lag immune).
+                float now = Time.realtimeSinceStartup;
+                if (now < _nextMouseLookScanTime) return 0f;
+                _cachedMouseLooks = Object.FindObjectsOfType<MouseLook>();
+                if (_cachedMouseLooks == null || _cachedMouseLooks.Length == 0)
+                {
+                    _nextMouseLookScanTime = now + MouseLookRescanInterval;
+                    return 0f;
+                }
+            }
+
+            float best = 0f, bestAbs = -1f;
+            bool anyLive = false;
+            for (int i = 0; i < _cachedMouseLooks.Length; i++)
+            {
+                var ml = _cachedMouseLooks[i];
+                if (ml == null) continue; // destroyed on a scene change
+                anyLive = true;
+                float ry = MouseLookRotationYRef(ml);
+                float a = Mathf.Abs(ry);
+                if (a > bestAbs) { bestAbs = a; best = ry; }
+            }
+            if (!anyLive) { _cachedMouseLooks = null; return 0f; } // all stale -> re-find next call
+            return best;
+        }
+
         private void SendPlayerPosition(CharacterController charController)
         {
             var position = charController.transform.position;
@@ -353,6 +440,18 @@ namespace SailwindCoop.Sync
             // author equals the one guest, so the single-avatar receive path is unchanged.
             ulong authorSteamId = Steamworks.SteamClient.SteamId.Value;
 
+            // CROUCH (v0.2.25 wire change): quantize the 0..1 crouch amount to a byte and append it as
+            // the LAST field, AFTER the optional held-item block. Trailing-append keeps the packet
+            // readable by pre-v0.2.25 receivers (their reads stop before it) and the receiver probes
+            // remaining stream length so an old sender's shorter packet still parses.
+            byte crouchByte = (byte)Mathf.RoundToInt(SampleCrouch01() * 255f);
+
+            // LOOK-LEAN (wire change): quantize the local vertical look pitch to ONE signed byte and append it
+            // AFTER the crouch byte. [-90,90] deg -> [0,255] (128 = 0 deg). Same trailing-append + stream-length
+            // probe contract as crouch, so a pre-look receiver just stops before it and a pre-look sender's
+            // shorter packet still parses (receiver reads neutral 128 = no lean).
+            byte lookByte = (byte)Mathf.RoundToInt(Mathf.Clamp(SampleLocalLookPitchDeg(), -90f, 90f) / 90f * 127f + 128f);
+
             Plugin.NetworkManager.SendToAllUnreliable(PacketType.PlayerPosition, writer =>
             {
                 writer.Write(authorSteamId);
@@ -378,6 +477,8 @@ namespace SailwindCoop.Sync
                     writer.Write(heldItemRot.z);
                     writer.Write(heldItemRot.w);
                 }
+                writer.Write(crouchByte); // CROUCH (v0.2.25): trailing 0-255 crouch amount
+                writer.Write(lookByte);   // LOOK-LEAN: trailing signed look-pitch byte (after crouch)
             });
         }
     }

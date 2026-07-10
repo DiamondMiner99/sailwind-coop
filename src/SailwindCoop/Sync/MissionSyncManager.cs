@@ -761,6 +761,8 @@ namespace SailwindCoop.Sync
             _pendingMissionUI = null;
             _pendingMissionTableAnchor = null;
             _pendingPortDude = null;
+            // (v0.2.25) hygiene: don't pin the last pre-broadcast Mission across sessions.
+            Patches.MissionPatches.MissionRegisterGoodPatch.ClearSessionState();
         }
     }
 }

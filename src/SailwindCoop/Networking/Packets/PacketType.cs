@@ -209,5 +209,14 @@ namespace SailwindCoop.Networking.Packets
         // every guest trade it executes), so only the host emits; guests never send this. Additive
         // wire - v0.2.22 clients silently drop the unknown type.
         TradeFeedEvent = 208,            // Host -> all guests: actor SteamId, buy/sell, item name, price, currency
+
+        // Ghost-item purge (209, v0.2.25): a guest can hold local "ghost" items whose instanceIds the
+        // host never registered (e.g. phantom-save cached items streamed in on v0.2.24; the v0.2.25
+        // cache flush stops NEW ones but residuals linger in old saves). The signature is the guest
+        // re-requesting pickup of the same unknown id over and over (up to x18 observed) and eating
+        // ItemPickupDenied reason=1 each time. After repeated unknown-id denies the host tells THAT
+        // guest to destroy its local copy. Additive wire - pre-v0.2.25 clients silently drop the
+        // unknown type and just keep seeing the deny loop (no worse than today).
+        GhostItemPurge = 209,            // Host -> requesting guest (targeted, reliable): destroy your local copy of this unknown instanceId
     }
 }

@@ -56,6 +56,12 @@ namespace SailwindCoop.Patches
                 var moorRopes = __instance.GetComponentInParent<BoatMooringRopes>();
                 if (moorRopes?.ropes != null && moorRopes.AnyRopeMoored()) return;
 
+                // Per-crew weight (kg). Vanilla uses 160 for every person (host included); this is configurable
+                // and lower by default so a crowd on one side of a small boat doesn't pile up enough heel to
+                // flip it. HOST-ONLY value (this whole patch is host-gated above), so nothing to sync.
+                float crewWeight = Plugin.CrewMemberWeightConfig != null ? Plugin.CrewMemberWeightConfig.Value : 90f;
+                if (crewWeight <= 0f) return;
+
                 // Add weight for each remote crew member currently on this boat.
                 foreach (var avatar in remoteManager.Avatars)
                 {
@@ -67,11 +73,12 @@ namespace SailwindCoop.Patches
                     // Convert world position to boat-local
                     Vector3 guestLocalPos = __instance.transform.InverseTransformPoint(capsule.position);
 
-                    // Add guest mass (same as host: 160 units)
-                    ___body.mass += 160f;
+                    // Add guest mass
+                    ___body.mass += crewWeight;
 
-                    // Calculate center of mass offset (same formula as host player in BoatMass.UpdateMass)
-                    float ratio = 160f / ___selfMass;
+                    // Center-of-mass offset (same formula as the host player in BoatMass.UpdateMass) - scales
+                    // with the weight, so lowering crewWeight also lightens the heel this crew member induces.
+                    float ratio = crewWeight / ___selfMass;
                     Vector3 offset = Quaternion.Euler(0f, -90f, 0f) * guestLocalPos * ratio * ___leverageMult;
                     ___body.centerOfMass += offset;
                 }

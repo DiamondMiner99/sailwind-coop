@@ -654,6 +654,29 @@ namespace SailwindCoop.Sync
                 }
             }
 
+            // DUPLICATE-DEFAULT-ITEMS FIX (issue #3): the joiner's OWN phantom-save copies of the default
+            // boat items (map, compass, lantern, scroll, mug, table...) are NOT instantiated at clear time -
+            // vanilla BoatLocalItems holds them as serialized SavePrefabData in `cachedItems` and streams them
+            // in lazily on player proximity, AFTER this clear + the host's SpawnItems have run. They then
+            // spawn on top of the host's authoritative copies = duplicates the host can't authorize (grab for
+            // ~1s then force-dropped, because they carry the joiner's own instanceIds). The dead
+            // GameState.loadingBoatLocalItems guard never prevented this. Flush the boat's cache so nothing
+            // re-streams: null cachedItems + mark itemsLoaded so BoatLocalItems.Update's spawn branch is
+            // inert. Autocache stays on, so the HOST's items still stream/re-cache normally under host ids.
+            var localItems = boat.GetComponent<BoatLocalItems>();
+            if (localItems != null)
+            {
+                try
+                {
+                    Traverse.Create(localItems).Field("cachedItems").SetValue(null);
+                    localItems.SetItemsLoaded(true);
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[JOIN] Could not flush BoatLocalItems cache on {boat.gameObject.name}: {e.Message}");
+                }
+            }
+
             Plugin.Log.LogDebug($"Cleared {count} items from {boat.gameObject.name}");
         }
 
@@ -832,6 +855,54 @@ namespace SailwindCoop.Sync
             var sortedItems = items.OrderBy(i => i.CrateId > 0 ? 1 : 0).ToArray();
             var spawnedInstances = new Dictionary<int, GameObject>();
             var itemIds = new List<int>();
+
+            // POCKET/WORLD DEDUP (issue #1 x disconnect-drop): a RETURNING guest keeps their persisted pocket
+            // items (issue #1), but the host also drops a guest's pocketed items into the WORLD when that guest
+            // disconnects - so the authoritative snapshot can re-spawn an item the guest STILL has pocketed,
+            // leaving two objects sharing one instanceId (ambiguous FindItemByInstanceId, a physical dupe). The
+            // host snapshot is authoritative, so before spawning, destroy any LOCAL pocket copy of an id that
+            // the snapshot places in the world. Only matters for a reused phantom (a fresh phantom already had
+            // its pockets cleared by ResetLocalSurvivalAndInventory).
+            if (!CoopSave.PhantomWasFreshlyCreated)
+            {
+                // (v0.2.25) Track the snapshot item's PREFAB per id, not just the id: instanceIds are
+                // random per-session, so a pocket item can collide with an UNRELATED world item's id
+                // from the host's session. Only destroy the pocket copy when the prefab matches too -
+                // on mismatch it's an id collision, keep the pocket item (vanishing odds, free guard).
+                var worldIds = new Dictionary<int, int>(); // instanceId -> PrefabIndex
+                foreach (var it in items) if (it.InstanceId > 0) worldIds[it.InstanceId] = it.PrefabIndex;
+
+                var slots = GPButtonInventorySlot.inventorySlots;
+                if (slots != null && worldIds.Count > 0)
+                {
+                    var itemSync = ItemSyncManager.Instance;
+                    bool restoreApplying = false;
+                    if (itemSync != null && !itemSync.IsApplyingRemoteState) { itemSync.SetApplyingRemoteState(true); restoreApplying = true; }
+                    try
+                    {
+                        int deduped = 0;
+                        foreach (var slot in slots)
+                        {
+                            if (slot == null || slot.currentItem == null) continue;
+                            var pfab = slot.currentItem.GetComponent<SaveablePrefab>();
+                            if (pfab == null || !worldIds.TryGetValue(pfab.instanceId, out var snapPrefab)) continue;
+                            if (snapPrefab != pfab.prefabIndex)
+                            {
+                                // (v0.2.25) Same id, DIFFERENT prefab: cross-session id collision, not a dupe.
+                                Plugin.Log.LogInfo($"[JOIN] Pocket/world dedup: id {pfab.instanceId} matches a snapshot world item but prefab differs (pocket={pfab.prefabIndex}, world={snapPrefab}) - id collision, keeping the pocket item");
+                                continue;
+                            }
+                            var dupItem = slot.currentItem;
+                            slot.currentItem = null;   // free the slot; the authoritative world copy will spawn below
+                            dupItem.DestroyItem();     // vanilla path: Unregister + Destroy (no broadcast under the guard)
+                            deduped++;
+                        }
+                        if (deduped > 0)
+                            Plugin.Log.LogInfo($"[JOIN] Pocket/world dedup: dropped {deduped} pocketed item(s) that the host snapshot places in the world (issue #1 anti-dupe)");
+                    }
+                    finally { if (restoreApplying && itemSync != null) itemSync.SetApplyingRemoteState(false); }
+                }
+            }
 
             // First pass: spawn all items (per-item isolation - see SpawnItems; one bad item must not
             // abort the join).
@@ -1553,6 +1624,19 @@ namespace SailwindCoop.Sync
             //    only consumer of Mission.spawnedGoods (Mission.AbandonMission, decomp Mission.cs:177-183)
             //    null-checks each entry, so a destroyed good is safely skipped there; no separate Good/PlayerMissions
             //    deregistration is needed, and mission save data never iterates the destroyed reference.
+            // INVENTORY PERSISTENCE (issue #1): only clean-slate the pockets on a FRESH phantom (first-ever
+            // join to this host). A RETURNING guest's phantom coop_session.save already round-trips their pocket
+            // items (vanilla SaveablePrefab persists each item + its inventorySlot; the join LoadGame restores
+            // them), and destroying them here is what lost the client's inventory between sessions. The original
+            // "don't carry over the host's items" purpose is now handled on the SENDER side (BoatStateCollector
+            // excludes the host's own pocket items), so this destroy is only needed to zap a genuinely fresh
+            // phantom's leftover solo pockets. Needs are still reset to full every join (above), unchanged.
+            if (!CoopSave.PhantomWasFreshlyCreated)
+            {
+                Plugin.Log.LogInfo("[JOIN] Reusing phantom - keeping the inventory it just restored (issue #1)");
+                return;
+            }
+
             var itemSync = ItemSyncManager.Instance;
             bool restoreApplying = false;
             if (itemSync != null && !itemSync.IsApplyingRemoteState)
@@ -1575,7 +1659,7 @@ namespace SailwindCoop.Sync
                         cleared++;
                     }
                 }
-                Plugin.Log.LogInfo($"[JOIN] Clean slate: cleared {cleared} item(s) from local inventory pockets");
+                Plugin.Log.LogInfo($"[JOIN] Clean slate (fresh phantom): cleared {cleared} item(s) from local inventory pockets");
             }
             finally
             {
@@ -1640,6 +1724,31 @@ namespace SailwindCoop.Sync
                         }
 
                         Plugin.Log.LogInfo($"  Rope {i}: MoorTo completed, IsMoored now={rope.IsMoored()}");
+
+                        // VISUAL-STRETCH GUARD (issue #5): the X/Z dock match can resolve a dock that, on THIS
+                        // client, is NOT co-located with where the boat ended up. The visible line is redrawn every
+                        // LateUpdate from the rope end (pinned by MoorTo to the dock cleat) to the boat: the cleat
+                        // inherits the horizon-sunk island Y (the loaded island scene is slaved to the IslandHorizon
+                        // proxy) while the boat floats at true sea level, and cross-region/floating-origin state can
+                        // also separate them horizontally - so the moor is "logically" correct (tied to the pier) yet
+                        // renders a rope raking across/into the ocean. The rope's own max length is
+                        // sqrt(maxLength=900)=30m (cleat->hull springAnchor); the check below measures cleat->boat
+                        // ORIGIN, which adds at most a hull's worth (~15-20m on the largest boats), so 50m is a
+                        // safe margin over any LEGIT near-dock moor while still catching a divergent frame -> unmoor
+                        // + stow rather than leave a kilometre-long dockline. (v0.2.24 handled the dock-MATCH and the
+                        // no-dock MISS; this is the "matched but impossible geometry on this client" branch.)
+                        var stretchRb = rope.GetBoatRigidbody();
+                        if (stretchRb != null)
+                        {
+                            float moorSpan = Vector3.Distance(rope.transform.position, stretchRb.transform.position);
+                            if (moorSpan > 50f)
+                            {
+                                Plugin.Log.LogWarning($"  Rope {i}: post-moor span {moorSpan:F0}m implausible " +
+                                    $"(dock/boat frames diverge on this client); unmooring + stowing to avoid a stretched dockline");
+                                rope.Unmoor();
+                                StowRopeIfDisplaced(rope, $"Rope {i}");
+                            }
+                        }
                     }
                     else
                     {

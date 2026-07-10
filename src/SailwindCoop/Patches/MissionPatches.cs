@@ -36,10 +36,34 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(Mission), nameof(Mission.RegisterGood))]
         public static class MissionRegisterGoodPatch
         {
+            // The mission we last pre-broadcast an accept for (see below). All goods of one accept share the
+            // same Mission instance, so this fires the pre-broadcast exactly once per accept.
+            private static Mission _preBroadcastMission;
+
+            /// <summary>(v0.2.25) Session hygiene: drop the stale Mission reference on session
+            /// reset/teardown (called from MissionSyncManager.Reset) so it can't pin a dead Mission
+            /// across sessions or suppress the pre-broadcast for a recycled instance.</summary>
+            public static void ClearSessionState() => _preBroadcastMission = null;
+
             [HarmonyPostfix]
             public static void Postfix(Mission __instance, GameObject good)
             {
                 if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+
+                // MISSIONLESS-FIRST-CRATE FIX (R2): Port.DoSpawnGoods registers good #0 and calls RegisterGood
+                // SYNCHRONOUSLY inside PlayerMissions.AcceptMission, BEFORE AcceptMission returns - so this
+                // patch (and its ItemSpawned below) fires BEFORE AcceptMissionPatch.Postfix broadcasts the
+                // MissionAccepted. On the reliable-ordered wire that means already-connected guests receive
+                // ItemSpawned #0 before MissionAccepted, so SaveablePrefab.Load sees missions[idx]==null and
+                // registers the first crate MISSIONLESS (wrong look-text, undeliverable). Broadcast the mission
+                // FIRST (once per accept; missionIndex is already assigned on the host by now, and the guest's
+                // OnMissionAcceptedReceived just sets the slot - idempotent) so every good's ItemSpawned is
+                // preceded by its mission. AcceptMissionPatch's later broadcast is then a harmless duplicate.
+                if (__instance != null && __instance != _preBroadcastMission && __instance.missionIndex >= 0)
+                {
+                    _preBroadcastMission = __instance;
+                    MissionSyncManager.Instance?.BroadcastMissionAccepted(__instance);
+                }
 
                 // Broadcast item spawn to guest
                 var shipItem = good?.GetComponent<ShipItem>();

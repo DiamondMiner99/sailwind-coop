@@ -359,11 +359,34 @@ namespace SailwindCoop.Networking
         // Track packet types for debugging (logged via F7 / PerformanceProfiler)
         private Dictionary<PacketType, int> _packetTypeCounts = new Dictionary<PacketType, int>();
 
+        // (v0.2.25) Rate-limit the unadmitted-sender drop log so a chatty refused client (position
+        // packets at ~20 Hz) can't spam the host's log every frame.
+        private float _lastUnadmittedDropLogRealtime = -999f;
+
         private void ProcessPacket(SteamId sender, byte[] data)
         {
             if (data == null || data.Length < 1)
             {
                 Plugin.Log.LogWarning($"Received empty or null packet from {sender}");
+                return;
+            }
+
+            // (v0.2.25) HOST-side per-packet admission backstop. Even with the session-request refusal
+            // above, packets can slip in through a session that was accepted BEFORE the admission verdict
+            // (or one Steam auto-revived through the relay). An unadmitted sender's packets must never
+            // reach the sync-manager handlers - that is exactly how the v0.2.23/24 refused guest still
+            // fed the host a whole session of state. Drop + re-close the session. Host-only: on a guest
+            // the admission set is not populated (the gate runs on the host), and a guest's handlers
+            // already key off the host/star topology.
+            if (Plugin.IsHost && !(SteamLobbyManager.Instance?.IsAdmitted(sender) ?? false))
+            {
+                SteamNetworking.CloseP2PSessionWithUser(sender);
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (now - _lastUnadmittedDropLogRealtime > 5f)
+                {
+                    _lastUnadmittedDropLogRealtime = now;
+                    Plugin.Log.LogWarning($"Dropped packet(s) from UNADMITTED sender {sender} (host admission gate); P2P session re-closed");
+                }
                 return;
             }
 
@@ -466,9 +489,24 @@ namespace SailwindCoop.Networking
 
         private void OnP2PSessionRequest(SteamId requester)
         {
-            // Always accept the underlying Steam P2P session - the lobby system already validated the
-            // requester, and accepting avoids race conditions when joining. (Accepting is harmless even
-            // if we don't peer with them; relayed traffic still flows host<->guest.)
+            // (v0.2.25) HOST ADMISSION at the TRANSPORT layer. The old comment here said "the lobby
+            // system already validated the requester" - false: the lobby admission gate only withholds
+            // OnPlayerJoined, it can't stop Steam from carrying raw P2P traffic. The v0.2.23/24 playtest
+            // logs proved a REFUSED guest's session still connected on both sides and the pair played an
+            // entire half-initialized session (no join snapshot). So the HOST now refuses the underlying
+            // session for any requester its admission gate has not admitted (SteamLobbyManager.IsAdmitted).
+            // Guests skip this check: a guest only ever receives requests from lobby members, and the
+            // star-topology branch below already ignores non-host requesters for peering.
+            if (Plugin.IsHost && !(SteamLobbyManager.Instance?.IsAdmitted(requester) ?? false))
+            {
+                SteamNetworking.CloseP2PSessionWithUser(requester);
+                Plugin.Log.LogWarning($"REFUSED P2P session from {requester}: not admitted by the host's admission gate (session closed, packets will be dropped)");
+                return;
+            }
+
+            // Accept the underlying Steam P2P session - the requester passed host admission (or we're a
+            // guest, whose only legitimate traffic source is the host/relayed lobby members). Accepting
+            // early avoids race conditions when joining; relayed traffic still flows host<->guest.
             SteamNetworking.AcceptP2PSessionWithUser(requester);
 
             // STAR ENFORCEMENT (N-player Phase 5): only AddPeer when role-appropriate, so guests never
@@ -507,6 +545,25 @@ namespace SailwindCoop.Networking
         private void OnP2PConnectionFailed(SteamId peerId, P2PSessionError error)
         {
             Plugin.Log.LogError($"P2P connection failed with {peerId}: {error}");
+
+            // (v0.2.25) GUEST RESILIENCE: a P2PSessionError for the HOST must never permanently
+            // un-peer a guest. RemovePeer here made one transient relay hiccup (NAT rebind, relay
+            // reroute, timeout) end the guest's session outbound FOREVER: every send loop iterates
+            // _connectedPeers, so with the host removed the guest silently stops sending and nothing
+            // ever re-adds the peer. Keep (re-add if needed) the host peer instead - the ~20Hz sync
+            // sends keep flowing and each SendP2PPacket re-raises the underlying Steam session request,
+            // so the pair reconnects as soon as the transport recovers. The HOST still removes a
+            // failed GUEST (authoritative disconnect handling / item drops stay unchanged).
+            var hostId = SteamLobbyManager.Instance?.HostSteamId ?? default;
+            if (!Plugin.IsHost && hostId.Value != 0 && peerId == hostId)
+            {
+                if (!_connectedPeers.Contains(peerId))
+                {
+                    AddPeer(peerId);
+                }
+                Plugin.Log.LogWarning($"Keeping HOST peer {peerId} despite P2P error '{error}' - retrying; ongoing ~20Hz sends will re-raise the Steam P2P session");
+                return;
+            }
 
             if (_connectedPeers.Contains(peerId))
             {

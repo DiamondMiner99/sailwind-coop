@@ -66,8 +66,9 @@ namespace SailwindCoop.Sync
 
         private void UpdateHost()
         {
-            // Send damage state at 1Hz
-            if (Time.time - _lastSyncTime >= SyncInterval)
+            // Send damage state at 1Hz. (v0.2.25) Halved during a host co-op sleep (Time.time runs 16x
+            // under the warp -> ~16Hz real) so the high-freq channels can't saturate a guest's budget.
+            if (Time.time - _lastSyncTime >= SyncInterval * SleepSyncManager.HostSleepSendIntervalScale)
             {
                 _lastSyncTime = Time.time;
                 SendDamageState();

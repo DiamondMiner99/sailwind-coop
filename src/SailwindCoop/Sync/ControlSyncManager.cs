@@ -101,7 +101,10 @@ namespace SailwindCoop.Sync
 
             Plugin.Profiler?.StartMeasure();
 
-            if (Time.time - _lastSyncTime >= SyncInterval)
+            // (v0.2.25) Rate halved on the HOST during a co-op sleep (scale is 1 on guests/awake):
+            // Time.time runs 16x under the warp, so this 10Hz poll became ~160Hz real and helped
+            // saturate a guest's packet budget (the SLEEP_SNAP crash chain). Frequency only.
+            if (Time.time - _lastSyncTime >= SyncInterval * SleepSyncManager.HostSleepSendIntervalScale)
             {
                 _lastSyncTime = Time.time;
                 // Join-race: retry rope seeds that arrived before the guest boat's sail controllers existed.
@@ -1291,6 +1294,21 @@ namespace SailwindCoop.Sync
                             springJoint.maxDistance = Mathf.Sqrt(packet.LengthSquared);
 
                         VerboseLogger.ControlApply($"Moored rope {packet.RopeIndex} to {dock.name}, restored authoritative maxDistance={(springJoint != null ? Mathf.Sqrt(packet.LengthSquared) : 0f):F2}");
+
+                        // VISUAL-STRETCH GUARD (issue #5): the X/Z match can resolve a dock that, on THIS client,
+                        // is not co-located with the boat (the dock cleat inherits the horizon-sunk island Y while
+                        // the boat floats at sea level; cross-region/floating-origin can also separate them). MoorTo
+                        // then renders a LineRenderer raking across the ocean even though the moor is "logically"
+                        // correct. The rope's max length is ~30m (cleat->hull anchor); this measures cleat->boat
+                        // origin (+ up to a hull), so 50m clears any legit near-dock moor while catching a divergent
+                        // frame -> unmoor + stow rather than draw a kilometre-long dockline.
+                        var stretchRb = rope.GetBoatRigidbody();
+                        if (stretchRb != null && Vector3.Distance(rope.transform.position, stretchRb.transform.position) > 50f)
+                        {
+                            rope.Unmoor();
+                            BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
+                            VerboseLogger.ControlApply($"Rope {packet.RopeIndex}: post-moor span implausible; stowed instead of a stretched dockline");
+                        }
                     }
                     else
                     {

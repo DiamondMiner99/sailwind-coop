@@ -26,7 +26,9 @@ namespace SailwindCoop
         // MUST stay System.Version-parseable (major.minor[.build]): BepInEx 5 does NOT strip semver
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
-        public const string PluginVersion = "0.2.24";
+        // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
+        // load. This is the in-progress v0.2.25 dev build; shows as 0.2.25 in the debug menu (distinct from 0.2.24).
+        public const string PluginVersion = "0.2.25";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -44,6 +46,34 @@ namespace SailwindCoop
         // deltaTime, amplifying idle stick drift ~20-60x into a constant let-out on any grabbed winch.
         // Read by ControlPatches.ControllerDeadzonePatch; 0 disables.
         public static ConfigEntry<float> ControllerDeadzoneConfig { get; private set; }
+        // (v0.2.25) Item buoyancy restore (v0.38 vanilla REGRESSION mitigation, LOCAL-ONLY physics):
+        // older game builds floated free items (ToggleCollider did `floater.enabled = state`); v0.38
+        // regressed that to a hard-coded disable every fixed frame, so dropped items/crates sink even
+        // in singleplayer despite their authored floaterHeight. Read by ItemBuoyancyPatches; default
+        // TRUE = restore the pre-0.38 floating players expect (set false for current-build sinking).
+        public static ConfigEntry<bool> RestoreItemBuoyancyConfig { get; private set; }
+
+        // Crouch pose tuning (v0.2.25), read live every frame by RemotePlayerManager + LocalPlayerBody so
+        // they can be tuned in-game with Configuration Manager. The crouch is a SQUAT: the hips/body drop and
+        // per-leg 2-bone IK re-plants the feet at their standing spot (feet stay on the deck at any depth), so
+        // the knobs are IK-appropriate (drop depth, torso lean, arm bend, stride cut, knee-forward flip)
+        // rather than raw joint angles. All applied * the 0..1 crouch amount.
+        public static ConfigEntry<float> CrouchDropMetersConfig { get; private set; }
+        public static ConfigEntry<float> CrouchTorsoLeanDegConfig { get; private set; }
+        public static ConfigEntry<float> CrouchArmBendDegConfig { get; private set; }
+        public static ConfigEntry<float> CrouchStrideCutConfig { get; private set; }
+        public static ConfigEntry<float> CrouchKneeForwardConfig { get; private set; }
+
+        // LOOK-LEAN pose tuning (torso pitches on the hips toward where the player looks vertically, like a
+        // Phasmophobia player model). Read live every frame by RemotePlayerManager + LocalPlayerBody. Applies
+        // in ALL states (standing, walking, crouched) and COMPOSES additively with the crouch torso fold.
+        public static ConfigEntry<float> LookPitchScaleConfig { get; private set; }
+        public static ConfigEntry<float> LookPitchMaxDegConfig { get; private set; }
+
+        // Crew weight: kg each REMOTE crew member adds to the boat they stand on (vanilla models every
+        // person, host included, at 160). HOST-ONLY physics (BoatMass.UpdateMass patch early-returns on
+        // clients), so only the host's value is ever used - nothing to sync; tunable live by the host.
+        public static ConfigEntry<float> CrewMemberWeightConfig { get; private set; }
 
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
@@ -167,6 +197,54 @@ namespace SailwindCoop
                 new ConfigDescription(
                     "Suppress gamepad stick input below this magnitude before it feeds winches and the steering wheel (vanilla has no deadzone, so idle stick drift slowly lets sails out / creeps the wheel). 0 disables.",
                     new AcceptableValueRange<float>(0f, 0.9f)));
+
+            // (v0.2.25) Item buoyancy restore: items floating IS vanilla behavior - older builds did
+            // `floater.enabled = state` in ItemRigidbody.ToggleCollider, but the current v0.38 build
+            // regressed it to a hard-coded disable that runs every fixed frame (verified in the live IL;
+            // looks like shipped debug leftovers), so dropped items sink even in singleplayer. ON by
+            // default because it restores the floating players expect; the postfix re-enables the
+            // floater for loose items only (not held, not resting on a boat, not stowed, not already
+            // deep underwater). Purely local: no wire change, each machine floats or sinks its own items.
+            RestoreItemBuoyancyConfig = Config.Bind(
+                "Coop",
+                "RestoreItemBuoyancy",
+                true,
+                "Re-enable floating for dropped items. Older Sailwind builds floated free items; the current v0.38 build regressed this to a hard-coded floater disable every physics frame, so dropped items/crates sink even in singleplayer. Default on = restore the pre-0.38 floating everyone expects. Applies to THIS machine only; other crew members see their own local physics either way. Set false for exact current-build (sinking) behavior.");
+            Log.LogInfo($"RestoreItemBuoyancy: {RestoreItemBuoyancyConfig.Value}");
+
+            // Crouch pose tuning - live-editable (Configuration Manager). The crouch is a SQUAT: the body
+            // drops and 2-bone leg IK re-plants the feet at their standing spot. All applied * the 0..1 crouch
+            // amount. Shared by remote avatars and your own third-person (orbit-cam) body.
+            CrouchDropMetersConfig = Config.Bind("Crouch", "CrouchDropMeters", 0.6f,
+                new ConfigDescription("Squat depth: how far the hips/body drop at full crouch. The leg IK keeps the feet planted on the deck at any depth, so the head comes down toward the camera without the feet clipping through.",
+                    new AcceptableValueRange<float>(0f, 1.2f)));
+            CrouchTorsoLeanDegConfig = Config.Bind("Crouch", "CrouchTorsoLeanDeg", 28f,
+                new ConfigDescription("Forward torso fold at full crouch (about the body's world right axis) - brings the chest/head down and forward toward the camera. Negative leans back.",
+                    new AcceptableValueRange<float>(-80f, 80f)));
+            CrouchArmBendDegConfig = Config.Bind("Crouch", "CrouchArmBendDeg", 45f,
+                new ConfigDescription("Elbow flex for a ready/tactical arm pose at full crouch (composed on top of the walk arm swing; the upper arms also raise slightly). Negative flexes the other way.",
+                    new AcceptableValueRange<float>(-120f, 120f)));
+            CrouchStrideCutConfig = Config.Bind("Crouch", "CrouchStrideCut", 0.5f,
+                new ConfigDescription("Fraction the walk stride shrinks while crouched (crouch-walk).",
+                    new AcceptableValueRange<float>(0f, 0.95f)));
+            CrouchKneeForwardConfig = Config.Bind("Crouch", "CrouchKneeForward", 1f,
+                new ConfigDescription("Knee-forward pole sign for the leg IK. +1 bends the knees FORWARD (a squat). If the knees bend the wrong way (backward), set this to -1 to flip the pole live.",
+                    new AcceptableValueRange<float>(-1f, 1f)));
+
+            // LOOK-LEAN tuning - live-editable (Configuration Manager). The avatar's upper body (Spine_01 ->
+            // chest/head/arms) pitches on the hips toward where the player looks vertically, in every state
+            // (standing/walking/crouched), composed on top of the crouch fold. Shared by remote avatars and
+            // your own third-person (orbit-cam) body.
+            LookPitchScaleConfig = Config.Bind("Crouch", "LookPitchScale", 0.9f,
+                new ConfigDescription("Torso look-lean: fraction of your vertical look angle the upper body pitches on the hips (1.0 = follows your look 1:1). Looking DOWN folds the torso forward, looking UP leans it back. Set NEGATIVE to flip the direction if it bends the wrong way in-game.",
+                    new AcceptableValueRange<float>(-2f, 2f)));
+            LookPitchMaxDegConfig = Config.Bind("Crouch", "LookPitchMaxDeg", 55f,
+                new ConfigDescription("Clamp (degrees) on the torso look-lean so it never over-bends up or down. Must exceed the crouch fold (~28 deg) for the torso to lean BACK past vertical while crouched + looking up.",
+                    new AcceptableValueRange<float>(0f, 90f)));
+
+            CrewMemberWeightConfig = Config.Bind("Coop", "CrewMemberWeightKg", 90f,
+                new ConfigDescription("Weight (kg) each REMOTE crew member adds to the boat they stand on. Vanilla models every person (the host too) at 160, so several people crowding one side of a small hull pile up a big tipping moment and can flip it. Lower this to reduce that heel/flip. HOST-ONLY: only the host computes crew weight (clients just receive the resulting boat motion), so only the host's value matters - safe to tune live mid-session.",
+                    new AcceptableValueRange<float>(0f, 200f)));
 
             try
             {
@@ -642,7 +720,9 @@ namespace SailwindCoop
                     // baseline reset only applies to a freshly-created phantom on the title-join path.
                     if (SaveSlots.currentSlot != CoopSave.PhantomSlot)
                     {
-                        if (CoopSave.EnterCoopSaveContext(out _))
+                        // (v0.2.25) hostId keys the phantom file per host; on the mid-game path the
+                        // lobby is already entered, so the authoritative lobby owner is available.
+                        if (CoopSave.EnterCoopSaveContext(LobbyManager.HostSteamId.Value, out _))
                         {
                             VerboseLogger.LobbyEvent("Phantom save: mid-game guest join redirected currentSlot to 99");
                         }
@@ -678,6 +758,14 @@ namespace SailwindCoop
                     // SELF-HEAL: if this guest's phantom-save load had to skip corrupt saveables,
                     // schedule ONE clean rewrite well after the join settles (contract: call once, ~60s).
                     StartCoroutine(GuestSelfHealSaveAfterJoin());
+
+                    // (v0.2.25) JOIN-STATE WATCHDOG: if the host never admits us (admission gate refused,
+                    // or the join snapshot was lost), the P2P transport can still connect and every sync
+                    // manager runs - in the v0.2.23/24 playtests a refused guest silently played an ENTIRE
+                    // session half-initialized (no world state, stale phantom-save needs). Watch for the
+                    // BoatWorldState snapshot and warn-and-quit if it never arrives. Guest-only by
+                    // construction (this whole branch is _joinedAsGuest).
+                    StartCoroutine(GuestJoinWatchdog());
                 }
             };
 
@@ -757,10 +845,27 @@ namespace SailwindCoop
                     ItemSyncManager.Instance?.UpdateRemoteHeldItemPosition(heldItemId, heldItemPos, heldItemRot, isOnBoat, boatName, author);
                 }
 
+                // CROUCH (v0.2.25 wire change): trailing byte = quantized 0..1 crouch amount, appended
+                // AFTER the held-item block. Probe remaining length so a packet from a pre-v0.2.25
+                // sender (no crouch field) still parses as standing instead of throwing EndOfStream.
+                byte crouchByte = 0;
+                if (reader.BaseStream.Position < reader.BaseStream.Length)
+                    crouchByte = reader.ReadByte();
+                float crouch01 = crouchByte / 255f;
+
+                // LOOK-LEAN (wire change): trailing signed byte AFTER the crouch byte = the sender's clamped
+                // vertical look pitch. Same stream-length probe as crouch so a pre-look sender's shorter packet
+                // still parses; the neutral default 128 decodes to 0 deg (looking straight ahead = no lean).
+                // Decode: [0,255] -> [-90,90] deg.
+                byte lookByte = 128;
+                if (reader.BaseStream.Position < reader.BaseStream.Length)
+                    lookByte = reader.ReadByte();
+                float lookPitchDeg = (lookByte - 128) / 127f * 90f;
+
                 // Pass boat-relative position with boat name for correct reference frame
                 // Note: PlayerRecv logging is done in RemoteAvatar.UpdatePosition
                 // N-player: identify the avatar by the body AUTHOR, not the transport sender.
-                RemotePlayerManager.UpdateRemotePosition(author, relativePos, rotation, isOnBoat, boatName);
+                RemotePlayerManager.UpdateRemotePosition(author, relativePos, rotation, isOnBoat, boatName, crouch01, lookPitchDeg);
 
                 // HOST RELAY (STAR topology): after applying locally, the host forwards this position to all
                 // OTHER guests, re-writing the SAME payload (INCLUDING the author field) so they see who it
@@ -792,6 +897,14 @@ namespace SailwindCoop
                             writer.Write(heldItemRot.z);
                             writer.Write(heldItemRot.w);
                         }
+                        // CROUCH (v0.2.25): forward the crouch byte so guests BEHIND the host (star
+                        // topology) also get it. Without this the host would strip crouch on relay and
+                        // only host<->sender would animate. Trailing-append matches the sender layout.
+                        writer.Write(crouchByte);
+                        // LOOK-LEAN: forward the look byte too so guests behind the host also get the torso
+                        // pitch (same star-relay reason as crouch). Trailing-append after the crouch byte
+                        // matches the sender layout; a pre-look sender relays as neutral 128 (0 deg).
+                        writer.Write(lookByte);
                     }, reliable: false);
                 }
             });
@@ -1317,6 +1430,15 @@ namespace SailwindCoop
                 TradeFeed.OnRemoteTradeFeedEvent(packet);
             });
 
+            // (v0.2.25) Host -> one guest: destroy your local ghost copy of an instanceId the host has
+            // repeatedly denied as UNKNOWN (reason=1). Targeted - no relay; guest-side guards ensure only
+            // a genuinely loose, untracked local item is destroyed.
+            NetworkManager.RegisterHandler(PacketType.GhostItemPurge, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadGhostItemPurge(reader);
+                ItemSyncManager?.OnRemoteGhostItemPurge(packet);
+            });
+
             // Guest -> host: guest's join coroutine finished; reply with a targeted mission-cargo
             // resync so a partially-applied join snapshot cannot hide mission crates from the joiner.
             // A snapshot lost outright never runs the join coroutine, so this request never arrives
@@ -1328,6 +1450,9 @@ namespace SailwindCoop
                 // The join snapshot always applies items un-nailed (no nail flag on the 0.2.22 wire),
                 // so replay nailed state to the joiner as targeted NailState packets.
                 ItemSyncManager?.ResyncNailedStateTo(sender);
+                // The hung-lantern joint is not persisted or in the snapshot either; replay hung state AFTER
+                // the nailed resync so the hook is on-wall before the lantern re-hangs (issue #4).
+                ItemSyncManager?.ResyncHungStateTo(sender);
             });
 
             // Ping loop (F8 overlay diagnostics). Both legs are UNRELIABLE on purpose: the number
@@ -1765,6 +1890,47 @@ namespace SailwindCoop
 
             yield return new UnityEngine.WaitForSecondsRealtime(6f);
             Application.Quit();
+        }
+
+        // (v0.2.25) How long a guest waits for the host's BoatWorldState join snapshot before concluding
+        // the host never admitted it. Deliberately GENEROUS: the host legitimately defers the join send up
+        // to 30s while asleep/time-warping (SendJoinStateWhenReady), plus transfer time for a large
+        // snapshot - so 45s of realtime silence is a confident "not admitted / join failed" signal, not a
+        // slow host. A const (not config): there is no guest-side join config knob to sit next to, and a
+        // player-tunable value here only creates support noise.
+        private const float GuestJoinSnapshotTimeoutSeconds = 45f;
+
+        /// <summary>
+        /// (v0.2.25) Guest-side join-state watchdog. The lobby-level admission gate on the HOST only
+        /// withholds OnPlayerJoined - it cannot reach across and stop THIS guest's sync managers, and the
+        /// raw P2P session still connects. Before this watchdog, a refused (or snapshot-lost) guest just
+        /// silently played on, half-initialized, keeping stale phantom-save survival needs and receiving
+        /// no world state (proven in the v0.2.23/24 playtest logs; a comment in HandleLobbyMemberJoined
+        /// even claimed this watchdog existed when it did not). Polls the authoritative snapshot-arrival
+        /// flag (BoatSyncManager.HasReceivedWorldState, set the moment BoatWorldState is received) and, if
+        /// it never arrives, warns the player and runs the standard guest leave path
+        /// (EndGuestSessionAndQuit -> LeaveLobby + warn + quit). Never fires for the host (started only in
+        /// the _joinedAsGuest branch of OnLobbyJoined) and never fires when the snapshot arrived.
+        /// </summary>
+        private static System.Collections.IEnumerator GuestJoinWatchdog()
+        {
+            float t0 = Time.unscaledTime;
+            while (Time.unscaledTime - t0 < GuestJoinSnapshotTimeoutSeconds)
+            {
+                // Snapshot arrived: the host admitted us and the normal join machinery owns everything
+                // from here. Stand down permanently (mid-session recoveries re-use BoatWorldState but the
+                // flag stays true, so the watchdog can never mis-fire later).
+                if (BoatSyncManager.HasReceivedWorldState) yield break;
+                // Session already ending for another reason (host left, we left, connection dropped):
+                // that path owns the messaging; don't stack a second warn/quit on top.
+                if (!_joinedAsGuest || _endingGuestSession) yield break;
+                yield return new UnityEngine.WaitForSecondsRealtime(1f); // realtime: survives timeScale changes
+            }
+
+            if (BoatSyncManager.HasReceivedWorldState || !_joinedAsGuest || _endingGuestSession) yield break;
+
+            Log.LogError($"[Coop] Join-state watchdog: no BoatWorldState snapshot from the host within {GuestJoinSnapshotTimeoutSeconds:F0}s - the host did not admit this client (or the join snapshot was lost). Leaving the session.");
+            EndGuestSessionAndQuit("The host did not admit you to the crew (or your join failed) - no world state ever arrived.\nAsk the host to add you as a Steam friend or enable Coop.AllowCrewInvites, then try again.");
         }
 
         private void OnDestroy()

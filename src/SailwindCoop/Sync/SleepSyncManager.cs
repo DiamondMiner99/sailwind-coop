@@ -34,6 +34,19 @@ namespace SailwindCoop.Sync
             Instance != null && Instance.CurrentState == SleepState.Sleeping;
 
         /// <summary>
+        /// (v0.2.25) Multiplier applied to the HOST's high-frequency send-interval gates (boat
+        /// transform, control, time, damage) while a co-op sleep is active. Those gates compare
+        /// Time.time, which runs 16x during the sleep warp - so a "1Hz" channel really sends at ~16Hz
+        /// of REAL time, and together they saturated a guest's 200-packet/frame budget, delaying
+        /// BoatTransform ~3.5s and firing 175-200m SLEEP_SNAPs into storm seas (the crash chain).
+        /// Halving the send rate during sleep is safe: guests are passive (controls locked, host
+        /// authoritative) and only need enough stream to track the warp. Send FREQUENCY only - no
+        /// wire/packet change. 1 everywhere except the sleeping host.
+        /// </summary>
+        public static float HostSleepSendIntervalScale =>
+            Plugin.IsHost && IsCoopSleepWarpActive ? 2f : 1f;
+
+        /// <summary>
         /// True when the CURRENT co-op sleep is a TAVERN sleep. Exposed read-only so SleepPatches can
         /// gate the keypress-wake blocks (vanilla tavern sleep is non-interruptible). Reliable on BOTH host and
         /// guest: the host sets it in OnLocalEnterBed, the guest in OnSleepApprovedReceived - unlike
