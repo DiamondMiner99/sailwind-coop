@@ -120,6 +120,9 @@ namespace SailwindCoop.Sync
                 // Host sweeps idle off-boat helm leases and sends a reliable terminal HelmState so
                 // passengers converge to the final wheel angle even if the last unreliable relay was dropped.
                 if (Plugin.IsHost) SweepStaleHelmLeases();
+                // Guest keeps its frozen anchor body inside the joint limit so the local
+                // ConfigurableJoint can never fight the host's authoritative position stream.
+                if (!Plugin.IsHost) RelaxGuestAnchorTether();
             }
 
             Plugin.Profiler?.EndMeasureControlSync();
@@ -1131,6 +1134,49 @@ namespace SailwindCoop.Sync
                 PacketSerializer.WriteAnchorEvent(w, packet));
         }
 
+        /// <summary>
+        /// Kedging-winch lunge (Robin report, v0.2.25): the anchor's dropped WORLD position is never on
+        /// the wire (AnchorEventPacket = IsSet + RopeLength only), so a guest's anchor freezes kinematic
+        /// at whatever pose its LOCAL sim happened to have - metres to tens of metres from the host's true
+        /// drop point, and drifting further as the host boat kedges while the guest boat is streamed after
+        /// it. The moment anyone winches in, the guest's own RopeControllerAnchor shrinks the LOCAL
+        /// ConfigurableJoint limit below the boat<->stale-anchor distance and the hard constraint yanks the
+        /// streamed hull toward the wrong point - the violent lunge (guest screen only). v0.2.26's
+        /// SnapStrandedAnchor is gated to impossible >maxLen+50m geometry, so a normal kedge divergence
+        /// never trips it. Guests never author boat physics, so their anchor joint has no authority:
+        /// each control tick, if the set (kinematic) anchor sits outside the current joint limit (+2m
+        /// slack), drag the frozen body back along the same bearing to just inside the limit. The joint
+        /// then never builds a corrective impulse; the visible boat motion stays whatever the host streams.
+        /// Direction is preserved so the rendered anchor rope still points at the kedge, and a body pinned
+        /// AT the hawse falls back to straight down.
+        /// </summary>
+        private void RelaxGuestAnchorTether()
+        {
+            var boat = BoatUtility.GetCurrentBoat();
+            if (boat == null) return;
+
+            var anchor = BoatUtility.GetAnchor(boat);
+            if (anchor == null || !anchor.IsSet()) return; // only a frozen (kinematic) anchor can be stale
+
+            var joint = anchor.GetComponent<ConfigurableJoint>();
+            var rb = anchor.GetComponent<Rigidbody>();
+            if (joint == null || rb == null) return;
+
+            var hawse = boat.GetComponent<BoatMooringRopes>()?.GetAnchorController()?.transform.position
+                        ?? boat.transform.position;
+            float limit = joint.linearLimit.limit;
+            var delta = anchor.transform.position - hawse;
+            float span = delta.magnitude;
+            if (span <= limit + 2f) return; // inside the constraint - nothing to relax
+
+            var dir = span > 0.05f ? delta / span : Vector3.down;
+            var relaxed = hawse + dir * Mathf.Max(limit - 1f, 0.5f);
+            anchor.transform.position = relaxed;
+            rb.position = relaxed; // transform writes alone don't reliably move the physics pose
+            VerboseLogger.ControlApply($"Anchor tether relaxed: span {span:F1}m > limit {limit:F1}m on '{boat.gameObject.name}'; " +
+                                       $"frozen anchor body pulled to {Mathf.Max(limit - 1f, 0.5f):F1}m to keep the local joint slack");
+        }
+
         public void OnRemoteAnchorChanged(AnchorEventPacket packet, SteamId sender = default)
         {
             VerboseLogger.ControlRecv($"AnchorEvent, boat={packet.BoatName}, set={packet.IsSet}, ropeLen={packet.RopeLength:F2}");
@@ -1221,13 +1267,52 @@ namespace SailwindCoop.Sync
                 PacketSerializer.WriteMooringState(w, packet));
         }
 
-        public void OnRemoteMooringChanged(MooringStatePacket packet, SteamId sender = default)
+        // Dock-resolve retry ledger (Robin report, v0.2.25 "moor rope snapped back then vanished for the
+        // host only"): FindClosestDockMooring reconstructs the dock from realPos + THIS client's floating-
+        // origin offset; over a multi-hour session the peers' reconstructions drift, and island streaming
+        // can leave dock objects momentarily inactive - both make the 5m match miss TRANSIENTLY or by a few
+        // metres while the moor is perfectly real on the sender. Stowing on the first miss deleted the rope
+        // here while the sender kept it. Retry the same packet a few times before giving up.
+        private readonly Dictionary<string, int> _moorRetryCounts = new Dictionary<string, int>();
+        private const int MoorResolveMaxAttempts = 4;      // 1 immediate + 3 retries over ~3s
+        private const float MoorResolveRetryDelay = 1.0f;
+        // Generation stamp per boat|rope: every NON-retry mooring packet bumps it, so a pending retry of
+        // an older packet aborts instead of re-applying a moor the sender has since unmoored/re-moored.
+        private readonly Dictionary<string, int> _moorPacketGen = new Dictionary<string, int>();
+
+        private System.Collections.IEnumerator RetryMoorAfterDelay(MooringStatePacket packet, SteamId sender, string retryKey, int expectedGen)
         {
-            VerboseLogger.ControlRecv($"MooringState, boat={packet.BoatName}, rope={packet.RopeIndex}, moored={packet.IsMoored}");
+            yield return new WaitForSeconds(MoorResolveRetryDelay);
+            if (!_moorPacketGen.TryGetValue(retryKey, out int gen) || gen != expectedGen)
+            {
+                _moorRetryCounts.Remove(retryKey);
+                VerboseLogger.ControlApply($"Moor retry for {retryKey} superseded by a newer mooring packet; dropped");
+                yield break;
+            }
+            OnRemoteMooringChanged(packet, sender, isRetry: true);
+        }
+
+        // Consistency backstop: when this machine is the HOST and its guards had to abandon a guest's moor
+        // (stretch guard, or dock resolve still missing after retries), the abandonment used to happen under
+        // IsApplyingRemoteState, so the Unmoor postfix never broadcast it - host and originator silently
+        // diverged ("rope gone for host, still there for the client"). Send an explicit authoritative
+        // unmoor to EVERYONE (originator included) so the whole crew converges on the conservative state.
+        private void BroadcastCorrectiveUnmoor(MooringStatePacket packet, string reason)
+        {
+            if (!Plugin.IsHost) return;
+            Plugin.Log.LogWarning($"Rope {packet.RopeIndex} ({packet.BoatName}): host abandoning relayed moor ({reason}); " +
+                                  "broadcasting corrective unmoor so the crew converges");
+            OnLocalMooringChanged(packet.BoatName, packet.RopeIndex, false, Vector3.zero, 0f);
+        }
+
+        public void OnRemoteMooringChanged(MooringStatePacket packet, SteamId sender = default, bool isRetry = false)
+        {
+            VerboseLogger.ControlRecv($"MooringState, boat={packet.BoatName}, rope={packet.RopeIndex}, moored={packet.IsMoored}, retry={isRetry}");
 
             // STAR host-relay: a guest's mooring change is a request; the host applies + relays the
             // authoritative result to the other guests. At N=1 SendToAllExcept(sender) is a no-op.
-            if (Plugin.IsHost)
+            // A local retry re-enters this method for the APPLY only - never re-relay it.
+            if (Plugin.IsHost && !isRetry)
             {
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.MooringState,
                     w => PacketSerializer.WriteMooringState(w, packet));
@@ -1245,6 +1330,15 @@ namespace SailwindCoop.Sync
             if (packet.RopeIndex < 0 || packet.RopeIndex >= mooringRopes.ropes.Length) return;
 
             var rope = mooringRopes.ropes[packet.RopeIndex];
+
+            string retryKey = packet.BoatName + "|" + packet.RopeIndex;
+            if (!isRetry)
+            {
+                // A fresh authoritative packet supersedes any pending dock-miss retry of an older one.
+                _moorPacketGen.TryGetValue(retryKey, out int g);
+                _moorPacketGen[retryKey] = g + 1;
+                _moorRetryCounts.Remove(retryKey);
+            }
 
             // Mark rope as network-changed to prevent feedback from local patches
             MarkRopeAsNetworkChanged(rope);
@@ -1279,6 +1373,7 @@ namespace SailwindCoop.Sync
                     var dock = FindClosestDockMooring(packet.DockPosition, out float nearestMissDist);
                     if (dock != null)
                     {
+                        _moorRetryCounts.Remove(retryKey);
                         // Release any prior dock SpringJoint before re-mooring. Vanilla MoorTo
                         // never clears an existing spring (only Unmoor does), so a re-moor that resolves a
                         // DIFFERENT dock instance than the one currently held would leave a leaked second spring
@@ -1313,16 +1408,38 @@ namespace SailwindCoop.Sync
                             rope.Unmoor();
                             BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
                             VerboseLogger.ControlApply($"Rope {packet.RopeIndex}: post-moor span implausible; stowed instead of a stretched dockline");
+                            // Host + originator must not diverge: tell the crew the moor was abandoned.
+                            BroadcastCorrectiveUnmoor(packet, "post-moor span implausible");
                         }
                     }
                     else
                     {
-                        // Dock resolve MISS. Do NOT leave the rope diverged (sender: moored, us: half-applied) -
-                        // that is the "rope stretched kilometers to a horizon-sunk island" class. Stow it
-                        // deterministically; guarded so an already-stowed rope is untouched.
-                        Plugin.Log.LogWarning($"Mooring FAILED: no dock near {packet.DockPosition} (5m XZ radius, " +
+                        _moorRetryCounts.TryGetValue(retryKey, out int attempts);
+                        attempts++;
+                        if (attempts < MoorResolveMaxAttempts)
+                        {
+                            // Dock resolve MISS - often transient (island streaming, floating-origin offset
+                            // drift). Leave the rope untouched and retry the same packet shortly instead of
+                            // stowing on the first miss (which deleted a real moor on this side only - the
+                            // "rope vanished for the host but not the client" report).
+                            _moorRetryCounts[retryKey] = attempts;
+                            Plugin.Log.LogWarning($"Mooring resolve miss for rope {packet.RopeIndex} ({packet.BoatName}): no dock near " +
+                                                  $"{packet.DockPosition} (5m XZ radius, nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); " +
+                                                  $"retry {attempts}/{MoorResolveMaxAttempts - 1} in {MoorResolveRetryDelay:F0}s");
+                            StartCoroutine(RetryMoorAfterDelay(packet, sender, retryKey,
+                                _moorPacketGen.TryGetValue(retryKey, out int gen) ? gen : 0));
+                            return;
+                        }
+                        // Still unresolved after retries. Do NOT leave the rope diverged (sender: moored,
+                        // us: half-applied) - that is the "rope stretched kilometers to a horizon-sunk
+                        // island" class. Stow it deterministically; guarded so an already-stowed rope is
+                        // untouched, and (host) broadcast the abandonment so the originator agrees.
+                        _moorRetryCounts.Remove(retryKey);
+                        Plugin.Log.LogWarning($"Mooring FAILED after {MoorResolveMaxAttempts} attempts: no dock near {packet.DockPosition} (5m XZ radius, " +
                                               $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); stowing rope {packet.RopeIndex} instead of leaving it diverged");
                         BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
+                        if (!rope.IsMoored())
+                            BroadcastCorrectiveUnmoor(packet, "dock unresolved after retries");
                     }
                 }
                 else

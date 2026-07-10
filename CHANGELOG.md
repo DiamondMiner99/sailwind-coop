@@ -14,6 +14,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.27 - 2026-07-10
+
+> **Hotfix.** No network change - fully compatible with v0.2.25/v0.2.26 crews, but each fix
+> runs on the machine that sees the bug, so the whole crew should update. Fixes the
+> 2026-07-10 playtest report batch (thanks Robin!).
+
+### Fixed
+- **Violent lunge when a crewmate winches in an anchor someone else dropped** (e.g. host
+  kedging, client hauling in). The anchor's dropped position is never sent over the network,
+  so the non-host copy of the anchor freezes at a slightly wrong spot and drifts further off
+  as the boat moves; the moment the rope was winched in, the local anchor joint yanked the
+  boat toward that stale point. Guests now continuously keep their (non-authoritative) anchor
+  tether slack so it can never fight the host's boat position - the boat's real motion always
+  comes from the host.
+- **Moor rope snapping back and vanishing for one player but not the other.** When a
+  crewmate moored and the receiving machine could not match the dock (a transient miss during
+  island streaming, or coordinate drift over a multi-hour session), the rope was stowed
+  immediately and silently on that machine only. Dock matching now retries for a few seconds
+  before giving up, and if the host does give up on a moor it tells the whole crew, so both
+  players always agree on whether the rope is attached.
+- **Sails looking furled to crewmates after changing sails at the shipyard** while the boat
+  visibly sailed on ("phantom sailing"). The machine that changed the sails kept watching the
+  OLD (destroyed) sail ropes internally, so unfurling and trimming the new sails was never
+  broadcast until a full rejoin. The rope list now refreshes on every shipyard change, and
+  the host re-sends all rope positions when leaving the shipyard.
+
 ## v0.2.26 - 2026-07-10
 
 > **Hotfix.** No network change - fully compatible with v0.2.25 crews, but the fix runs on

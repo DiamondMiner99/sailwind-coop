@@ -75,6 +75,14 @@ namespace SailwindCoop.Sync
             _lastMastsEnabled = null;
             _lastSails = null;
             _lastPartOptions = null;
+
+            // Belt-and-braces for the phantom-furled-sails fix: a change landing in the same frame as the
+            // exit would be cached-then-missed, so re-invalidate on the way out, and (host only) re-seed
+            // every current rope length so crew whose sails were rebuilt to defaults by LoadData converge
+            // immediately instead of waiting for the next host winch movement.
+            var boat = BoatUtility.GetCurrentBoat();
+            if (boat != null) BoatUtility.InvalidateRopeCache(boat);
+            if (Plugin.IsHost) ControlSyncManager.Instance?.ResendRopeForCurrentBoat();
         }
 
         private void PollForChanges()
@@ -103,6 +111,14 @@ namespace SailwindCoop.Sync
 
             // Update cache
             CacheState(data);
+
+            // Phantom-furled sails (Robin report, v0.2.25): a LOCAL shipyard sail change destroys the old
+            // sail GameObjects (and their RopeControllers) and instantiates new ones, but only the RECEIVER
+            // path (ApplyCustomization) invalidated the rope cache. The changer's own machine kept polling
+            // the stale cached RopeController[] (destroyed entries read null and are skipped; the NEW reef/
+            // sheet ropes are absent), so its unfurl/trim changes were never broadcast and the crew saw the
+            // sails furled forever while the boat visibly sailed. Invalidate on every detected local change.
+            BoatUtility.InvalidateRopeCache(boat);
         }
 
         private bool HasCustomizationChanged(SaveBoatCustomizationData data)
