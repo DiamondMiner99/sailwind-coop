@@ -37,11 +37,29 @@ namespace SailwindCoop.Patches
         public static class BoatDamageImpactPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix()
+            public static bool Prefix(BoatDamage __instance)
             {
                 if (Plugin.IsMultiplayer && !Plugin.IsHost)
                 {
                     return false; // Skip on guest
+                }
+
+                // (v0.2.28 Fix C) Shipyard discharge suppression: vanilla DischargeShip instant-teleports
+                // the boat to shipReleasePosition and re-enables physics - the water/dock depenetration
+                // registers a >1.5 m/s impact and the boat "damages itself" leaving the cradle (and on
+                // remote peers the forced convergence snap can do the same). Skip Impact for a short
+                // window after any shipyard release of THIS boat. Runs in multiplayer only; vanilla solo
+                // behavior is untouched.
+                // Cheap early-out: HasActiveSuppression is a Count check, so the common Impact path
+                // (no discharge window live anywhere) never pays the GetComponent lookup.
+                if (Plugin.IsMultiplayer && ShipyardSyncManager.HasActiveSuppression)
+                {
+                    var boatName = __instance.GetComponent<SaveableObject>()?.gameObject.name;
+                    if (ShipyardSyncManager.IsImpactSuppressed(boatName))
+                    {
+                        VerboseLogger.DamageEvent($"Impact suppressed for '{boatName}' (recent shipyard discharge)");
+                        return false;
+                    }
                 }
                 return true;
             }

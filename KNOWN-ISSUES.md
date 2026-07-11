@@ -40,14 +40,21 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
   independent; the wallet and world economy are shared and **host-authoritative** (a
   guest's purchase is validated against the host's wallet and rejected with a
   notification if the crew can't afford it).
-- 🟡 **One shared boat.** The crew sails one vessel together; multiple crewed boats in a
-  single session are not supported yet.
+- 🟡 **One shared boat (mostly).** The crew sails one vessel together. Since v0.2.28 a
+  second boat with a crew member aboard does stay position-synced (so moving the old ship
+  after buying a new one works), but full multi-boat support (each boat's physics driven by
+  the player sailing it) is not implemented yet - a second boat can still feel sluggish or
+  imprecise for the player driving it.
+- 🟡 **The shipyard cradle lift is only visible to the player using the shipyard.** For
+  everyone else the ship stays in the water during the edit and snaps cleanly to the
+  released position when the shipyard closes. Deliberate (v0.2.28): syncing the lift itself
+  caused far worse bugs than it fixed.
 
 ## Compatibility
 
-- 🟡 **Everyone must run the same mod build AND the same Sailwind version.** The network
-  format is not yet versioned, so a mismatch can desync silently. (A version handshake is a
-  planned pre-release item.)
+- 🟡 **Everyone must run the same mod build AND the same Sailwind version.** Since v0.2.28
+  the host refuses joins from a mismatched mod version with a clear message on both screens
+  (older builds still fail silently against each other).
 - 🟡 **Targets Sailwind v0.38.** Game updates can break the Harmony hooks; a new game patch
   may need a mod update.
 - 🟡 **Heavy Harmony patching**: may conflict with other mods that patch the same systems.

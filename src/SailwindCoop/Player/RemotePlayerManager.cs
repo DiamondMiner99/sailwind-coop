@@ -91,6 +91,15 @@ namespace SailwindCoop.Player
         /// </summary>
         public Transform CurrentBoat => _currentBoat;
 
+        /// <summary>
+        /// Root boat NAME the sender last reported ("" = on land / none). This is the sender's
+        /// GameState.lastBoat.name (root SaveableObject name), i.e. the SAME key BoatTransformPacket and
+        /// BoatUtility.FindBoatByName use - unlike CurrentBoat, which may resolve to the boatModel child.
+        /// Used by the host's multi-boat transform streaming (BoatSyncManager) to find every boat that
+        /// currently carries a remote crew member.
+        /// </summary>
+        public string CurrentBoatName => _lastBoatName;
+
         /// <summary>The SteamId this avatar represents.</summary>
         public SteamId PlayerId => _remotePlayerId;
 

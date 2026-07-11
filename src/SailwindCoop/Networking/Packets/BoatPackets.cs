@@ -187,6 +187,10 @@ namespace SailwindCoop.Networking.Packets
         public Vector3 Velocity;
         public Vector3 AngularVelocity;
         public bool IsAnchored;
+        // v0.2.28 multi-boat streaming: true when this is the host's lastBoat (the primary crewed boat),
+        // false for the additional "active" boats (any boat carrying a remote crew member). Guests key
+        // their single-boat legacy state (SnapBoatToLiveTarget etc.) off the primary only.
+        public bool IsPrimary;
     }
 
     /// <summary>

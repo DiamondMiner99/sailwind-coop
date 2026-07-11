@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using Steamworks;
 using SailwindCoop.Debug;
@@ -7,7 +8,8 @@ namespace SailwindCoop.Sync
 {
     /// <summary>
     /// Manages continuous boat synchronization between host and guest.
-    /// Host sends boat transform at 10Hz, guest interpolates received state.
+    /// Host sends boat transforms at 40Hz (primary boat) / 10Hz (secondary crewed boats),
+    /// guest runs a per-boat physics correction toward the received state.
     /// </summary>
     public class BoatSyncManager : MonoBehaviour
     {
@@ -16,27 +18,72 @@ namespace SailwindCoop.Sync
         private const float SyncInterval = 0.025f; // 40 Hz
         private float _lastSyncTime;
 
-        // Interpolation state (guest only)
-        // Store REAL (offset-independent) position and calculate local on-demand; this prevents
-        // stale positions when the FloatingOriginManager offset changes during shifting.
-        private string _targetBoatName;  // which boat to apply the transform to
-        private Vector3 _targetRealPosition;
-        private Quaternion _targetRotation;
-        private Vector3 _targetVelocity;
-        private Vector3 _targetAngularVelocity;
-        private float _lastPacketTime;
-        private bool _hasReceivedState;
-        // Staleness snap: set when a >2s receive stall is detected in OnBoatTransformReceived.
-        // The next ApplyBoatTransform teleport-snaps instead of velocity-chasing a many-seconds-old gap
-        // at huge correction speeds. Unscaled clock so 16x sleep timewarp can't inflate the inter-packet
-        // gap and cause false snaps.
-        private bool _snapOnNextApply;
-        private float _lastPacketUnscaledTime;
+        // (v0.2.28 multi-boat) Secondary boats (crewed boats that are NOT the host's lastBoat) are
+        // throttled to every 4th send tick (~10Hz) to keep the added bandwidth negligible.
+        private const int SecondaryBoatSendDivider = 4;
+        private int _sendTick;
 
-        // Cached references to avoid GetComponent in hot paths
+        // (v0.2.28 multi-boat) Guest-side entries for boats we have not heard about in this long are
+        // pruned (host stopped streaming them - e.g. the last remote player left that boat).
+        private const float BoatStatePruneSeconds = 10f;
+
+        /// <summary>
+        /// Per-boat interpolation/correction state (guest only). (v0.2.28) Previously a single set of
+        /// fields keyed by one _targetBoatName - so when the host streamed a SECOND boat (multi-boat
+        /// streaming, "old ship rotates in place" fix) each packet clobbered the other boat's target and
+        /// the correction chased a moving key. One entry per boat name lets multiple boats be corrected
+        /// concurrently with fully independent teleport/staleness/integrator state.
+        ///
+        /// Positions are stored REAL (offset-independent) and converted to local on-demand; this prevents
+        /// stale positions when the FloatingOriginManager offset changes during shifting.
+        /// </summary>
+        private class BoatSyncState
+        {
+            public Vector3 TargetRealPosition;
+            public Quaternion TargetRotation;
+            public Vector3 TargetVelocity;
+            public Vector3 TargetAngularVelocity;
+            public float LastPacketTime;
+            // Staleness snap: set when a >2s receive stall is detected in OnBoatTransformReceived.
+            // The next ApplyBoatTransform teleport-snaps instead of velocity-chasing a many-seconds-old
+            // gap at huge correction speeds. Unscaled clock so 16x sleep timewarp can't inflate the
+            // inter-packet gap and cause false snaps.
+            public bool SnapOnNextApply;
+            public float LastPacketUnscaledTime;
+            // False until the first real target (packet or world-state) lands. A pre-armed entry created
+            // by ForceSnapOnNextApply has no target yet - applying it would teleport the boat to a
+            // zero-initialized position.
+            public bool HasTarget;
+
+            // Cached references to avoid GetComponent in hot paths
+            public Transform CachedBoatTransform;
+            public Rigidbody CachedBoatRb;
+
+            // Previous-frame values, used to detect floating-origin shifts and position jumps
+            public Vector3 PrevBoatPosition;
+            public Vector3 PrevOffset;
+            public bool HasPrevValues;
+        }
+
+        // Guest-side per-boat states, keyed by root SaveableObject name (the BoatTransformPacket key).
+        private readonly Dictionary<string, BoatSyncState> _boatStates = new Dictionary<string, BoatSyncState>();
+        // Scratch list for pruning while iterating (avoid per-frame allocation where possible).
+        private readonly List<string> _pruneScratch = new List<string>();
+
+        // PRIMARY boat name = the host's lastBoat (packet.IsPrimary). Preserves the pre-multi-boat
+        // single-boat semantics for SnapBoatToLiveTarget and the join flow.
+        private string _targetBoatName;
+        private bool _hasReceivedState;
+
+        // Cached references for the HOST's primary send path (avoid GetComponent in hot paths)
         private Transform _cachedBoatTransform;
         private Rigidbody _cachedBoatRb;
         private SaveableObject _cachedBoatSaveable;
+
+        // (v0.2.28 Fix A) Host send path: reusable set of active boats per tick (lastBoat + every boat
+        // carrying a remote crew member). Reused to avoid per-frame allocation.
+        private readonly List<SaveableObject> _activeBoatsScratch = new List<SaveableObject>();
+        private readonly HashSet<string> _activeBoatNamesScratch = new HashSet<string>();
 
         // Physics-based correction parameters
         // Higher values = faster correction but more "snappy", lower = smoother but may lag behind
@@ -56,11 +103,6 @@ namespace SailwindCoop.Sync
         // If the boat diverges vertically by more than this, fall back to full Y correction (catches the
         // boat before it can clip badly through the deck/water; normal float jitter stays well under this).
         private const float VerticalHardCorrectThreshold = 3f; // meters
-
-        // Previous-frame values, used to detect floating-origin shifts and position jumps
-        private Vector3 _prevBoatPosition;
-        private Vector3 _prevOffset;
-        private bool _hasPrevValues;
 
         /// <summary>
         /// Set to true during join/recovery to prevent physics sync from running.
@@ -105,20 +147,25 @@ namespace SailwindCoop.Sync
 
             if (Plugin.IsHost)
             {
-                SendBoatTransform();
+                SendBoatTransforms();
             }
             else
             {
-                ApplyBoatTransform();
+                ApplyBoatTransforms();
             }
 
             Plugin.Profiler?.EndMeasureBoatSync();
         }
 
         /// <summary>
-        /// Host: Send current boat transform to all guests at 10Hz.
+        /// Host: Send current boat transforms to all guests. (v0.2.28 Fix A, "old ship rotates in place")
+        /// Previously only GameState.lastBoat was streamed - when the host boarded a newly bought boat,
+        /// the OLD boat (still crewed by guests) got zero position sync: guest helm input reached the host
+        /// via control sync, so the boat rotated in the host's sim but never translated on the guest's
+        /// screen. Now the host streams EVERY active boat: lastBoat at the full rate plus any boat that
+        /// currently carries a remote crew member at 1/4 rate (~10Hz).
         /// </summary>
-        private void SendBoatTransform()
+        private void SendBoatTransforms()
         {
             // (v0.2.25) SyncInterval is scaled up (rate halved) while the host drives a co-op sleep:
             // Time.time runs 16x under the warp, so unscaled this channel alone floods guests and
@@ -126,28 +173,94 @@ namespace SailwindCoop.Sync
             // delayed transforms ~3.5s and triggered the 175-200m SLEEP_SNAP crash chain.
             if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.HostSleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
+            _sendTick++;
 
-            // Symmetric to the guest's ApplyBoatTransform shipyard guard. While the HOST is
-            // in a shipyard, vanilla AdmitShip kinematically lifts the shared boat onto the cradle, but the host
-            // would keep streaming the cradle-lifted (or pre-lift water) transform - peers then see the boat
-            // bobbing / fighting the host's edit. Freeze the stream for all peers during the host's shipyard
-            // edit; it resumes when DischargeShip sets currentShipyard = null (the next ApplyBoatTransform on
-            // each guest sees a large error and teleport-snaps back to the host). Solo is never multiplayer.
-            if (GameState.currentShipyard != null) return;
+            // Symmetric to the guest's ApplyBoatTransforms shipyard guard. While the HOST has a boat
+            // admitted to a shipyard, vanilla AdmitShip kinematically lifts THAT boat onto the cradle;
+            // streaming its cradle-lifted transform would fight peers' view of it. (v0.2.28 multi-boat:
+            // narrowed from a blanket whole-stream freeze to the ONE admitted boat, resolved from
+            // currentShipyard.currentShip - other boats keep syncing while the host browses/edits.
+            // Null currentShip while merely browsing the shipyard menu = nothing suppressed.)
+            // NOTE: a boat a GUEST is editing in a cradle is deliberately NOT suppressed here - the host
+            // stream stays authoritative and other peers keep seeing it in the water; the cosmetic cradle
+            // lift on the editing guest's screen is not synced (see ShipyardSyncManager Fix C notes).
+            var localShipyardBoatName = GetLocalShipyardBoatName();
 
-            var boat = GameState.lastBoat;
-            if (boat == null) return;
+            var lastBoat = GameState.lastBoat;
+            var lastBoatName = lastBoat != null ? lastBoat.name : null;
 
-            // Update cache if boat changed
-            if (_cachedBoatTransform != boat)
+            // Primary boat (lastBoat): full rate, cached refs (hot path, unchanged behavior).
+            if (lastBoat != null && lastBoatName != localShipyardBoatName)
             {
-                _cachedBoatTransform = boat;
-                _cachedBoatRb = boat.GetComponent<Rigidbody>();
-                _cachedBoatSaveable = boat.GetComponent<SaveableObject>();
+                // Update cache if boat changed
+                if (_cachedBoatTransform != lastBoat)
+                {
+                    _cachedBoatTransform = lastBoat;
+                    _cachedBoatRb = lastBoat.GetComponent<Rigidbody>();
+                    _cachedBoatSaveable = lastBoat.GetComponent<SaveableObject>();
+                }
+
+                if (_cachedBoatRb != null)
+                {
+                    SendTransformFor(lastBoat, _cachedBoatRb, _cachedBoatSaveable, isPrimary: true);
+                }
             }
 
-            if (_cachedBoatRb == null) return;
+            // Secondary crewed boats: throttled to every 4th tick (~10Hz) - they are typically moored or
+            // drifting, and the guest aboard still gets full-fidelity control sync; this only carries hull
+            // translation/rotation. GetComponent at 10Hz is negligible, so no per-boat cache is kept.
+            // The avatar scan lives inside the divider branch so it only runs on ticks that actually send.
+            if ((_sendTick % SecondaryBoatSendDivider) == 0)
+            {
+                // Build the secondary set: every boat a remote crew member is on, minus the primary.
+                _activeBoatsScratch.Clear();
+                _activeBoatNamesScratch.Clear();
 
+                var rpm = Player.RemotePlayerManager.Instance;
+                if (rpm != null)
+                {
+                    foreach (var avatar in rpm.Avatars)
+                    {
+                        var crewedBoatName = avatar.CurrentBoatName;
+                        if (string.IsNullOrEmpty(crewedBoatName)) continue;           // remote player ashore
+                        if (crewedBoatName == lastBoatName) continue;                 // primary already streamed
+                        if (!_activeBoatNamesScratch.Add(crewedBoatName)) continue;   // already queued this tick
+                        var crewedBoat = BoatUtility.FindBoatByName(crewedBoatName);
+                        if (crewedBoat != null) _activeBoatsScratch.Add(crewedBoat);
+                    }
+                }
+
+                foreach (var boatSaveable in _activeBoatsScratch)
+                {
+                    if (boatSaveable.gameObject.name == localShipyardBoatName) continue; // host's admitted boat
+                    var rb = boatSaveable.GetComponent<Rigidbody>();
+                    if (rb == null) continue;
+                    SendTransformFor(boatSaveable.transform, rb, boatSaveable, isPrimary: false);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Name of the boat currently admitted to the LOCAL machine's shipyard cradle (null when not at a
+        /// shipyard, or browsing with no ship admitted). Vanilla Shipyard.GetCurrentBoat() returns the
+        /// admitted boat root; prefer the SaveableObject name, the shared sync key.
+        /// </summary>
+        private static string GetLocalShipyardBoatName()
+        {
+            var shipyard = GameState.currentShipyard;
+            if (shipyard == null) return null;
+            var ship = shipyard.GetCurrentBoat();
+            if (ship == null) return null;
+            var saveable = ship.GetComponent<SaveableObject>();
+            return saveable != null ? saveable.gameObject.name : ship.name;
+        }
+
+        /// <summary>
+        /// Host: serialize and broadcast one boat's transform. Shared by the primary (lastBoat, 40Hz)
+        /// and secondary (crewed, ~10Hz) send paths.
+        /// </summary>
+        private void SendTransformFor(Transform boat, Rigidbody rb, SaveableObject saveable, bool isPrimary)
+        {
             // Convert to real world coordinates (subtract FloatingOriginManager offset)
             var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
             var realPosition = boat.position - offset;
@@ -157,12 +270,13 @@ namespace SailwindCoop.Sync
                 BoatName = boat.name,
                 Position = realPosition,
                 Rotation = boat.rotation,
-                Velocity = _cachedBoatRb.velocity,
-                AngularVelocity = _cachedBoatRb.angularVelocity,
-                IsAnchored = BoatUtility.IsBoatAnchored(_cachedBoatSaveable)
+                Velocity = rb.velocity,
+                AngularVelocity = rb.angularVelocity,
+                IsAnchored = BoatUtility.IsBoatAnchored(saveable),
+                IsPrimary = isPrimary
             };
 
-            VerboseLogger.BoatSend($"BoatTransform, boat={boat.name}, localPos={boat.position}, offset={offset}, realPos={realPosition}, vel={_cachedBoatRb.velocity.magnitude:F2}m/s", throttle: true);
+            VerboseLogger.BoatSend($"BoatTransform, boat={boat.name}, primary={isPrimary}, localPos={boat.position}, offset={offset}, realPos={realPosition}, vel={rb.velocity.magnitude:F2}m/s", throttle: true);
 
             Plugin.NetworkManager.SendToAllUnreliable(PacketType.BoatTransform, writer =>
             {
@@ -171,72 +285,113 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// Guest: Apply velocity-based correction to guide physics toward host's authoritative state.
-        /// Physics runs naturally (buoyancy, wind forces), we just nudge velocity to match host.
+        /// Guest: Apply velocity-based correction to guide physics toward host's authoritative state,
+        /// for EVERY boat the host streams (v0.2.28 multi-boat). Physics runs naturally (buoyancy, wind
+        /// forces), we just nudge velocity to match host. Entries not refreshed for BoatStatePruneSeconds
+        /// are pruned (host stopped streaming that boat).
         /// </summary>
-        private void ApplyBoatTransform()
+        private void ApplyBoatTransforms()
         {
             if (!_hasReceivedState) return;
 
             // Skip physics sync during join/recovery - boat may have mooring springs attached
             if (IsJoinInProgress) return;
 
-            // While the LOCAL player is in a shipyard, vanilla AdmitShip has
-            // kinematically lifted GameState.currentBoat onto the cradle. The host doesn't enter the shipyard,
-            // so its boat keeps bobbing in the water and broadcasts that transform; applying it here would
-            // force this boat NON-kinematic again (the isKinematic re-enable below) and nudge it toward the
-            // host's water position - fighting the cradle lift (boat bobs in the water on the modifying
-            // client). Suppress the per-frame correction entirely while in the shipyard so the local cradle
-            // owns the boat. The lift releases (DischargeShip sets currentShipyard = null) and normal sync
-            // resumes - the next ApplyBoatTransform sees a large error and teleport-snaps back to the host.
-            // DEFERRED: a full cross-peer cradle-kinematic sync (enter/exit packet so EVERY peer freezes the
-            // boat on the cradle) is not implemented - the host and other guests still see the boat in the
-            // water during the edit. This guard stops the MODIFYING client from fighting its own lift.
-            if (GameState.currentShipyard != null) return;
+            // While the LOCAL player has a boat admitted to a shipyard, vanilla AdmitShip has
+            // kinematically lifted it onto the cradle. The host doesn't enter the shipyard, so its copy
+            // keeps bobbing in the water and broadcasts that transform; applying it here would force the
+            // boat NON-kinematic again (the isKinematic re-enable below) and nudge it toward the host's
+            // water position - fighting the cradle lift on the editing client. (v0.2.28 multi-boat:
+            // narrowed from a blanket all-boats suppression to the ONE admitted boat, resolved from
+            // currentShipyard.currentShip - other streamed boats keep correcting while we edit. Null
+            // currentShip while browsing = nothing suppressed.) The lift releases (DischargeShip) and
+            // normal sync resumes via the ForceSnapOnNextApply armed in OnLocalShipyardState.
+            var localShipyardBoatName = GetLocalShipyardBoatName();
+
+            _pruneScratch.Clear();
+            foreach (var kvp in _boatStates)
+            {
+                var state = kvp.Value;
+
+                // Prune boats the host stopped streaming (e.g. the last remote player left that boat).
+                // Unscaled clock for the same 16x-sleep reason as the staleness snap.
+                if (Time.unscaledTime - state.LastPacketUnscaledTime > BoatStatePruneSeconds)
+                {
+                    _pruneScratch.Add(kvp.Key);
+                    continue;
+                }
+
+                if (kvp.Key == localShipyardBoatName) continue; // local cradle owns this boat
+
+                ApplyBoatTransformFor(kvp.Key, state);
+            }
+
+            foreach (var staleName in _pruneScratch)
+            {
+                _boatStates.Remove(staleName);
+                VerboseLogger.BoatApply($"Pruned stale boat sync state for '{staleName}' (no packet for {BoatStatePruneSeconds:F0}s)");
+            }
+        }
+
+        /// <summary>
+        /// Guest: per-boat correction step. This is the pre-v0.2.28 single-boat ApplyBoatTransform body
+        /// operating on a BoatSyncState entry instead of instance fields - the teleport threshold snap,
+        /// staleness snap, sleep-warp tracking, vertical softening and ALL integrator clamps (the
+        /// pre-v0.2.19 357 m/s runaway lesson) are preserved exactly.
+        /// </summary>
+        private void ApplyBoatTransformFor(string boatName, BoatSyncState state)
+        {
+            // (v0.2.28 Fix C) NOTE: a boat that is shipyard-active on ANOTHER peer is NOT skipped here.
+            // The host stream stays authoritative and this peer keeps seeing the boat in the water; the
+            // cosmetic cradle lift on the editing machine's screen is deliberately not synced.
+
+            // Pre-armed entry (ForceSnapOnNextApply) with no real target yet - nothing to apply.
+            if (!state.HasTarget) return;
 
             // Look up boat by name instead of using GameState.lastBoat
             // This prevents applying transform to wrong boat when player steps on a different boat
-            var boatSaveable = BoatUtility.FindBoatByName(_targetBoatName);
+            var boatSaveable = BoatUtility.FindBoatByName(boatName);
             if (boatSaveable == null) return;
             var boat = boatSaveable.transform;
 
             // Update cache if boat changed
-            if (_cachedBoatTransform != boat)
+            if (state.CachedBoatTransform != boat)
             {
-                _cachedBoatTransform = boat;
-                _cachedBoatRb = boat.GetComponent<Rigidbody>();
+                state.CachedBoatTransform = boat;
+                state.CachedBoatRb = boat.GetComponent<Rigidbody>();
                 Plugin.Log.LogInfo($"Guest: Cached new boat: {boat.name}");
             }
 
-            if (_cachedBoatRb == null) return;
+            var rb = state.CachedBoatRb;
+            if (rb == null) return;
 
             // Ensure boat is NOT kinematic - we want physics to run
-            if (_cachedBoatRb.isKinematic)
+            if (rb.isKinematic)
             {
                 Plugin.Log.LogInfo("Guest: Enabling physics on boat (was kinematic)");
-                _cachedBoatRb.isKinematic = false;
+                rb.isKinematic = false;
             }
 
             // Calculate local position on-demand using CURRENT offset
             var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
 
             // Detect FOM offset changes (verbose diagnostics only)
-            if (_hasPrevValues)
+            if (state.HasPrevValues)
             {
-                var offsetDelta = (offset - _prevOffset).magnitude;
+                var offsetDelta = (offset - state.PrevOffset).magnitude;
                 if (offsetDelta > 0.1f)
                 {
-                    VerboseLogger.TeleportDebug($"FOM_SHIFT: offsetDelta={offsetDelta:F1}m, prevOffset={_prevOffset}, newOffset={offset}");
+                    VerboseLogger.TeleportDebug($"FOM_SHIFT: offsetDelta={offsetDelta:F1}m, prevOffset={state.PrevOffset}, newOffset={offset}");
                 }
             }
 
             // Extrapolate target position using velocity to smooth out gaps between packets
-            float timeSincePacket = Mathf.Min(Time.time - _lastPacketTime, 0.05f);
-            var extrapolatedRealPosition = _targetRealPosition + _targetVelocity * timeSincePacket;
+            float timeSincePacket = Mathf.Min(Time.time - state.LastPacketTime, 0.05f);
+            var extrapolatedRealPosition = state.TargetRealPosition + state.TargetVelocity * timeSincePacket;
             var targetLocalPosition = extrapolatedRealPosition + offset;
 
             // Extrapolate rotation using angular velocity
-            var extrapolatedRotation = _targetRotation * Quaternion.Euler(_targetAngularVelocity * Mathf.Rad2Deg * timeSincePacket);
+            var extrapolatedRotation = state.TargetRotation * Quaternion.Euler(state.TargetAngularVelocity * Mathf.Rad2Deg * timeSincePacket);
 
             // Position error determines correction strategy
             Vector3 positionError = targetLocalPosition - boat.position;
@@ -256,33 +411,33 @@ namespace SailwindCoop.Sync
                     boat.position = targetLocalPosition;
                     boat.rotation = extrapolatedRotation;
                 }
-                _cachedBoatRb.velocity = _targetVelocity;
-                _cachedBoatRb.angularVelocity = _targetAngularVelocity;
-                _snapOnNextApply = false;
+                rb.velocity = state.TargetVelocity;
+                rb.angularVelocity = state.TargetAngularVelocity;
+                state.SnapOnNextApply = false;
 
-                _prevBoatPosition = boat.position;
-                _prevOffset = offset;
-                _hasPrevValues = true;
+                state.PrevBoatPosition = boat.position;
+                state.PrevOffset = offset;
+                state.HasPrevValues = true;
                 return;
             }
 
-            if (errorMagnitude > TeleportThreshold || (_snapOnNextApply && errorMagnitude > 5f))
+            if (errorMagnitude > TeleportThreshold || (state.SnapOnNextApply && errorMagnitude > 5f))
             {
                 // === TELEPORT MODE ===
                 // Error too large for velocity correction (join/recovery), or the stream stalled >2s and we
                 // re-acquired far from target - teleport directly instead of a violent velocity chase.
-                VerboseLogger.TeleportDebug($"TELEPORT: error={errorMagnitude:F1}m (threshold={TeleportThreshold}m, staleSnap={_snapOnNextApply}), " +
+                VerboseLogger.TeleportDebug($"TELEPORT: error={errorMagnitude:F1}m (threshold={TeleportThreshold}m, staleSnap={state.SnapOnNextApply}), " +
                     $"from={boat.position} to={targetLocalPosition}");
 
                 boat.position = targetLocalPosition;
                 boat.rotation = extrapolatedRotation;
-                _cachedBoatRb.velocity = _targetVelocity;
-                _cachedBoatRb.angularVelocity = _targetAngularVelocity;
-                _snapOnNextApply = false;
+                rb.velocity = state.TargetVelocity;
+                rb.angularVelocity = state.TargetAngularVelocity;
+                state.SnapOnNextApply = false;
             }
             else
             {
-                _snapOnNextApply = false; // error is small again - no snap needed
+                state.SnapOnNextApply = false; // error is small again - no snap needed
                 // === PHYSICS-BASED CORRECTION ===
                 // Small error - apply velocity corrections to let physics run naturally
 
@@ -301,7 +456,7 @@ namespace SailwindCoop.Sync
                 Vector3 positionCorrection = positionError * PositionCorrectionStrength;
 
                 // Velocity correction: blend toward host's velocity
-                Vector3 velocityError = _targetVelocity - _cachedBoatRb.velocity;
+                Vector3 velocityError = state.TargetVelocity - rb.velocity;
                 // Don't force vertical velocity to match the host - that would override the local buoyancy
                 // bob. Soften Y by the same factor (full only when far out of vertical sync).
                 velocityError.y *= verticalFactor;
@@ -316,13 +471,13 @@ namespace SailwindCoop.Sync
                 // Clamp the commanded correction so a large-but-sub-teleport error (e.g. after a receive
                 // stall) is chased gently instead of violently. No-op at normal errors (<5m -> <~35 m/s^2).
                 Vector3 correction = Vector3.ClampMagnitude(positionCorrection + velocityCorrection, 30f);
-                _cachedBoatRb.velocity += correction * dt;
+                rb.velocity += correction * dt;
 
                 // Hard speed ceiling relative to the host's authoritative speed - catches any residual
                 // runaway regardless of source. No-op in normal play.
-                float maxSpeed = _targetVelocity.magnitude + 8f;
-                if (_cachedBoatRb.velocity.magnitude > maxSpeed)
-                    _cachedBoatRb.velocity = _cachedBoatRb.velocity.normalized * maxSpeed;
+                float maxSpeed = state.TargetVelocity.magnitude + 8f;
+                if (rb.velocity.magnitude > maxSpeed)
+                    rb.velocity = rb.velocity.normalized * maxSpeed;
 
                 // Rotation correction: apply angular velocity toward target rotation
                 Quaternion rotationError = extrapolatedRotation * Quaternion.Inverse(boat.rotation);
@@ -334,10 +489,10 @@ namespace SailwindCoop.Sync
                     Vector3 rotationCorrection = axis * (angle * Mathf.Deg2Rad) * RotationCorrectionStrength;
 
                     // Angular velocity correction: blend toward host's angular velocity
-                    Vector3 angularVelocityError = _targetAngularVelocity - _cachedBoatRb.angularVelocity;
+                    Vector3 angularVelocityError = state.TargetAngularVelocity - rb.angularVelocity;
                     Vector3 angularVelocityCorrection = angularVelocityError * VelocityCorrectionStrength;
 
-                    _cachedBoatRb.angularVelocity += (rotationCorrection + angularVelocityCorrection) * dt;
+                    rb.angularVelocity += (rotationCorrection + angularVelocityCorrection) * dt;
                 }
 
                 // Debug: Log significant position errors (but below teleport threshold)
@@ -345,57 +500,108 @@ namespace SailwindCoop.Sync
                 {
                     VerboseLogger.TeleportDebug($"POSITION_ERROR: {errorMagnitude:F1}m, " +
                         $"current={boat.position}, target={targetLocalPosition}, " +
-                        $"velocity={_cachedBoatRb.velocity.magnitude:F1}m/s, correction={positionCorrection.magnitude:F1}");
+                        $"velocity={rb.velocity.magnitude:F1}m/s, correction={positionCorrection.magnitude:F1}");
                 }
             }
 
             // Store for next frame comparison
-            _prevBoatPosition = boat.position;
-            _prevOffset = offset;
-            _hasPrevValues = true;
+            state.PrevBoatPosition = boat.position;
+            state.PrevOffset = offset;
+            state.HasPrevValues = true;
         }
 
         /// <summary>
         /// Called when a BoatTransform packet is received from host.
-        /// Updates interpolation targets for the guest.
+        /// Updates interpolation targets for the guest, per boat (v0.2.28 multi-boat).
         /// </summary>
         public void OnBoatTransformReceived(BoatTransformPacket packet)
         {
             // Store real position directly, don't convert to local here;
-            // local position is calculated on-demand in ApplyBoatTransform using the current offset
-            VerboseLogger.BoatRecv($"BoatTransform, boat={packet.BoatName}, realPos={packet.Position}, vel={packet.Velocity.magnitude:F2}m/s", throttle: true);
+            // local position is calculated on-demand in ApplyBoatTransformFor using the current offset
+            VerboseLogger.BoatRecv($"BoatTransform, boat={packet.BoatName}, primary={packet.IsPrimary}, realPos={packet.Position}, vel={packet.Velocity.magnitude:F2}m/s", throttle: true);
+
+            if (string.IsNullOrEmpty(packet.BoatName)) return;
+
+            bool isNewEntry = !_boatStates.TryGetValue(packet.BoatName, out var state);
+            if (isNewEntry)
+            {
+                state = new BoatSyncState();
+                _boatStates[packet.BoatName] = state;
+                // New-entry snap default: the FIRST apply for a boat we weren't tracking teleports to the
+                // received pose instead of velocity-chasing an arbitrary local-sim gap. Covers first-ever
+                // packets AND the prune-then-resume hole (a boat pruned after 10s of silence re-enters as
+                // a fresh entry and snaps). Harmless for the join flow: SnapBoatToLiveTarget wants a snap
+                // anyway, and the flag only fires when the error exceeds 5m.
+                state.SnapOnNextApply = true;
+            }
+            else if (!state.HasTarget)
+            {
+                // Pre-armed entry from ForceSnapOnNextApply: treat this first packet as new data (skip the
+                // jump/staleness diagnostics below, which would read zero-initialized targets).
+                isNewEntry = true;
+            }
 
             // Detect large jumps in received target position (> 20m); these would indicate
             // packet reordering, corruption, or a sender-side issue (verbose diagnostics only)
-            if (_hasReceivedState)
+            if (!isNewEntry)
             {
-                var targetJump = (packet.Position - _targetRealPosition).magnitude;
+                var targetJump = (packet.Position - state.TargetRealPosition).magnitude;
                 if (targetJump > 20f)
                 {
-                    VerboseLogger.TeleportDebug($"TARGET_JUMP: delta={targetJump:F1}m, prevTarget={_targetRealPosition}, " +
+                    VerboseLogger.TeleportDebug($"TARGET_JUMP: boat={packet.BoatName}, delta={targetJump:F1}m, prevTarget={state.TargetRealPosition}, " +
                         $"newTarget={packet.Position}, vel={packet.Velocity.magnitude:F1}m/s, " +
-                        $"timeSinceLastPacket={(Time.time - _lastPacketTime):F3}s");
+                        $"timeSinceLastPacket={(Time.time - state.LastPacketTime):F3}s");
                 }
             }
 
             // Staleness snap: a long receive stall leaves the target frozen while our boat sails on;
             // when the stream resumes, the correction would chase the huge gap at runaway speeds.
             // Flag a one-shot snap instead. UNSCALED clock: Time.time-based gaps inflate 16x during co-op
-            // sleep timewarp and would false-positive on every normal packet interval.
-            if (_hasReceivedState && Time.unscaledTime - _lastPacketUnscaledTime > 2f)
+            // sleep timewarp and would false-positive on every normal packet interval. Secondary boats
+            // stream at 1/4 rate (0.1s interval), still far below the 2s stall threshold.
+            if (!isNewEntry && Time.unscaledTime - state.LastPacketUnscaledTime > 2f)
             {
-                VerboseLogger.TeleportDebug($"STALE_STREAM: {Time.unscaledTime - _lastPacketUnscaledTime:F1}s since last packet; will snap on next apply");
-                _snapOnNextApply = true;
+                VerboseLogger.TeleportDebug($"STALE_STREAM: boat={packet.BoatName}, {Time.unscaledTime - state.LastPacketUnscaledTime:F1}s since last packet; will snap on next apply");
+                state.SnapOnNextApply = true;
             }
 
-            _targetBoatName = packet.BoatName;  // store boat name for lookup
-            _targetRealPosition = packet.Position;
-            _targetRotation = packet.Rotation;
-            _targetVelocity = packet.Velocity;
-            _targetAngularVelocity = packet.AngularVelocity;
-            _lastPacketTime = Time.time;
-            _lastPacketUnscaledTime = Time.unscaledTime;
+            // Track the PRIMARY boat name (host's lastBoat) for SnapBoatToLiveTarget / join flow.
+            if (packet.IsPrimary)
+                _targetBoatName = packet.BoatName;
+
+            state.TargetRealPosition = packet.Position;
+            state.TargetRotation = packet.Rotation;
+            state.TargetVelocity = packet.Velocity;
+            state.TargetAngularVelocity = packet.AngularVelocity;
+            state.LastPacketTime = Time.time;
+            state.LastPacketUnscaledTime = Time.unscaledTime;
+            state.HasTarget = true;
             _hasReceivedState = true;
+        }
+
+        /// <summary>
+        /// (v0.2.28 Fix C) Force a one-shot teleport snap for a boat on the next apply, without waiting
+        /// for the 50m threshold. Used when a shipyard discharge arrives: the boat was frozen in place
+        /// here while the editing peer moved it (cradle lift + release teleport), so converge by snapping
+        /// to the next authoritative transform instead of velocity-chasing the gap.
+        /// </summary>
+        public void ForceSnapOnNextApply(string boatName)
+        {
+            if (string.IsNullOrEmpty(boatName)) return;
+            if (!_boatStates.TryGetValue(boatName, out var state))
+            {
+                // No entry yet (e.g. this peer never received a stream for the boat, or it was pruned):
+                // create a pre-armed one instead of silently no-oping. HasTarget stays false, so nothing
+                // is applied until the first packet lands; the fresh timestamps keep it from being pruned
+                // before that packet arrives.
+                state = new BoatSyncState
+                {
+                    LastPacketTime = Time.time,
+                    LastPacketUnscaledTime = Time.unscaledTime
+                };
+                _boatStates[boatName] = state;
+            }
+            state.SnapOnNextApply = true;
         }
 
         /// <summary>
@@ -419,53 +625,65 @@ namespace SailwindCoop.Sync
                 // Store real position, not local:
                 // convert the current local position back to real for consistent storage
                 var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
-                _targetRealPosition = currentBoat.transform.position - offset;
-                _targetRotation = currentBoat.transform.rotation;
-                _targetVelocity = Vector3.zero; // Will be updated by next BoatTransform packet
-                _targetAngularVelocity = Vector3.zero;
-                _lastPacketTime = Time.time;
-                _lastPacketUnscaledTime = Time.unscaledTime;
+
+                var boatName = currentBoat.gameObject.name;
+                if (!_boatStates.TryGetValue(boatName, out var state))
+                {
+                    state = new BoatSyncState();
+                    _boatStates[boatName] = state;
+                }
+                state.TargetRealPosition = currentBoat.transform.position - offset;
+                state.TargetRotation = currentBoat.transform.rotation;
+                state.TargetVelocity = Vector3.zero; // Will be updated by next BoatTransform packet
+                state.TargetAngularVelocity = Vector3.zero;
+                state.LastPacketTime = Time.time;
+                state.LastPacketUnscaledTime = Time.unscaledTime;
+                state.HasTarget = true;
+
+                _targetBoatName = boatName;
                 _hasReceivedState = true;
 
-                VerboseLogger.BoatApply($"WorldState applied, currentBoat={packet.CurrentBoatName}, realPos={_targetRealPosition}");
+                VerboseLogger.BoatApply($"WorldState applied, currentBoat={packet.CurrentBoatName}, realPos={state.TargetRealPosition}");
             }
         }
 
         /// <summary>
         /// At-sea join: snap the guest's boat to the host's LIVE transform + velocity right now.
-        /// During a join the per-frame apply (ApplyBoatTransform) is gated off by IsJoinInProgress, so the
+        /// During a join the per-frame apply (ApplyBoatTransforms) is gated off by IsJoinInProgress, so the
         /// guest's boat sits at the multi-second-old join SNAPSHOT. OnBoatTransformReceived is NOT gated, so
-        /// _targetRealPosition has tracked the host's live position the whole time. Called right before the
-        /// guest is placed/embarked so the deck is where the host's boat ACTUALLY is (not where it was when
-        /// the join started). Then when IsJoinInProgress clears, the first ApplyBoatTransform sees a tiny
-        /// error -> smooth correction, instead of a >50m TELEPORT that yanks the deck out from under the
-        /// just-embarked guest and strands them. No-op at a port (no BoatTransform streamed, or live target ==
-        /// snapshot). Returns true if it snapped. Mirrors the ApplyBoatTransform teleport branch exactly.
+        /// the primary boat's TargetRealPosition has tracked the host's live position the whole time. Called
+        /// right before the guest is placed/embarked so the deck is where the host's boat ACTUALLY is (not
+        /// where it was when the join started). Then when IsJoinInProgress clears, the first apply sees a
+        /// tiny error -> smooth correction, instead of a >50m TELEPORT that yanks the deck out from under
+        /// the just-embarked guest and strands them. No-op at a port (no BoatTransform streamed, or live
+        /// target == snapshot). Returns true if it snapped. Mirrors the teleport branch exactly. Operates
+        /// on the PRIMARY boat (host's lastBoat) only, matching pre-multi-boat behavior.
         /// </summary>
         public bool SnapBoatToLiveTarget()
         {
             if (!_hasReceivedState || string.IsNullOrEmpty(_targetBoatName)) return false;
+            if (!_boatStates.TryGetValue(_targetBoatName, out var state)) return false;
             var boatSaveable = BoatUtility.FindBoatByName(_targetBoatName);
             if (boatSaveable == null) return false;
             var boat = boatSaveable.transform;
             var rb = boat.GetComponent<Rigidbody>();
             var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
 
-            boat.position = _targetRealPosition + offset;
-            boat.rotation = _targetRotation;
+            boat.position = state.TargetRealPosition + offset;
+            boat.rotation = state.TargetRotation;
             if (rb != null && !rb.isKinematic)
             {
-                rb.velocity = _targetVelocity;
-                rb.angularVelocity = _targetAngularVelocity;
+                rb.velocity = state.TargetVelocity;
+                rb.angularVelocity = state.TargetAngularVelocity;
             }
-            // Prime cache + prev-frame values so the first post-join ApplyBoatTransform compares against THIS
-            // snapped position (otherwise it would read a spurious one-frame apparent velocity from the old pos).
-            _cachedBoatTransform = boat;
-            _cachedBoatRb = rb;
-            _prevBoatPosition = boat.position;
-            _prevOffset = offset;
-            _hasPrevValues = true;
-            Plugin.Log.LogInfo($"[JOIN] Snapped boat '{boat.name}' to LIVE host transform before embark: realPos={_targetRealPosition}, vel={_targetVelocity.magnitude:F1}m/s");
+            // Prime cache + prev-frame values so the first post-join apply compares against THIS snapped
+            // position (otherwise it would read a spurious one-frame apparent velocity from the old pos).
+            state.CachedBoatTransform = boat;
+            state.CachedBoatRb = rb;
+            state.PrevBoatPosition = boat.position;
+            state.PrevOffset = offset;
+            state.HasPrevValues = true;
+            Plugin.Log.LogInfo($"[JOIN] Snapped boat '{boat.name}' to LIVE host transform before embark: realPos={state.TargetRealPosition}, vel={state.TargetVelocity.magnitude:F1}m/s");
             return true;
         }
 
@@ -476,12 +694,9 @@ namespace SailwindCoop.Sync
         {
             _hasReceivedState = false;
             _lastSyncTime = 0f;
-            _lastPacketTime = 0f;
-            _lastPacketUnscaledTime = 0f;
-            _snapOnNextApply = false;
+            _sendTick = 0;
             _targetBoatName = null;
-            _targetVelocity = Vector3.zero;
-            _targetAngularVelocity = Vector3.zero;
+            _boatStates.Clear();
             IsJoinInProgress = false;
             HasReceivedWorldState = false; // (v0.2.25) re-arm the guest join-state watchdog for the next session
 
@@ -489,6 +704,8 @@ namespace SailwindCoop.Sync
             _cachedBoatTransform = null;
             _cachedBoatRb = null;
             _cachedBoatSaveable = null;
+            _activeBoatsScratch.Clear();
+            _activeBoatNamesScratch.Clear();
         }
 
         /// <summary>

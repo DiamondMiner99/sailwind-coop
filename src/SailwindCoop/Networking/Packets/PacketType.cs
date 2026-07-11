@@ -218,5 +218,13 @@ namespace SailwindCoop.Networking.Packets
         // guest to destroy its local copy. Additive wire - pre-v0.2.25 clients silently drop the
         // unknown type and just keep seeing the deny loop (no worse than today).
         GhostItemPurge = 209,            // Host -> requesting guest (targeted, reliable): destroy your local copy of this unknown instanceId
+
+        // Shipyard cradle state (210, v0.2.28): vanilla Shipyard.AdmitShip/DischargeShip is purely local
+        // (kinematic cradle lift on the editing machine only), so other peers kept seeing the boat bobbing
+        // in the water and, on discharge, the instant teleport + physics re-enable registered a >1.5 m/s
+        // BoatDamage.Impact on the host. Editing peer sends active=true/false; host relays; non-editing
+        // peers freeze the boat in place (kinematic) and suppress transform sync + impact damage briefly
+        // on release. v0.2.28 is already wire-breaking (version handshake), so all peers have this type.
+        ShipyardState = 210,             // Editing peer -> all (reliable): boat admitted to / discharged from a shipyard cradle; host relays
     }
 }

@@ -14,6 +14,40 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.28 - 2026-07-10
+
+> **All players must update.** The network format changed (new shipyard packet + boat sync
+> field), and this release adds a version handshake: the host now refuses joins from a
+> mismatched mod version with a clear message on both screens, instead of letting the crew
+> desync in confusing ways. Also fixes the 2026-07-10 second playtest report batch
+> (thanks Jav1k!).
+
+### Added
+- **Version handshake at join.** Crews on different mod versions no longer silently
+  half-work: the joiner is rejected with a message saying which side needs to update.
+- **A second boat now stays in sync.** The host used to stream only the boat it was
+  standing on, so after buying a new ship the old one froze (or "rotated in place") for
+  everyone not on the host's boat. The host now streams every boat that has a crew member
+  aboard, so moving the old ship while the host is on the new one works.
+
+### Fixed
+- **Lamps hung on hooks became untouchable for the rest of the crew** until the hanger
+  took them down and dropped them on the floor. Hanging an item now restores its
+  clickability on every machine, not just the hanger's.
+- **Rejoining after a ship purchase violently yanked the new ship back to the shipyard
+  dock, ropes attached.** A freshly bought ship silently kept its purchase-dock mooring in
+  the join snapshot; the mooring is now measured against where the rope actually attaches
+  before the spring is created, and an implausible moor is stowed instead of yanking.
+- **Closing the shipyard teleported the ship and chipped its hull.** The shipyard release
+  drops the ship back in the water instantly; everyone now snaps cleanly to the released
+  position and impact damage is suppressed for a few seconds around the release. (The
+  cradle lift itself is still only visible to the player using the shipyard - see
+  KNOWN-ISSUES.)
+- **A crewmate's sail handling could silently stop reaching the rest of the crew
+  mid-session** (nothing moved on other screens until they rejoined). After any sail/
+  shipyard change the mod now re-learns the new sail ropes immediately instead of
+  watching destroyed ones, without cancelling an in-flight rope adjustment.
+
 ## v0.2.27 - 2026-07-10
 
 > **Hotfix.** No network change - fully compatible with v0.2.25/v0.2.26 crews, but each fix

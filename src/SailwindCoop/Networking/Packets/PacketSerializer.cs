@@ -665,6 +665,7 @@ namespace SailwindCoop.Networking.Packets
             WriteVector3(writer, packet.Velocity);
             WriteVector3(writer, packet.AngularVelocity);
             writer.Write(packet.IsAnchored);
+            writer.Write(packet.IsPrimary);
         }
 
         /// <summary>
@@ -679,7 +680,8 @@ namespace SailwindCoop.Networking.Packets
                 Rotation = ReadQuaternion(reader),
                 Velocity = ReadVector3(reader),
                 AngularVelocity = ReadVector3(reader),
-                IsAnchored = reader.ReadBoolean()
+                IsAnchored = reader.ReadBoolean(),
+                IsPrimary = reader.ReadBoolean()
             };
         }
 
@@ -1097,6 +1099,23 @@ namespace SailwindCoop.Networking.Packets
                 packet.PartActiveOptions[i] = reader.ReadInt32();
 
             return packet;
+        }
+
+        // Shipyard cradle state. Write order MUST equal Read order.
+
+        public static void WriteShipyardState(BinaryWriter writer, ShipyardStatePacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+            writer.Write(packet.Active);
+        }
+
+        public static ShipyardStatePacket ReadShipyardState(BinaryReader reader)
+        {
+            return new ShipyardStatePacket
+            {
+                BoatName = reader.ReadString(),
+                Active = reader.ReadBoolean()
+            };
         }
 
         // Shipyard order request. Write order MUST equal Read order.

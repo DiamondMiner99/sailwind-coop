@@ -2915,6 +2915,62 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
+        /// Reverse DisarmRemoteHeldItemPhysics for an item that leaves a remote hand WITHOUT an
+        /// ItemDropped (click-to-hang: ShipItemLampHook.OnItemClick -> ConnectJoint while still held
+        /// sends only ItemHung; OnLocalItemDropped skips hanging items). Without this the hung lamp
+        /// keeps the fake held reference, disabled trigger + colliders and a possibly-running disarm
+        /// sweep on every OTHER machine, so it is non-interactible for everyone but the hanger.
+        /// Mirrors the drop-path re-arm (~OnRemoteItemDropped) minus the parenting/latch work, which
+        /// ConnectJoint handles itself.
+        /// </summary>
+        private void RearmRemoteHeldItemPhysics(ShipItem item, int instanceId)
+        {
+            // Stop the deferred disarm sweep BEFORE re-enabling colliders, so it cannot fight the re-arm
+            StopColliderDisarmSweep(instanceId);
+
+            // Re-enable item if it was hidden (in inventory)
+            if (!item.gameObject.activeSelf)
+                item.gameObject.SetActive(true);
+
+            // Clear the fake held reference we set during pickup
+            item.held = null;
+
+            // Restore the ShipItem's own trigger collider disabled while remote-held,
+            // so the item is interactable/raycastable again
+            SetShipItemOwnTriggers(item, true);
+
+            if (item.itemRigidbodyC != null)
+            {
+                // Re-enable ALL colliders (was disabled during pickup; children too - the
+                // pickup disarm disables subcollider children, vanilla never re-enables them)
+                foreach (var col in item.itemRigidbodyC.GetComponentsInChildren<Collider>(true))
+                    col.enabled = true;
+
+                item.itemRigidbodyC.enabled = true;
+            }
+
+            // Reset layer to Default (0) for raycast interaction (same as the drop path)
+            item.gameObject.layer = 0;
+        }
+
+        /// <summary>
+        /// True when the LOCAL player genuinely holds <paramref name="item"/> right now. item.held alone
+        /// cannot answer this: the remote-held disarm (DisarmRemoteHeldItemPhysics) fakes item.held with
+        /// the SAME FindObjectOfType&lt;GoPointer&gt; instance, so the check must come from the POINTER side
+        /// (GoPointer.GetHeldItem() - vanilla only sets that for a real local grab). The _heldItems record
+        /// covers a confirmed local hold; the pointer check covers the just-grabbed window before the
+        /// host's ItemPickedUp broadcast returns (same two-layer pattern as the OnRemoteItemDropped guard).
+        /// </summary>
+        private bool IsHeldByLocalPlayer(ShipItem item, int instanceId)
+        {
+            if (item == null) return false;
+            if (_heldItems.TryGetValue(instanceId, out var holder) && holder == SteamClient.SteamId)
+                return true;
+            var localPointer = Object.FindObjectOfType<GoPointer>();
+            return localPointer != null && ReferenceEquals(localPointer.GetHeldItem(), item);
+        }
+
+        /// <summary>
         /// Stop the disarm sweep for an item, if one is running. Called by every drop/resync path
         /// right before it re-enables colliders, so the sweep cannot fight the re-enable.
         /// </summary>
@@ -3920,6 +3976,19 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ItemHung, w =>
                     PacketSerializer.WriteItemHung(w, packet));
 
+            // LOCAL-HOLD RACE GUARD: a hang can race a local grab (the hanger's reliable ItemHung lands
+            // after THIS player already snatched the item). Applying it would stomp live vanilla held
+            // state: held=null + collider/layer re-arm on an item in the local hand, plus a ConnectJoint
+            // yanking it onto the hook. Safest minimal behavior: skip the WHOLE application (bookkeeping
+            // included, so the local hold record survives) - the local pickup broadcast supersedes the
+            // hang for everyone else, exactly like the OnRemoteItemDropped local-hold skip.
+            var raceItem = FindItemByInstanceId(packet.ItemInstanceId);
+            if (raceItem != null && IsHeldByLocalPlayer(raceItem, packet.ItemInstanceId))
+            {
+                VerboseLogger.ItemApply($"Skipping ItemHung for item {packet.ItemInstanceId} held by local player");
+                return;
+            }
+
             // Clear held state - item is no longer held when hung on hook
             _heldItems.Remove(packet.ItemInstanceId);
             _remoteHeldItems.Remove(packet.ItemInstanceId);
@@ -3949,6 +4018,11 @@ namespace SailwindCoop.Sync
             IsApplyingRemoteState = true;
             try
             {
+                // Click-to-hang sends NO ItemDropped, so undo the remote-held physics disarm here
+                // (fake held ref, disabled trigger/colliders, disarm sweep) or the hung item stays
+                // non-interactible on this machine (the gas-lamp-on-holder bug)
+                RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
+
                 hangable.ConnectJoint(hook.GetComponent<Collider>());
                 VerboseLogger.ItemApply($"Hung item {packet.ItemInstanceId} on hook {packet.HookInstanceId}");
             }
@@ -3987,6 +4061,15 @@ namespace SailwindCoop.Sync
             IsApplyingRemoteState = true;
             try
             {
+                // Safety net: if the item somehow reached the hook still physics-disarmed (missed
+                // ItemHung), re-arm it now - but never while ANYONE currently holds it: a remote
+                // holder's live pickup disarm must not be undone, and (local-hold race) a local grab
+                // that beat this packet must not have held=null/collider/layer stomped over vanilla
+                // held state. _heldItems covers recorded holds; IsHeldByLocalPlayer covers the
+                // just-grabbed local window before the host's ItemPickedUp broadcast returns.
+                if (!_heldItems.ContainsKey(packet.ItemInstanceId) && !IsHeldByLocalPlayer(item, packet.ItemInstanceId))
+                    RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
+
                 hangable.DisconnectJoint();
                 VerboseLogger.ItemApply($"Unhung item {packet.ItemInstanceId}");
             }

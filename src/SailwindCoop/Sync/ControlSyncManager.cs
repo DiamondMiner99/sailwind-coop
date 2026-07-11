@@ -166,6 +166,14 @@ namespace SailwindCoop.Sync
             new Dictionary<RopeController, GPButtonRopeWinch>();
         private Anchor _ropeCacheAnchor;
         private string _ropeCacheBoatName;
+        // Rope-array identity the winch map was built against. BoatUtility.GetRopeControllers returns the
+        // SAME cached array until InvalidateRopeCache (fired on ANY sail change: shipyard sync, boat state
+        // apply - the v0.2.25/v0.2.27 rope-cache invalidation story) forces a fresh allocation. A sail
+        // rebuild destroys and recreates RopeController instances; with an unchanged count on a same-named
+        // boat, the count/name trigger below never fires and the winch map stays keyed on destroyed ropes,
+        // so IsLocalOperatingRope misses on EVERY rope and all local rope broadcasts are silently
+        // suppressed until rejoin. Array identity catches exactly those rebuilds.
+        private RopeController[] _ropeCacheArrayRef;
 
         private void PollBoatControls()
         {
@@ -187,6 +195,8 @@ namespace SailwindCoop.Sync
             // rope->winch map must never alias another boat's winches, and the length cache is per-boat.
             if (_lastRopeLengths.Length != ropes.Length || _ropeCacheBoatName != boatName)
             {
+                // FULL wipe: different boat or different rope count - none of the per-rope send state
+                // is meaningful against the new rope set.
                 _lastRopeLengths = new float[ropes.Length];
                 _ropeLastChangeTime = new float[ropes.Length];
                 _ropeFinalSent = new bool[ropes.Length];
@@ -196,7 +206,24 @@ namespace SailwindCoop.Sync
                     _lastRopeLengths[j] = -1f;
                     _ropeFinalSent[j] = true; // no pending terminal for a freshly-(re)discovered rope
                 }
+                _ropeCacheArrayRef = ropes;
                 BuildRopeWinchMap(boat, boatName);
+            }
+            else if (!ReferenceEquals(ropes, _ropeCacheArrayRef))
+            {
+                // IDENTITY-ONLY rebuild: same boat, same rope count, but GetRopeControllers handed back a
+                // fresh array - the rope cache was invalidated (fires on ANY customization/sail change,
+                // possibly mid-winch-operation) and the RopeController instances may have been recreated,
+                // so the rope->winch map must be rebuilt or it stays keyed on destroyed objects and every
+                // local rope broadcast is silently suppressed. Crucially, PRESERVE the per-rope arrays
+                // (_lastRopeLengths/_ropeFinalSent/_ropeLastChangeTime/_ropeLastSentLength): wiping them
+                // here would cancel a pending IsFinal rope terminal (the reliable packet that heals a
+                // dropped final delta) and recreate the v0.2.24 "sail stuck at intermediate position"
+                // class. Rope ORDER is stable for a same-count same-boat invalidation (GetRopeControllers
+                // rebuilds from the same component scan); worst case a reordered index produces one
+                // spurious length delta, which is self-healing.
+                _ropeCacheArrayRef = ropes;
+                BuildRopeWinchMap(boat, boatName); // also refreshes _ropeCacheBoatName + _ropeCacheAnchor
             }
 
             for (int i = 0; i < ropes.Length; i++)
@@ -1634,6 +1661,7 @@ namespace SailwindCoop.Sync
             _ropeWinchMap.Clear();                // per-boat winch/anchor cache dies with the session
             _ropeCacheAnchor = null;
             _ropeCacheBoatName = null;
+            _ropeCacheArrayRef = null;
             _anchorRopeIndices.Clear();
             _loggedBoatRopes.Clear();
             _helmLeaseHolder.Clear();

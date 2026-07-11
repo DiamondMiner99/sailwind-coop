@@ -27,8 +27,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the in-progress v0.2.26 dev build (stranded-anchor fix); shows as 0.2.26 in the debug menu.
-        public const string PluginVersion = "0.2.27";
+        // load. This is the v0.2.28 build (version handshake + Jav1k 0710 batch); shows as 0.2.28.
+        public const string PluginVersion = "0.2.28";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -74,6 +74,12 @@ namespace SailwindCoop
         // person, host included, at 160). HOST-ONLY physics (BoatMass.UpdateMass patch early-returns on
         // clients), so only the host's value is ever used - nothing to sync; tunable live by the host.
         public static ConfigEntry<float> CrewMemberWeightConfig { get; private set; }
+
+        // (v0.2.27) Version handshake escape hatch: when true, a mod-version mismatch between host and
+        // guest is warned about instead of refused. Off by default - the wire format is unversioned and
+        // mixed builds can desync silently. Checked on BOTH sides (guest lobby-data pre-check + host
+        // Handshake gate), so both peers must enable it to actually play mismatched.
+        public static ConfigEntry<bool> AllowVersionMismatchConfig { get; private set; }
 
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
@@ -245,6 +251,9 @@ namespace SailwindCoop
             CrewMemberWeightConfig = Config.Bind("Coop", "CrewMemberWeightKg", 90f,
                 new ConfigDescription("Weight (kg) each REMOTE crew member adds to the boat they stand on. Vanilla models every person (the host too) at 160, so several people crowding one side of a small hull pile up a big tipping moment and can flip it. Lower this to reduce that heel/flip. HOST-ONLY: only the host computes crew weight (clients just receive the resulting boat motion), so only the host's value matters - safe to tune live mid-session.",
                     new AcceptableValueRange<float>(0f, 200f)));
+
+            AllowVersionMismatchConfig = Config.Bind("Coop", "AllowVersionMismatch", false,
+                "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it.");
 
             try
             {
@@ -468,6 +477,13 @@ namespace SailwindCoop
 
                 Notify($"{friend.Name} joined the crew", 4f);
 
+                // (v0.2.27) Version-handshake grace watchdog: pre-v0.2.27 guests never send a
+                // Handshake, so their (possibly mismatched) build is invisible to the version gate.
+                // Warn the host if an admitted guest stays silent - warn-only, since a wire-compatible
+                // older build may still be a deliberate choice.
+                if (IsHost && Instance != null)
+                    Instance.StartCoroutine(WarnIfNoVersionHandshake(friend));
+
                 // Send boat world state to new player
                 if (IsHost)
                 {
@@ -496,6 +512,8 @@ namespace SailwindCoop
 
             LobbyManager.OnPlayerLeft += friend =>
             {
+                // (v0.2.27) a re-joining peer must handshake again (mirrors the admission revoke)
+                _versionHandshaked.Remove(friend.Id);
                 Notify($"{friend.Name} left the crew", 4f);
                 _lastDisconnectNotifyTime = Time.time;
 
@@ -679,6 +697,41 @@ namespace SailwindCoop
                 // the host, so the guest still ends up with exactly one peer (the host) - identical to the
                 // old full-mesh behavior. We still SpawnRemotePlayer for existing members for the avatar
                 // (Phase 2 makes that multi-avatar); transport peering is host-only.
+                // (v0.2.27) VERSION HANDSHAKE, guest side (layer 1): the host stamps its mod version
+                // into the lobby data at creation (present since the first networking build), so a
+                // joining guest can catch a mismatched crew BEFORE opening a P2P session or touching
+                // any save state. The wire format is unversioned - mixed builds desync silently - so
+                // refuse by default; Coop.AllowVersionMismatch downgrades the refusal to a warning.
+                if (!IsHost)
+                {
+                    var hostVersion = LobbyManager.GetLobbyData("version");
+                    if (!string.IsNullOrEmpty(hostVersion) && hostVersion != PluginVersion)
+                    {
+                        string mismatchMsg = $"Mod version mismatch: the host runs v{hostVersion}, you run v{PluginVersion}. Everyone must install the same version.";
+                        Log.LogError($"[VERSION] {mismatchMsg}");
+                        if (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value)
+                        {
+                            Notify(mismatchMsg + "\n(Coop.AllowVersionMismatch is on - joining anyway; expect desyncs.)", 10f);
+                        }
+                        else if (SaveSlots.currentSlot == CoopSave.PhantomSlot)
+                        {
+                            // Title-screen join: the phantom co-op world is already loaded, so a bare
+                            // lobby-leave would strand the guest in a dead session - quit cleanly instead.
+                            _joinedAsGuest = true;
+                            EndGuestSessionAndQuit(mismatchMsg);
+                            return;
+                        }
+                        else
+                        {
+                            // Mid-game (Continue -> join) path: nothing co-op has touched their solo
+                            // world yet; leaving the lobby returns them to normal singleplayer.
+                            Notify(mismatchMsg, 12f);
+                            LobbyManager.LeaveLobby();
+                            return;
+                        }
+                    }
+                }
+
                 var hostId = LobbyManager.HostSteamId;
                 bool joinedExistingPlayer = false;
                 foreach (var member in LobbyManager.LobbyMembers)
@@ -695,6 +748,17 @@ namespace SailwindCoop
                 // OnLobbyJoined ALSO fires when the host enters their own freshly-created (empty)
                 // lobby, so only show the "you're aboard the host's ship" toast when we actually
                 // found another player to join - otherwise a solo host gets this bogus message.
+                // (v0.2.27) VERSION HANDSHAKE, guest side (layer 2): announce our version to the host
+                // over P2P. Layer 1 can't protect a NEWER host from an OLDER guest (pre-v0.2.27 guests
+                // never ran the lobby check), so the host independently gates on this packet - and
+                // warns when an admitted guest never sends it (an old build). Sent before the role
+                // bookkeeping below; the host's HandshakeAck refusal (if any) arrives strictly after
+                // this handler finished, so _joinedAsGuest is already recorded by then.
+                if (!IsHost && joinedExistingPlayer)
+                {
+                    NetworkManager.SendReliable(hostId, PacketType.Handshake, w => w.Write(PluginVersion));
+                }
+
                 if (joinedExistingPlayer)
                 {
                     Notify("Aboard the host's ship!", 5f);
@@ -772,6 +836,7 @@ namespace SailwindCoop
             LobbyManager.OnLobbyCreated += lobby =>
             {
                 _joinedAsGuest = false; // we're the host
+                _versionHandshaked.Clear(); // (v0.2.27) fresh lobby = fresh handshake set
                 // Registry population moved to OnPlayerJoined (save may not be loaded yet)
                 Notify("Server opened - waiting for crew (close from the menu)", 5f);
             };
@@ -782,20 +847,48 @@ namespace SailwindCoop
 
         private void RegisterPacketHandlers()
         {
-            // Handshake packet - basic connection verification
+            // (v0.2.27) Version handshake, host side. Guests send their mod version right after
+            // peering (OnLobbyJoined); the host refuses a mismatch unless Coop.AllowVersionMismatch
+            // is on. The packet existed (dormant, log-only) since Phase 1, so this is not a wire
+            // change - old guests simply never send it, which the grace warning in
+            // WarnIfNoVersionHandshake surfaces to the host instead.
             NetworkManager.RegisterHandler(PacketType.Handshake, (sender, reader) =>
             {
                 var version = reader.ReadString();
-                Log.LogInfo($"Received handshake from {sender}: version {version}");
+                Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion})");
 
-                // Reply if we're host
-                if (IsHost)
+                if (!IsHost) return;
+                _versionHandshaked.Add(sender);
+
+                bool match = version == PluginVersion;
+                bool allow = match || (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value);
+
+                string guestName = sender.ToString();
+                foreach (var member in LobbyManager.LobbyMembers)
+                    if (member.Id == sender) { guestName = member.Name; break; }
+
+                if (!match)
                 {
-                    NetworkManager.SendReliable(sender, PacketType.HandshakeAck, w =>
-                    {
-                        w.Write(PluginVersion);
-                        w.Write(true); // accepted
-                    });
+                    Notify(allow
+                        ? $"{guestName} is on mod v{version} (you run v{PluginVersion}) - allowed by Coop.AllowVersionMismatch; expect desyncs."
+                        : $"{guestName} is on mod v{version} - refused. Everyone must run v{PluginVersion}.", 10f);
+                    Log.LogWarning($"[VERSION] {guestName} ({sender}) version {version} vs host {PluginVersion}: {(allow ? "ALLOWED by config" : "REFUSED")}");
+                }
+
+                // Ack BEFORE any revoke, or the refusal could never reach the guest.
+                NetworkManager.SendReliable(sender, PacketType.HandshakeAck, w =>
+                {
+                    w.Write(PluginVersion);
+                    w.Write(allow);
+                });
+
+                if (!allow)
+                {
+                    // Same teeth as the admission gate: drop transport admission + peering so the
+                    // mismatched guest cannot keep feeding the sync managers. The guest quits itself
+                    // on the refused ack; if that packet is lost, its 45s join watchdog still fires.
+                    LobbyManager.RevokeAdmission(sender);
+                    NetworkManager.RemovePeer(sender);
                 }
             });
 
@@ -803,7 +896,12 @@ namespace SailwindCoop
             {
                 var version = reader.ReadString();
                 var accepted = reader.ReadBoolean();
-                Log.LogInfo($"Handshake response from {sender}: version {version}, accepted: {accepted}");
+                Log.LogInfo($"[VERSION] Handshake response from {sender}: version {version}, accepted: {accepted}");
+
+                // (v0.2.27) The host refused our version - quit cleanly instead of playing a
+                // half-admitted session (the host has already revoked our admission).
+                if (!IsHost && !accepted)
+                    EndGuestSessionAndQuit($"Mod version mismatch: the host runs v{version}, you run v{PluginVersion}. Everyone must install the same version.");
             });
 
             // Player position packet (boat-relative coordinates + held item)
@@ -1258,6 +1356,14 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadShipyardCustomization(reader);
                 ShipyardSyncManager?.OnCustomizationReceived(packet, sender);
+            });
+
+            // Shipyard cradle state (210, v0.2.28): editing peer announces AdmitShip/DischargeShip so
+            // non-editing peers freeze the boat and suppress transform sync + discharge impact damage.
+            NetworkManager.RegisterHandler(PacketType.ShipyardState, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadShipyardState(reader);
+                ShipyardSyncManager?.OnShipyardStateReceived(packet, sender);
             });
 
             // Mission sync packets
@@ -1867,6 +1973,29 @@ namespace SailwindCoop
         /// game. Runs at most once; safe even after Steam transfers lobby ownership to the
         /// guest, because it keys off the session-stable _joinedAsGuest flag, not IsHost.
         /// </summary>
+        // (v0.2.27) HOST-side: peers that sent a version Handshake this lobby. Consulted by the grace
+        // watchdog below; cleared per lobby (fresh lobby = fresh set) and per leaving member.
+        private static readonly System.Collections.Generic.HashSet<SteamId> _versionHandshaked =
+            new System.Collections.Generic.HashSet<SteamId>();
+
+        /// (v0.2.27) Host-side grace watchdog: if an admitted guest sends no version Handshake within
+        /// the window, they are almost certainly on a pre-v0.2.27 build - the version gate cannot see
+        /// them, so at least tell the host. 15s is generous for one reliable packet right after
+        /// peering, and early enough to act before the crew sails off with a desyncing member.
+        private static System.Collections.IEnumerator WarnIfNoVersionHandshake(Steamworks.Friend friend)
+        {
+            yield return new WaitForSecondsRealtime(15f);
+            if (!IsHost || !LobbyManager.IsInLobby || _versionHandshaked.Contains(friend.Id)) yield break;
+
+            bool stillInLobby = false;
+            foreach (var member in LobbyManager.LobbyMembers)
+                if (member.Id == friend.Id) { stillInLobby = true; break; }
+            if (!stillInLobby) yield break;
+
+            Log.LogWarning($"[VERSION] No version handshake from {friend.Name} ({friend.Id}) after 15s - likely a pre-v0.2.27 mod build");
+            Notify($"{friend.Name} sent no version handshake - they are likely on an older mod build. Everyone should run v{PluginVersion}.", 10f);
+        }
+
         private static void EndGuestSessionAndQuit(string reason)
         {
             if (!_joinedAsGuest || _endingGuestSession) return;

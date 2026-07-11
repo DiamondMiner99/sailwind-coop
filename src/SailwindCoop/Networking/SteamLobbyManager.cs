@@ -343,6 +343,15 @@ namespace SailwindCoop.Networking
             return id == SteamClient.SteamId || _admittedMembers.Contains(id);
         }
 
+        /// (v0.2.27) HOST-side: revoke a previously-granted admission (version-mismatch refusal).
+        /// The transport gate (IsAdmitted) then drops the peer's session and packets exactly like a
+        /// never-admitted stranger; a re-join runs the admission gate (and version handshake) afresh.
+        public void RevokeAdmission(SteamId id)
+        {
+            if (_admittedMembers.Remove(id))
+                Plugin.Log.LogInfo($"[LOBBY] Admission revoked for {id}");
+        }
+
         public int GetMemberCount()
         {
             return _currentLobby?.MemberCount ?? 0;
