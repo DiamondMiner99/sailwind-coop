@@ -55,6 +55,44 @@ namespace SailwindCoop.Networking.Packets
         public int ItemInstanceId;
     }
 
+    /// <summary>
+    /// (v0.2.29) Cargo transport hire sync. Requests are guest -> host; the host performs the vanilla
+    /// transaction (charging the shared wallet, which CurrencySync then propagates) and broadcasts the
+    /// applied result to everyone. Price/Requester ride on the result so ONLY the requester plays the
+    /// gold sound + money notification (everyone's wallet updates silently via CurrencySync).
+    /// </summary>
+    [Serializable]
+    public struct CargoInsertRequestPacket
+    {
+        public int PortIndex;        // CargoCarrier.portIndex (CargoCarrier.carriers registry key)
+        public int ItemInstanceId;
+    }
+
+    [Serializable]
+    public struct CargoInsertedPacket
+    {
+        public int PortIndex;
+        public int ItemInstanceId;
+        public int Price;            // What the host's wallet was charged (0 for join backfill)
+        public ulong RequesterSteamId;
+    }
+
+    [Serializable]
+    public struct CargoWithdrawRequestPacket
+    {
+        public int PortIndex;
+        public int ItemInstanceId;   // Id, not list index - cargo list order is not guaranteed identical
+    }
+
+    [Serializable]
+    public struct CargoWithdrawnPacket
+    {
+        public int PortIndex;
+        public int ItemInstanceId;
+        public int Price;
+        public ulong RequesterSteamId; // This peer picks the item up into their hand after applying
+    }
+
     [Serializable]
     public struct ItemSpawnedPacket
     {

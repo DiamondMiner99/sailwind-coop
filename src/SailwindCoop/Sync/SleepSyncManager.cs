@@ -67,6 +67,15 @@ namespace SailwindCoop.Sync
         private bool _isTavernSleep;
         private bool _isTimeskipEnabled;
         private bool _localPlayerInBed;
+
+        /// <summary>
+        /// (v0.2.29 bed rest) True while the LOCAL player is committed to a bed but real sleep has not
+        /// started - i.e. the whole waiting-for-crew window. SurvivalPatches uses this to freeze vital
+        /// drains + slowly restore sleep so an in-bed AFK player (typically a lone host, who can never
+        /// sleep solo under the all-crew rule) does not pass out.
+        /// </summary>
+        public bool IsLocalPlayerRestingInBed => _localPlayerInBed && !GameState.sleeping;
+
         // N-player (Phase 4): per-peer in-bed set, replacing the single _remotePlayerInBed. The host owns
         // the quorum: an entry per connected peer (guest) that has reported it is in bed. At N=1 this holds
         // at most the single guest, so AllCrewInBed == (that one peer in bed) == the old _remotePlayerInBed.

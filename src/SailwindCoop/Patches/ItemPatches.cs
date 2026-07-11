@@ -127,6 +127,23 @@ namespace SailwindCoop.Patches
             }
 
             var prefab = __instance.GetComponent<SaveablePrefab>();
+
+            // BOAT STREAM-OUT teardown (v0.2.29): when a boat drifts past the horizon, vanilla
+            // BoatLocalItems.CacheItemsOnOutOfRange caches every item aboard and flags it
+            // parentObject=-2; ShipItem.ProcessSaveable then DestroyItem()s each one. That is a purely
+            // LOCAL LOD event (vanilla respawns from cache on stream-in), but it slips past both guards
+            // above: boat items have currentWalkCol set, crate-contained items are layer 26, and
+            // GameState.recovering is false. Broadcasting it deletes the boat's deck items AND crate
+            // contents for every peer still in range - including the host, whose save then loses them
+            // permanently (the "guest opens crate, items destroyed even for host" report). parentObject
+            // is only ever set to -2 by CacheItemsOnOutOfRange, so this cannot swallow a real destroy.
+            if (Plugin.IsMultiplayer && prefab != null && prefab.GetParentObject() == -2)
+            {
+                VerboseLogger.Log("ITEM", "LOCAL",
+                    $"Suppressed stream-out ItemDestroyed broadcast for boat item {__instance.name} (local LOD cache; vanilla respawns on stream-in)");
+                return true; // destroy locally (vanilla caches + respawns), do NOT broadcast
+            }
+
             if (prefab != null)
             {
                 ItemSyncManager.Instance?.OnLocalItemDestroyed(prefab.instanceId);
@@ -150,6 +167,15 @@ namespace SailwindCoop.Patches
             var crateId = __instance.GetComponent<SaveablePrefab>()?.instanceId ?? 0;
             if (crateId != 0 && ItemSyncManager.Instance?.IsCrateUnsealing(crateId) == true) return;
 
+            // BOAT STREAM-IN respawn (v0.2.29): when a boat streams back into range, vanilla respawns
+            // its cached items and each item's load coroutine re-inserts itself by currentCrateId
+            // (ShipItem start coroutine -> CrateInventory.InsertItem). That re-insert is local
+            // reconstruction, not a player action - broadcasting it spams peers whose own copies are
+            // still cached/not yet respawned ("item or crate not found") and re-orders their crate
+            // state. Same rationale as the unseal suppression above; peers rebuild from their own
+            // caches (and the stream-out destroy broadcast is suppressed to match).
+            if (GameState.loadingBoatLocalItems || GameState.currentlyLoading) return;
+
             ItemSyncManager.Instance?.OnLocalItemInsertedInCrate(item, __instance);
         }
 
@@ -165,6 +191,99 @@ namespace SailwindCoop.Patches
 
             ItemSyncManager.Instance?.OnLocalItemRemovedFromCrate(item, __instance);
         }
+
+        /// <summary>
+        /// (v0.2.29) Cargo transport hire: vanilla InsertItem is purely local (local wallet deduct +
+        /// local cargo list + scale-zero the item), which desynced everything a guest transported.
+        /// Guest: run vanilla's own pre-checks for instant UX, then route the transaction to the host
+        /// and cancel. Host: let vanilla run; the postfix broadcasts the applied insert.
+        /// </summary>
+        [HarmonyPatch(typeof(CargoCarrier), "InsertItem")]
+        [HarmonyPrefix]
+        public static bool OnCargoInsertPrefix(CargoCarrier __instance, ShipItem item)
+        {
+            if (!Plugin.IsMultiplayer) return true;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return true;
+            if (Plugin.IsHost) return true; // vanilla runs; postfix broadcasts
+
+            // Mirror vanilla's rejects locally so the guest gets the same notifications without a round trip
+            if (item is ShipItemCrate && item.amount <= 0f)
+            {
+                NotificationUi.instance.ShowNotification("Cannot transport\nunsealed crates.");
+                return false;
+            }
+            if (PlayerGold.currency[(int)__instance.currency] < __instance.GetTransportPrice(item))
+            {
+                NotificationUi.instance.ShowNotification("Not enough money.");
+                return false;
+            }
+
+            ItemSyncManager.Instance?.RequestCargoInsert(__instance, item);
+            return false; // host applies + broadcasts; we apply on CargoInserted
+        }
+
+        [HarmonyPatch(typeof(CargoCarrier), "InsertItem")]
+        [HarmonyPostfix]
+        public static void OnCargoInsertPostfix(CargoCarrier __instance, ShipItem item)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+            // Vanilla early-outs (unsealed crate / not enough money) never reach cargo.Add,
+            // so list membership is the "insert actually happened" signal.
+            if (item != null && __instance.cargo != null && __instance.cargo.Contains(item))
+                ItemSyncManager.Instance?.BroadcastCargoInserted(__instance, item);
+        }
+
+        /// <summary>
+        /// (v0.2.29) Cargo withdraw: guest routes to host (by item id - list order isn't guaranteed);
+        /// host runs vanilla and the postfix broadcasts. __state carries (itemId, price) captured
+        /// before vanilla mutates the list.
+        /// </summary>
+        [HarmonyPatch(typeof(CargoCarrier), "WithdrawItem")]
+        [HarmonyPrefix]
+        public static bool OnCargoWithdrawPrefix(CargoCarrier __instance, GoPointer activatingPointer, int index, ref int __state)
+        {
+            __state = 0;
+            if (!Plugin.IsMultiplayer) return true;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return true;
+            if (index < 0 || index >= __instance.cargo.Count) return true; // let vanilla handle/no-op
+
+            if (Plugin.IsHost)
+            {
+                __state = __instance.cargo[index].GetComponent<SaveablePrefab>()?.instanceId ?? 0;
+                _hostWithdrawPrice = Mathf.RoundToInt(__instance.GetWithdrawPrice(index));
+                return true;
+            }
+
+            // Guest: mirror vanilla's money reject locally, then route
+            if (PlayerGold.currency[(int)__instance.currency] < Mathf.RoundToInt(__instance.GetWithdrawPrice(index)))
+            {
+                NotificationUi.instance.ShowNotification("Not enough money.");
+                return false;
+            }
+            ItemSyncManager.Instance?.RequestCargoWithdraw(__instance, index);
+            return false;
+        }
+
+        [HarmonyPatch(typeof(CargoCarrier), "WithdrawItem")]
+        [HarmonyPostfix]
+        public static void OnCargoWithdrawPostfix(CargoCarrier __instance, int index, int __state)
+        {
+            if (!Plugin.IsMultiplayer || !Plugin.IsHost || __state == 0) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+            // Vanilla removes the entry on success (held-item reject leaves it in place)
+            bool stillThere = false;
+            foreach (var c in __instance.cargo)
+                if (c != null && c.GetComponent<SaveablePrefab>()?.instanceId == __state) { stillThere = true; break; }
+            if (!stillThere)
+                ItemSyncManager.Instance?.BroadcastCargoWithdrawn(__instance, __state, _hostWithdrawPrice, Steamworks.SteamClient.SteamId);
+        }
+
+        // Withdraw price captured in the prefix (main-thread only; vanilla mutates the list before the
+        // postfix so it cannot be recomputed there). __state carries the item id.
+        private static int _hostWithdrawPrice;
 
         /// <summary>
         /// Verbose trading trace: logs when a shop item is clicked (OnAltActivate).

@@ -20,18 +20,62 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(PlayerNeeds), "LateUpdate")]
         public static class PlayerNeedsLateUpdatePatch
         {
+            // BED REST (v0.2.29): snapshot taken in the prefix while the local player is in bed but
+            // awake (waiting-for-crew window); the postfix restores the non-sleep vitals to the
+            // snapshot (freeze) and applies a capped slow sleep regen. Snapshot/restore instead of
+            // counter-adding vanilla's drain rates, so this cannot drift if those rates change, and a
+            // frozen stat can never cross 0 mid-update and PassOut.
+            private const float BedRestSleepCap = 60f;   // resting never gets you past 60/100 - real sleep keeps its role
+            private const float BedRestRegenPerSec = 2f; // 25% of real sleep's 8/s (both x timescale)
+
+            private static bool _resting;
+            private static float _preSleep, _preFood, _preWater, _preProtein, _preVitamins;
+
             [HarmonyPrefix]
             public static bool Prefix()
             {
+                _resting = false;
+
                 // GUEST FAINT: while a local faint is mid-blackout, suppress vanilla decay so stats
                 // can't be pushed back to 0 and re-fire PassOut during the fade (re-entrancy storm).
                 if (PlayerNeedsPassOutPatch.SuppressDecay) return false;
+
+                if (Plugin.IsMultiplayer && Plugin.BedRestConfig.Value
+                    && SleepSyncManager.Instance != null && SleepSyncManager.Instance.IsLocalPlayerRestingInBed)
+                {
+                    _resting = true;
+                    _preSleep = PlayerNeeds.sleep;
+                    _preFood = PlayerNeeds.food;
+                    _preWater = PlayerNeeds.water;
+                    _preProtein = PlayerNeeds.protein;
+                    _preVitamins = PlayerNeeds.vitamins;
+                }
 
                 // INDEPENDENT NEEDS: each player ticks their OWN needs decay (food/water/sleep).
                 // Previously the guest's LateUpdate was suppressed and stats were mirrored from the
                 // host. Now we ALWAYS run the vanilla LateUpdate so every client decays locally.
                 // (Sun.sun.timescale is synced, so both sides decay at the same rate.)
                 return true;
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix()
+            {
+                if (!_resting) return;
+                _resting = false;
+
+                // Freeze the non-sleep vitals (alcohol deliberately keeps draining - sobering up in bed is fine)
+                PlayerNeeds.food = _preFood;
+                PlayerNeeds.water = _preWater;
+                PlayerNeeds.protein = _preProtein;
+                PlayerNeeds.vitamins = _preVitamins;
+
+                // Cancel the awake sleep drain, then regen slowly up to the cap. Never reduce a value
+                // vanilla left higher (e.g. an eat/drink effect this same frame).
+                float s = UnityEngine.Mathf.Max(PlayerNeeds.sleep, _preSleep);
+                if (s < BedRestSleepCap)
+                    s = UnityEngine.Mathf.Min(s + UnityEngine.Time.deltaTime * Sun.sun.timescale * BedRestRegenPerSec, BedRestSleepCap);
+                PlayerNeeds.sleep = s;
             }
         }
 

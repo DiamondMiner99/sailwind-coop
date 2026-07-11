@@ -1197,11 +1197,18 @@ namespace SailwindCoop.Sync
             if (span <= limit + 2f) return; // inside the constraint - nothing to relax
 
             var dir = span > 0.05f ? delta / span : Vector3.down;
-            var relaxed = hawse + dir * Mathf.Max(limit - 1f, 0.5f);
+            // 70% of the limit, not limit-1 (v0.2.29): parking the body NEAR-taut let ordinary boat
+            // drift re-tauten the joint between control ticks, and vanilla's taut-release condition
+            // (Anchor.ExtraFixedUpdate, force > unsetResistance at <60 deg) fired on the guest one
+            // fixed frame after every remote set - half of the 0711 "ship spazzes out when anyone
+            // touches the anchor" ping-pong (the other half is the guest auto-transition block in
+            // ControlPatches). Real slack keeps joint force at zero so the local sim never fights.
+            float relaxedSpan = Mathf.Max(limit * 0.7f, 0.5f);
+            var relaxed = hawse + dir * relaxedSpan;
             anchor.transform.position = relaxed;
             rb.position = relaxed; // transform writes alone don't reliably move the physics pose
             VerboseLogger.ControlApply($"Anchor tether relaxed: span {span:F1}m > limit {limit:F1}m on '{boat.gameObject.name}'; " +
-                                       $"frozen anchor body pulled to {Mathf.Max(limit - 1f, 0.5f):F1}m to keep the local joint slack");
+                                       $"frozen anchor body pulled to {relaxedSpan:F1}m to keep the local joint slack");
         }
 
         public void OnRemoteAnchorChanged(AnchorEventPacket packet, SteamId sender = default)

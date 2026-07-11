@@ -40,6 +40,7 @@ namespace SailwindCoop.Patches
             // across scene reloads, accumulating one stale entry per push-col per rejoined co-op session.
             BoatPushStartDist.Clear();
             DockPushStartDist.Clear();
+            _anchorLastHeldTime.Clear();
         }
 
         // === BOAT PUSH / SAIL PUSH (guest -> host input) ===
@@ -306,12 +307,94 @@ namespace SailwindCoop.Patches
             return connected != null ? connected.GetComponent<SaveableObject>() : null;
         }
 
+        // ANCHOR AUTHORITY WAR (Jav1k 0711, v0.2.28): vanilla Anchor.ExtraFixedUpdate AUTO-releases a
+        // set anchor (taut joint at <60 deg, or winched below 8m) and AUTO-sets a loose one lying flat
+        // on ground - a purely local sim that BOTH machines run on a synced anchor. Each side's postfix
+        // then broadcast those automatic "corrections": guest applies host's set=True, its stale/taut
+        // local geometry auto-releases one fixed frame later and broadcasts set=False; host applies
+        // that, its anchor is genuinely grounded so it auto-sets and re-broadcasts set=True - a ~3s
+        // ping-pong that flips the guest anchor's kinematic state against a taut joint every cycle
+        // (ship "spazzing out, flipping, vibrating, diving" on the guest). Fix: the HOST is the anchor
+        // authority. On GUESTS, vanilla's automatic transitions are gated by KIND (adversarial-review
+        // refinement) so the ping-pong cannot survive even a hands-on window:
+        //   - RELEASE: allowed only while the anchor is CURRENTLY held (Anchor.cs `set && held ->
+        //     ReleaseAnchor`, a real manual pull-up). The taut-release and winch-release branches always
+        //     run with held==null, so this blocks the set=False half of the loop UNCONDITIONALLY.
+        //   - SET: allowed only if the anchor was held within the last few seconds - a guest's own
+        //     physical drop grounds+sets a frame or two after it leaves the hand, so the recent-hold
+        //     stamp (taken in the scope prefix while held!=null) covers that legit ground-set.
+        // Rope winching needs no exception: the winch drives rope length, which streams to the host,
+        // whose own auto logic performs the release/set authoritatively and broadcasts it back.
+        private static bool _inAnchorAutoUpdate;
+        private static readonly System.Collections.Generic.Dictionary<int, float> _anchorLastHeldTime
+            = new System.Collections.Generic.Dictionary<int, float>();
+        private const float AnchorLocalInteractionWindow = 10f;
+
+        private static bool AnchorRecentlyHeldLocally(Anchor anchor)
+        {
+            if (anchor.held != null) return true;
+            return _anchorLastHeldTime.TryGetValue(anchor.GetInstanceID(), out var t)
+                   && UnityEngine.Time.time - t < AnchorLocalInteractionWindow;
+        }
+
+        /// <summary>True = let vanilla run; false = block a guest-side automatic transition.
+        /// isRelease distinguishes the two vanilla calls: a release is host-authoritative unless the
+        /// guest is literally holding the anchor; a set is allowed briefly after a local hold (drop).</summary>
+        private static bool AllowAnchorTransition(Anchor __instance, bool isRelease)
+        {
+            if (!Plugin.IsMultiplayer || Plugin.IsHost) return true;               // host sim is authoritative
+            if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return true; // host-sent state applies freely
+            if (!_inAnchorAutoUpdate) return true;                                  // manual/load paths untouched
+
+            if (isRelease)
+            {
+                // Only a hands-on pull-up may release + broadcast; every automatic release is the host's call.
+                if (__instance.held != null) return true;
+            }
+            else if (AnchorRecentlyHeldLocally(__instance))
+            {
+                return true; // the guest's own drop grounding into a set
+            }
+
+            VerboseLogger.ControlLocal($"Blocked guest auto anchor {(isRelease ? "release" : "set")} (host-authoritative)");
+            return false;
+        }
+
+        [HarmonyPatch(typeof(Anchor), "ExtraFixedUpdate")]
+        public static class AnchorAutoUpdateScopePatch
+        {
+            [HarmonyPrefix]
+            public static void Prefix(Anchor __instance)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                if (__instance.held != null)
+                    _anchorLastHeldTime[__instance.GetInstanceID()] = UnityEngine.Time.time;
+                _inAnchorAutoUpdate = true;
+            }
+
+            // Finalizer, not postfix: the flag must clear even if vanilla throws mid-update,
+            // or every later manual transition would be misclassified as auto.
+            [HarmonyFinalizer]
+            public static void Finalizer()
+            {
+                _inAnchorAutoUpdate = false;
+            }
+        }
+
         [HarmonyPatch(typeof(Anchor), "SetAnchor")]
         public static class AnchorSetPatch
         {
-            [HarmonyPostfix]
-            public static void Postfix(Anchor __instance)
+            [HarmonyPrefix]
+            public static bool Prefix(Anchor __instance, ref bool __state)
             {
+                __state = AllowAnchorTransition(__instance, isRelease: false);
+                return __state;
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix(Anchor __instance, bool __state)
+            {
+                if (!__state) return; // transition was blocked - vanilla did not run, nothing to broadcast
                 if (!Plugin.IsMultiplayer) return;
                 // Prevent feedback loop when applying remote state
                 if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return;
@@ -339,9 +422,17 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(Anchor), "ReleaseAnchor")]
         public static class AnchorReleasePatch
         {
-            [HarmonyPostfix]
-            public static void Postfix(Anchor __instance)
+            [HarmonyPrefix]
+            public static bool Prefix(Anchor __instance, ref bool __state)
             {
+                __state = AllowAnchorTransition(__instance, isRelease: true);
+                return __state;
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix(Anchor __instance, bool __state)
+            {
+                if (!__state) return; // transition was blocked - vanilla did not run, nothing to broadcast
                 if (!Plugin.IsMultiplayer) return;
                 // Prevent feedback loop when applying remote state
                 if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return;

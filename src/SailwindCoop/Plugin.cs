@@ -27,8 +27,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.28 build (version handshake + Jav1k 0710 batch); shows as 0.2.28.
-        public const string PluginVersion = "0.2.28";
+        // load. This is the v0.2.29 build (boat stream-out destroy-broadcast hotfix); shows as 0.2.29.
+        public const string PluginVersion = "0.2.29";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -37,6 +37,7 @@ namespace SailwindCoop
         // SteamLobbyManager.MaxPlayers, which feeds Steam's lobby max-members argument.
         public static ConfigEntry<int> MaxPlayersConfig { get; private set; }
         public static ConfigEntry<bool> AllowCrewInvitesConfig { get; private set; }
+        public static ConfigEntry<bool> BedRestConfig { get; private set; }
         // Crew spending feed (UI.TradeFeed): receiver-side gates - turning them down/off changes only
         // THIS machine's feed lines and quiet coin cue, never what the host broadcasts.
         public static ConfigEntry<bool> SpendingFeedConfig { get; private set; }
@@ -251,6 +252,9 @@ namespace SailwindCoop
             CrewMemberWeightConfig = Config.Bind("Coop", "CrewMemberWeightKg", 90f,
                 new ConfigDescription("Weight (kg) each REMOTE crew member adds to the boat they stand on. Vanilla models every person (the host too) at 160, so several people crowding one side of a small hull pile up a big tipping moment and can flip it. Lower this to reduce that heel/flip. HOST-ONLY: only the host computes crew weight (clients just receive the resulting boat motion), so only the host's value matters - safe to tune live mid-session.",
                     new AcceptableValueRange<float>(0f, 200f)));
+
+            BedRestConfig = Config.Bind("Coop", "BedRest", true,
+                "Lying in a bed while AWAKE (e.g. waiting for the rest of the crew, or just going AFK) slowly restores sleep up to 60/100 and freezes hunger/thirst/protein/vitamin drain. Real crew sleep is still the only way to rest fully. Per-player and local-only - each machine applies its own value.");
 
             AllowVersionMismatchConfig = Config.Bind("Coop", "AllowVersionMismatch", false,
                 "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it.");
@@ -1250,6 +1254,31 @@ namespace SailwindCoop
                 ItemSyncManager?.OnRemoteItemResync(packet);
             });
 
+            // Cargo transport hire (v0.2.29): host-routed carrier transactions
+            NetworkManager.RegisterHandler(PacketType.CargoInsertRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCargoInsertRequest(reader);
+                ItemSyncManager?.OnRemoteCargoInsertRequest(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.CargoInserted, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCargoInserted(reader);
+                ItemSyncManager?.OnRemoteCargoInserted(packet);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.CargoWithdrawRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCargoWithdrawRequest(reader);
+                ItemSyncManager?.OnRemoteCargoWithdrawRequest(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.CargoWithdrawn, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCargoWithdrawn(reader);
+                ItemSyncManager?.OnRemoteCargoWithdrawn(packet);
+            });
+
             // Sleep sync packets
             NetworkManager.RegisterHandler(PacketType.SleepRequest, (sender, reader) =>
             {
@@ -1559,6 +1588,9 @@ namespace SailwindCoop
                 // The hung-lantern joint is not persisted or in the snapshot either; replay hung state AFTER
                 // the nailed resync so the hook is on-wall before the lantern re-hangs (issue #4).
                 ItemSyncManager?.ResyncHungStateTo(sender);
+                // Carrier cargo arrives in the snapshot as plain world items; tuck it back into the
+                // port cargo carriers (v0.2.29 cargo transport sync).
+                ItemSyncManager?.ResyncCargoCarriersTo(sender);
             });
 
             // Ping loop (F8 overlay diagnostics). Both legs are UNRELIABLE on purpose: the number

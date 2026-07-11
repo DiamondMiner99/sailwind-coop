@@ -1684,6 +1684,74 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteCargoInsertRequest(BinaryWriter writer, CargoInsertRequestPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+            writer.Write(packet.ItemInstanceId);
+        }
+
+        public static CargoInsertRequestPacket ReadCargoInsertRequest(BinaryReader reader)
+        {
+            return new CargoInsertRequestPacket
+            {
+                PortIndex = reader.ReadInt32(),
+                ItemInstanceId = reader.ReadInt32()
+            };
+        }
+
+        public static void WriteCargoInserted(BinaryWriter writer, CargoInsertedPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.Price);
+            writer.Write(packet.RequesterSteamId);
+        }
+
+        public static CargoInsertedPacket ReadCargoInserted(BinaryReader reader)
+        {
+            return new CargoInsertedPacket
+            {
+                PortIndex = reader.ReadInt32(),
+                ItemInstanceId = reader.ReadInt32(),
+                Price = reader.ReadInt32(),
+                RequesterSteamId = reader.ReadUInt64()
+            };
+        }
+
+        public static void WriteCargoWithdrawRequest(BinaryWriter writer, CargoWithdrawRequestPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+            writer.Write(packet.ItemInstanceId);
+        }
+
+        public static CargoWithdrawRequestPacket ReadCargoWithdrawRequest(BinaryReader reader)
+        {
+            return new CargoWithdrawRequestPacket
+            {
+                PortIndex = reader.ReadInt32(),
+                ItemInstanceId = reader.ReadInt32()
+            };
+        }
+
+        public static void WriteCargoWithdrawn(BinaryWriter writer, CargoWithdrawnPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.Price);
+            writer.Write(packet.RequesterSteamId);
+        }
+
+        public static CargoWithdrawnPacket ReadCargoWithdrawn(BinaryReader reader)
+        {
+            return new CargoWithdrawnPacket
+            {
+                PortIndex = reader.ReadInt32(),
+                ItemInstanceId = reader.ReadInt32(),
+                Price = reader.ReadInt32(),
+                RequesterSteamId = reader.ReadUInt64()
+            };
+        }
+
         public static void WriteItemResync(BinaryWriter writer, ItemResyncPacket packet)
         {
             writer.Write(packet.InstanceId);

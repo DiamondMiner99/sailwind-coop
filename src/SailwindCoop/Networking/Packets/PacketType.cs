@@ -226,5 +226,16 @@ namespace SailwindCoop.Networking.Packets
         // peers freeze the boat in place (kinematic) and suppress transform sync + impact damage briefly
         // on release. v0.2.28 is already wire-breaking (version handshake), so all peers have this type.
         ShipyardState = 210,             // Editing peer -> all (reliable): boat admitted to / discharged from a shipyard cradle; host relays
+
+        // Cargo transport hire sync (211-214, v0.2.29): vanilla CargoCarrier.InsertItem/WithdrawItem are
+        // purely local (local wallet deduct + local cargo list + item scaled to zero), so a guest using
+        // the transport dude paid a phantom fee, the crates stayed in the world for everyone else, and
+        // withdrawing the guest-only carrier copies collided with the host's world copies. Host-routed
+        // like shop trades: guests request, the host performs the transaction against the shared wallet
+        // (CurrencySync propagates the charge) and broadcasts the applied result. Additive wire.
+        CargoInsertRequest = 211,        // Guest -> host: put this world item into this port's cargo carrier
+        CargoInserted = 212,             // Host -> all: item entered a carrier (apply locally, no payment; requester plays money UX)
+        CargoWithdrawRequest = 213,      // Guest -> host: take this item out of this port's cargo carrier
+        CargoWithdrawn = 214,            // Host -> all: item left a carrier (apply locally; requester picks it up + plays money UX)
     }
 }

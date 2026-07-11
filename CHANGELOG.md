@@ -14,6 +14,47 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.29 - 2026-07-11
+
+> Fixes both 2026-07-11 reports (thanks Jav1k!): crate contents being permanently destroyed
+> for the whole crew, and the cargo transport hire desyncing everything a guest shipped.
+> New packet types are additive, but the v0.2.28 version handshake refuses mixed versions
+> anyway - everyone updates as usual.
+
+### Added
+- **Bed rest.** Lying in a bed while awake (waiting for the crew, or just going AFK) now
+  slowly restores sleep up to 60/100 and freezes hunger/thirst/protein/vitamin drain, so
+  an AFK host no longer passes out in bed. Real crew sleep is still the only way to rest
+  fully. Per-player and local; toggle with `Coop.BedRest` (default on).
+- **Cargo transport hire now works for guests.** It was completely unsynced: a guest
+  loading cargo onto the cart paid a phantom fee (the shared wallet never saw it), the
+  crates stayed in the world for everyone else, withdrawing the guest-only copies made
+  them instantly vanish, and a duplicated mission crate could stop being accepted by the
+  trader. Carrier transactions are now host-routed like shop trades: the host validates
+  and charges the shared wallet, everyone's view of the cart updates, and rejoining
+  players get the cart inventory replayed after the join snapshot.
+
+### Fixed
+- **Touching the anchor made the ship "go completely wild" (flipping, vibrations, diving)
+  on the other player's screen.** The base game's local anchor simulation auto-releases a
+  taut anchor and auto-sets a grounded one - and both machines ran it on the same synced
+  anchor, each broadcasting its own "correction": the guest's stale anchor geometry kept
+  releasing what the host kept re-setting, ~every 3 seconds, flipping the anchor's physics
+  state against a taut rope each cycle. The host is now the anchor authority: a guest's
+  automatic anchor transitions are blocked (their own hands-on anchor handling still works
+  and still syncs), and the v0.2.27 tether relax now parks the anchor with real slack
+  instead of near-taut, so the guest's simulation has nothing to fight.
+- **Crates went empty / items on a boat were permanently destroyed for everyone, host
+  included.** The base game silently despawns every item on a boat when that boat drifts
+  past the horizon (it caches them and respawns them when you sail back - a purely local
+  level-of-detail trick). The mod was broadcasting each of those despawns as a real
+  "item destroyed" event, so the moment ONE player got far enough from a boat, its deck
+  items and crate contents were deleted for the whole crew - and then from the host's
+  save. Both sides are fixed: the stream-out despawn is no longer broadcast, and the
+  stream-in respawn no longer re-broadcasts each crate item as a fresh insert (which
+  had been shredding peers' crate inventories into the "looks empty but a slot still
+  works" state).
+
 ## v0.2.28 - 2026-07-10
 
 > **All players must update.** The network format changed (new shipyard packet + boat sync

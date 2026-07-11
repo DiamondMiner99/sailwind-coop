@@ -4221,6 +4221,283 @@ namespace SailwindCoop.Sync
 
         #endregion
 
+        #region Cargo Transport Hire (v0.2.29)
+
+        // While the host applies a guest's CargoInsertRequest via vanilla InsertItem, the insert
+        // postfix fires exactly as for a host-local insert; this override keeps the requester
+        // attribution so the money UX targets the paying guest instead of the host.
+        private SteamId? _cargoInsertRequester;
+
+        private static CargoCarrier FindCargoCarrier(int portIndex)
+        {
+            var arr = CargoCarrier.carriers;
+            if (arr == null || portIndex < 0 || portIndex >= arr.Length) return null;
+            return arr[portIndex];
+        }
+
+        /// <summary>Guest -> host: route a cargo carrier insert (called from the InsertItem prefix).</summary>
+        public void RequestCargoInsert(CargoCarrier carrier, ShipItem item)
+        {
+            var prefab = item != null ? item.GetComponent<SaveablePrefab>() : null;
+            if (carrier == null || prefab == null) return;
+
+            var packet = new CargoInsertRequestPacket { PortIndex = carrier.portIndex, ItemInstanceId = prefab.instanceId };
+            VerboseLogger.ItemSend($"CargoInsertRequest, port={packet.PortIndex}, item={packet.ItemInstanceId}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.CargoInsertRequest, w =>
+                PacketSerializer.WriteCargoInsertRequest(w, packet));
+        }
+
+        /// <summary>Guest -> host: route a cargo carrier withdraw (called from the WithdrawItem prefix).</summary>
+        public void RequestCargoWithdraw(CargoCarrier carrier, int index)
+        {
+            if (carrier == null || carrier.cargo == null || index < 0 || index >= carrier.cargo.Count) return;
+            var prefab = carrier.cargo[index] != null ? carrier.cargo[index].GetComponent<SaveablePrefab>() : null;
+            if (prefab == null) return;
+
+            var packet = new CargoWithdrawRequestPacket { PortIndex = carrier.portIndex, ItemInstanceId = prefab.instanceId };
+            VerboseLogger.ItemSend($"CargoWithdrawRequest, port={packet.PortIndex}, item={packet.ItemInstanceId}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.CargoWithdrawRequest, w =>
+                PacketSerializer.WriteCargoWithdrawRequest(w, packet));
+        }
+
+        /// <summary>Host: broadcast an applied insert (called from the InsertItem postfix).</summary>
+        public void BroadcastCargoInserted(CargoCarrier carrier, ShipItem item)
+        {
+            var prefab = item.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+
+            var packet = new CargoInsertedPacket
+            {
+                PortIndex = carrier.portIndex,
+                ItemInstanceId = prefab.instanceId,
+                // GetTransportPrice depends only on item mass, unchanged by the insert - recomputing
+                // here equals what vanilla just charged.
+                Price = carrier.GetTransportPrice(item),
+                RequesterSteamId = _cargoInsertRequester ?? SteamClient.SteamId
+            };
+            VerboseLogger.ItemSend($"CargoInserted, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}, requester={packet.RequesterSteamId}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.CargoInserted, w =>
+                PacketSerializer.WriteCargoInserted(w, packet));
+        }
+
+        /// <summary>Host: broadcast an applied withdraw.</summary>
+        public void BroadcastCargoWithdrawn(CargoCarrier carrier, int itemInstanceId, int price, SteamId requester)
+        {
+            var packet = new CargoWithdrawnPacket
+            {
+                PortIndex = carrier.portIndex,
+                ItemInstanceId = itemInstanceId,
+                Price = price,
+                RequesterSteamId = requester
+            };
+            VerboseLogger.ItemSend($"CargoWithdrawn, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}, requester={packet.RequesterSteamId}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.CargoWithdrawn, w =>
+                PacketSerializer.WriteCargoWithdrawn(w, packet));
+        }
+
+        /// <summary>Host: a guest asked to put an item into a carrier. Vanilla InsertItem validates the
+        /// shared wallet + performs the transaction; the insert postfix broadcasts on success.</summary>
+        public void OnRemoteCargoInsertRequest(CargoInsertRequestPacket packet, SteamId sender)
+        {
+            if (!Plugin.IsHost) return;
+            VerboseLogger.ItemRecv($"CargoInsertRequest, port={packet.PortIndex}, item={packet.ItemInstanceId}, from={sender}");
+
+            var carrier = FindCargoCarrier(packet.PortIndex);
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (carrier == null || item == null)
+            {
+                Plugin.Log.LogWarning($"CargoInsertRequest: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found");
+                return;
+            }
+            if (carrier.cargo != null && carrier.cargo.Contains(item)) return; // duplicate request
+
+            _cargoInsertRequester = sender;
+            try
+            {
+                carrier.InsertItem(item);
+            }
+            finally
+            {
+                _cargoInsertRequester = null;
+            }
+        }
+
+        /// <summary>Host: a guest asked to take an item out of a carrier. Mirrors vanilla WithdrawItem
+        /// minus the pointer pickup (the requester picks it up on the CargoWithdrawn apply).</summary>
+        public void OnRemoteCargoWithdrawRequest(CargoWithdrawRequestPacket packet, SteamId sender)
+        {
+            if (!Plugin.IsHost) return;
+            VerboseLogger.ItemRecv($"CargoWithdrawRequest, port={packet.PortIndex}, item={packet.ItemInstanceId}, from={sender}");
+
+            var carrier = FindCargoCarrier(packet.PortIndex);
+            if (carrier == null || carrier.cargo == null)
+            {
+                Plugin.Log.LogWarning($"CargoWithdrawRequest: carrier {packet.PortIndex} not found");
+                return;
+            }
+            int index = -1;
+            for (int i = 0; i < carrier.cargo.Count; i++)
+            {
+                if (carrier.cargo[i] != null && carrier.cargo[i].GetComponent<SaveablePrefab>()?.instanceId == packet.ItemInstanceId)
+                {
+                    index = i;
+                    break;
+                }
+            }
+            if (index < 0)
+            {
+                Plugin.Log.LogWarning($"CargoWithdrawRequest: item {packet.ItemInstanceId} not in carrier {packet.PortIndex}");
+                return;
+            }
+
+            int price = Mathf.RoundToInt(carrier.GetWithdrawPrice(index));
+            if (PlayerGold.currency[(int)carrier.currency] < price)
+            {
+                // The requester's local wallet mirror passed the same check, so it was stale -
+                // re-assert the authoritative wallet to that guest and drop the request.
+                EconomySyncManager.Instance?.ResyncCurrencyTo(sender);
+                return;
+            }
+            if (price > 0)
+            {
+                PlayerGold.currency[(int)carrier.currency] -= price;
+                DayLogs.instance.dayLogs[(int)carrier.currency].LogTransaction(-price, TransactionCategory.other);
+            }
+
+            var item = carrier.cargo[index];
+            ApplyCargoWithdrawLocal(carrier, item);
+            BroadcastCargoWithdrawn(carrier, packet.ItemInstanceId, price, sender);
+        }
+
+        /// <summary>All peers: apply an insert the host performed. Requester additionally plays the
+        /// vanilla money/deposit UX (its own vanilla call was cancelled in the prefix).</summary>
+        public void OnRemoteCargoInserted(CargoInsertedPacket packet)
+        {
+            VerboseLogger.ItemRecv($"CargoInserted, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}");
+
+            var carrier = FindCargoCarrier(packet.PortIndex);
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (carrier == null || item == null)
+            {
+                Plugin.Log.LogWarning($"CargoInserted: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found");
+                return;
+            }
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                if (carrier.cargo == null || !carrier.cargo.Contains(item))
+                {
+                    carrier.LoadSavedItem(item); // EnterInventorySlot + InsertIntoCargoCarrier + scale zero + cargo.Add
+                    item.daysInStorage = 0;
+                }
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+
+            if (packet.RequesterSteamId == (ulong)SteamClient.SteamId)
+            {
+                if (packet.Price > 0)
+                {
+                    UISoundPlayer.instance?.PlayGoldSound();
+                    MoneyNotification.instance?.PlayNotif(-packet.Price, (int)carrier.currency);
+                }
+                UISoundPlayer.instance?.PlayUISound(UISounds.itemInventoryIn, 1f, 0.66f);
+                if (!GameState.unloadedCargoFromCart)
+                    NotificationUi.instance?.ShowNotification("Open your inventory to\nretrieve cargo from the cart.", 5f);
+                GameState.loadedCargoIntoCart = true;
+            }
+        }
+
+        /// <summary>All peers: apply a withdraw the host performed. The requester picks the item up
+        /// into their hand (which re-enters the normal pickup sync) and plays the vanilla UX.</summary>
+        public void OnRemoteCargoWithdrawn(CargoWithdrawnPacket packet)
+        {
+            VerboseLogger.ItemRecv($"CargoWithdrawn, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}");
+
+            var carrier = FindCargoCarrier(packet.PortIndex);
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (carrier == null || item == null)
+            {
+                Plugin.Log.LogWarning($"CargoWithdrawn: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found");
+                return;
+            }
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                if (carrier.cargo != null && carrier.cargo.Contains(item))
+                    ApplyCargoWithdrawLocal(carrier, item);
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+
+            if (packet.RequesterSteamId == (ulong)SteamClient.SteamId)
+            {
+                if (packet.Price > 0)
+                {
+                    UISoundPlayer.instance?.PlayGoldSound();
+                    MoneyNotification.instance?.PlayNotif(-packet.Price, (int)carrier.currency);
+                }
+                var pointer = Object.FindObjectOfType<GoPointer>();
+                if (pointer != null && pointer.GetHeldItem() == null)
+                    pointer.PickUpItem(item); // IsApplyingRemoteState is false again: the pickup broadcasts normally, as desired
+                PlayerNeedsUI.instance?.CloseNeedsUI();
+                UISoundPlayer.instance?.PlayUISound(UISounds.itemInventoryOut, 1f, 0.6f);
+                CargoStorageUI.instance?.EnableLoadingMode();
+                GameState.unloadedCargoFromCart = true;
+            }
+        }
+
+        /// <summary>Vanilla WithdrawItem minus the pointer pickup (usable for a remote requester).</summary>
+        private static void ApplyCargoWithdrawLocal(CargoCarrier carrier, ShipItem item)
+        {
+            item.daysInStorage = 0;
+            item.WithdrawFromCarrier();
+            item.transform.Translate(carrier.transform.forward * 10f, Space.World);
+            item.GetItemRigidbody().transform.Translate(carrier.transform.forward * 10f, Space.World);
+            item.GetItemRigidbody().ExitInventorySlot();
+            item.transform.localScale = Vector3.one;
+            carrier.cargo.Remove(item);
+        }
+
+        /// <summary>Host -> one joiner: replay carrier inventories (the join snapshot ships carrier
+        /// items as plain world items; this tucks them back into their carriers). Price=0 and a zero
+        /// requester id keep the apply silent.</summary>
+        public void ResyncCargoCarriersTo(SteamId target)
+        {
+            if (!Plugin.IsHost || CargoCarrier.carriers == null) return;
+
+            int sent = 0;
+            foreach (var carrier in CargoCarrier.carriers)
+            {
+                if (carrier == null || carrier.cargo == null) continue;
+                foreach (var item in carrier.cargo)
+                {
+                    var prefab = item != null ? item.GetComponent<SaveablePrefab>() : null;
+                    if (prefab == null) continue;
+                    var packet = new CargoInsertedPacket
+                    {
+                        PortIndex = carrier.portIndex,
+                        ItemInstanceId = prefab.instanceId,
+                        Price = 0,
+                        RequesterSteamId = 0
+                    };
+                    Plugin.NetworkManager.SendReliable(target, PacketType.CargoInserted, w =>
+                        PacketSerializer.WriteCargoInserted(w, packet));
+                    sent++;
+                }
+            }
+            if (sent > 0)
+                VerboseLogger.ItemSend($"CargoCarrier resync to {target}: {sent} items");
+        }
+
+        #endregion
+
         #region Crate Unsealing
 
         /// <summary>
