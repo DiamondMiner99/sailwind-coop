@@ -1397,7 +1397,11 @@ namespace SailwindCoop.Sync
                     // must gain an explicit suppression (review finding).
                     var pointer = rope.held;
                     pointer.DropItem();
-                    rope.ResetRopePos();
+                    // Parent-safe hanger restore (bare ResetRopePos() writes LOCAL position - on a
+                    // detached parent==null rope that is a WORLD-space write near the origin). The helper
+                    // re-parents first and clears the was-moored save flag; a held rope is never moored
+                    // (vanilla OnPickup unmoors), so the helper's IsMoored bail can't skip this reset.
+                    BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} force-release ({packet.BoatName})");
                     VerboseLogger.ControlApply($"Force-released locally-held rope {packet.RopeIndex} (remote mooring state wins)");
                     Plugin.Notify("Mooring rope taken by a crewmate");
                 }
@@ -1478,27 +1482,21 @@ namespace SailwindCoop.Sync
                 }
                 else
                 {
-                    var ropeTraverse = Traverse.Create(rope);
-
-                    // Get initial transform values for returning rope to boat
-                    var initialParent = ropeTraverse.Field("initialParent").GetValue<Transform>();
-                    var initialPos = ropeTraverse.Field("initialPos").GetValue<Vector3>();
-                    var initialRot = ropeTraverse.Field("initialRot").GetValue<Quaternion>();
-
                     // Call Unmoor() - this disconnects the SpringJoint (but doesn't destroy it!)
-                    // and re-parents rope to initialParent
+                    // and re-parents rope to initialParent. It NO-OPS entirely (no re-parent) on an
+                    // already-unmoored rope - and a rope in the detached was-moored save-restore state
+                    // has parent==null, so a bare localPosition write here would be a WORLD-space write
+                    // hurling the rope to hanger-local coords near the world origin ("ropes gone from
+                    // both the poles and the storage", Robin 0711).
                     rope.Unmoor();
 
-                    // Unmoor() re-parents to initialParent but doesn't reset local position/rotation
-                    // Force the rope back to its hanger position
-                    if (initialParent != null)
-                    {
-                        rope.transform.localPosition = initialPos;
-                        rope.transform.localRotation = initialRot;
-                    }
+                    // Parent-safe hanger restore: re-parents a detached rope first, resets local pos/rot,
+                    // and clears the was-moored save flag so the detached state can't re-persist into the
+                    // next save (vanilla Unmoor only clears it when a spring actually existed).
+                    BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
 
                     // Force RopeEffect to update
-                    var ropeEffect = ropeTraverse.Field("rope").GetValue<RopeEffect>();
+                    var ropeEffect = Traverse.Create(rope).Field("rope").GetValue<RopeEffect>();
                     if (ropeEffect != null)
                     {
                         ropeEffect.enabled = false;

@@ -467,6 +467,18 @@ namespace SailwindCoop.Patches
             {
                 if (!Plugin.IsMultiplayer) return;
 
+                // PHANTOM-LOAD GATE (Robin 0711, "host loses mooring ropes when loading in"): a joining
+                // guest's own phantom save restores a was-moored rope detached at the cleat, and vanilla's
+                // OnTriggerEnter re-moors it DURING the load - a purely local, pre-authoritative event.
+                // Broadcasting it sent the guest's phantom moor (with a mid-load floating-origin dockPos)
+                // to the host as if it were a player action. The host's join snapshot is the sole authority
+                // for mooring state; nothing from the phantom world may be broadcast. The third clause
+                // covers the connected-but-pre-snapshot gap: SuppressLoadErrors clears right after
+                // JoinLobby, but until the host's BoatWorldState arrives this guest's world is still its
+                // own phantom (HasReceivedWorldState is guest-only, false until the first snapshot).
+                if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                    || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+
                 bool isApplying = ControlSyncManager.Instance?.IsApplyingRemoteState == true;
                 bool wasRecent = ControlSyncManager.Instance?.WasRecentlyChangedByNetwork(__instance) == true;
 
@@ -502,12 +514,33 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(PickupableBoatMooringRope), "Unmoor")]
         public static class MooringDetachPatch
         {
-            [HarmonyPostfix]
-            public static void Postfix(PickupableBoatMooringRope __instance)
+            // Vanilla Unmoor() is a silent NO-OP when the rope has no spring (mooredToSpring == null),
+            // but a Harmony postfix fires regardless. Vanilla calls Unmoor() speculatively on ropes that
+            // are NOT moored - BoatMooringRopes.UnmoorAllRopes() inside SaveableObject.Load for EVERY
+            // boat, plus Recovery and Shipyard paths - and any of those firing on a connected peer
+            // broadcast an authoritative "unmoor rope N" that cut a perfectly real moor on every OTHER
+            // machine (Robin 0711: ropes gone for host on load, client still moored, boat tug-of-war
+            // until the client released). Only broadcast a transition that actually happened:
+            // moored -> unmoored.
+            [HarmonyPrefix]
+            public static void Prefix(PickupableBoatMooringRope __instance, out bool __state)
             {
-                VerboseLogger.ControlLocal($"Unmoor PATCH FIRED, rope={__instance?.name}, isMP={Plugin.IsMultiplayer}");
+                __state = __instance != null && __instance.IsMoored();
+            }
 
+            [HarmonyPostfix]
+            public static void Postfix(PickupableBoatMooringRope __instance, bool __state)
+            {
+                VerboseLogger.ControlLocal($"Unmoor PATCH FIRED, rope={__instance?.name}, isMP={Plugin.IsMultiplayer}, wasMoored={__state}");
+
+                if (!__state) return; // no-op Unmoor on an already-unmoored rope: nothing to sync
                 if (!Plugin.IsMultiplayer) return;
+
+                // PHANTOM-LOAD GATE: same reasoning as MooringAttachPatch - nothing that happens to the
+                // guest's phantom world during a title-join load/apply (or before the first host
+                // snapshot arrives) may be broadcast as authoritative.
+                if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                    || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
 
                 bool isApplying = ControlSyncManager.Instance?.IsApplyingRemoteState == true;
                 bool wasRecent = ControlSyncManager.Instance?.WasRecentlyChangedByNetwork(__instance) == true;

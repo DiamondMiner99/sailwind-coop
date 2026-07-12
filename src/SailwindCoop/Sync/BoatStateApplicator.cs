@@ -472,11 +472,21 @@ namespace SailwindCoop.Sync
 
             try
             {
-                // 0. Unmoor dock ropes first (must happen before moving boat)
+                // 0. Unmoor dock ropes first (must happen before moving boat).
+                // NOT vanilla UnmoorAllRopes(): that calls ResetRopePos() (a LOCAL-space write) on every
+                // rope, and a phantom-save rope still in the detached was-moored restore state
+                // (parent==null, OnTriggerEnter re-moor not yet fired) would be hurled to hanger-local
+                // coords in WORLD space near the origin. Unmoor + parent-safe stow instead (also clears
+                // the was-moored save flag so the state can't re-persist).
                 var mooringRopes = boat.GetComponent<BoatMooringRopes>();
-                if (mooringRopes != null)
+                if (mooringRopes != null && mooringRopes.ropes != null)
                 {
-                    mooringRopes.UnmoorAllRopes();
+                    foreach (var mrope in mooringRopes.ropes)
+                    {
+                        if (mrope == null) continue;
+                        mrope.Unmoor();
+                        StowRopeIfDisplaced(mrope, $"PhaseA unmoor ({data.Name})");
+                    }
                     Plugin.Log.LogDebug($"Unmoored dock ropes from {data.Name}");
                 }
 
@@ -1812,7 +1822,11 @@ namespace SailwindCoop.Sync
                 }
                 else
                 {
-                    Plugin.Log.LogInfo($"  Rope {i}: Not moored in data, skipping");
+                    // Host says unmoored. Don't just skip: this rope may sit in the detached was-moored
+                    // phantom-restore state (parent==null, off-hanger) - restow it parent-safely so the
+                    // guest can't be left with a rope that exists but is nowhere findable.
+                    Plugin.Log.LogInfo($"  Rope {i}: Not moored in data; ensuring stowed");
+                    StowRopeIfDisplaced(rope, $"Rope {i} (unmoored in snapshot)");
                 }
             }
         }

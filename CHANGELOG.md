@@ -14,6 +14,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.30 - 2026-07-12
+
+> Fixes the 2026-07-12 report (thanks Robin!): the host "losing" the mooring ropes when
+> loading in with a ship moored - gone from the poles and the on-ship storage - while the
+> client still saw the ship moored and it flew back and forth between the two positions
+> until the client released the ropes. No network format change, but the version handshake
+> refuses mixed versions - everyone updates as usual.
+
+### Fixed
+- **Host no longer loses its mooring ropes when the crew loads in moored.** Three-part fix:
+  - The game calls "unmoor" speculatively in several places (loading a save unmoors every
+    rope of every boat; boat recovery and the shipyard do it too), including on ropes that
+    are not moored - where it silently does nothing. The mod broadcast every one of those
+    no-ops as a real "crewmate unmoored rope N", which could quietly cut a real mooring on
+    every other machine in the crew. Only actual moored-to-unmoored transitions are
+    broadcast now.
+  - Nothing a joining client's game does to its own placeholder world while it loads and
+    syncs is broadcast anymore. Its moor/unmoor events were being sent to the host as if a
+    player did them; the host's state is the only authority during a join.
+  - When a remote unmoor was applied to a rope that was detached (the just-loaded state),
+    the "put the rope back on its hanger" step could teleport the rope to a spot in the
+    ocean near the world origin instead - a rope that exists but is nowhere anyone can see
+    or reach, which is exactly "gone from both the poles and the storage". The rope is now
+    always re-attached to its hanger first. This also explains why the client releasing the
+    ropes brought them back: that forced a second, correctly-parented hanger reset.
+
 ## v0.2.29 - 2026-07-11
 
 > Fixes both 2026-07-11 reports (thanks Jav1k!): crate contents being permanently destroyed
