@@ -234,6 +234,10 @@ namespace SailwindCoop.Networking
                 lobby.SetPrivate();
                 lobby.SetData("name", $"{SteamClient.Name}'s Sailwind Voyage");
                 lobby.SetData("version", Plugin.PluginVersion);
+                // (v0.2.31) Mod-set signature (currently: Shipyard Expansion presence + version).
+                // Guests pre-check this BEFORE opening P2P, exactly like the version stamp above.
+                // Opaque token - compare for equality, never parse it.
+                lobby.SetData("mods", SailwindCoop.Compat.SECompat.ModSignature);
                 lobby.SetJoinable(true);
 
                 _hostSentInvites.Clear();

@@ -7,7 +7,7 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.2.30-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-v0.2.31-blue)](../../releases)
 [![game](https://img.shields.io/badge/Sailwind-v0.38-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -60,6 +60,21 @@ See **[CHANGELOG.md](CHANGELOG.md)** for the full version history.
 - **Crew sleep:** bunk down together or rent one shared tavern room; the crew auto-wakes once *everyone* is rested.
 - **Live menus:** when any crewmate trades or takes a mission, everyone's open trade/mission screen refreshes instead of going stale.
 - **Save-safe for guests:** co-op progress is written to a separate co-op session save; a guest's own solo saves are never touched.
+
+## Compatibility
+
+### Shipyard Expansion (v0.2.31+)
+
+Works alongside nandbrew's **Shipyard Expansion**: custom rigs (extra masts, and resized,
+rotated, flipped, or retextured sails) sync to the whole crew, both when a guest joins and
+live while someone is editing at a shipyard.
+
+The requirement is the same as for the mod itself: either every player has the same Shipyard
+Expansion version installed, or nobody does. A crew with mismatched Shipyard Expansion
+installs is refused at join, with a message naming the mismatch.
+
+Note that the `Coop.AllowVersionMismatch` config option is an escape hatch that also bypasses
+this check, so turning it on lets a crew with mismatched Shipyard Expansion installs in too.
 
 ## Install
 

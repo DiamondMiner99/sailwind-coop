@@ -14,6 +14,36 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.31 - 2026-07-13
+
+> Adds compatibility with nandbrew's **Shipyard Expansion**. Custom rigs (extra masts,
+> resized / rotated / flipped / retextured sails) now sync to the whole crew, at join and
+> live while someone edits at a shipyard. New requirement when anyone uses it: either
+> EVERY player installs the same Shipyard Expansion version, or nobody does - a mixed crew
+> is refused at join instead of silently desyncing. If nobody in your crew runs Shipyard
+> Expansion, nothing changes for you. The network format is additive, but the version
+> handshake refuses mixed versions, so everyone updates as usual.
+
+### Added
+- **Shipyard Expansion rig sync.** Guests see and can operate the host's custom rigs.
+  Structural changes (masts, sails, part options) already travelled with the existing
+  shipyard packets; what was missing was Shipyard Expansion's own per-sail extras (scale,
+  angle, flip, texture), which it stores separately from the game's boat data. Those now
+  sync too, both in the join snapshot and live while a player edits at a shipyard. Edits
+  made by a guest are relayed to the rest of the crew by the host, same as everything else.
+- **Mod-set check at join.** The lobby and the handshake now carry a Shipyard Expansion
+  signature (presence, version, and the Shipyard Expansion settings that change the rig
+  itself). A mismatch is refused with a message naming the problem, in either direction -
+  a player without the mod cannot even build the other players' rigs, so a half-modded
+  crew was never going to work. `Coop.AllowVersionMismatch` bypasses this check too, and
+  its description now says so.
+
+### Notes
+- Shipyard Expansion support is entirely optional and is implemented as a soft dependency:
+  with the mod absent, none of this code runs and behaviour is unchanged.
+- Untested in live play, like every release here. If a rig looks wrong on one machine,
+  grab `BepInEx/LogOutput.log` from everyone.
+
 ## v0.2.30 - 2026-07-12
 
 > Fixes the 2026-07-12 report (thanks Robin!): the host "losing" the mooring ropes when

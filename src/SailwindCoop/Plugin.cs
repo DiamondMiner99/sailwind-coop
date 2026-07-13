@@ -14,6 +14,7 @@ using UnityEngine;
 namespace SailwindCoop
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+    [BepInDependency(Compat.SECompat.SEGuid, BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
         public const string PluginGUID = "com.sailwindcoop.mod";
@@ -27,8 +28,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.30 build (host mooring-rope loss on load); shows as 0.2.30.
-        public const string PluginVersion = "0.2.30";
+        // load. This is the v0.2.31 build (Shipyard Expansion compatibility); shows as 0.2.31.
+        public const string PluginVersion = "0.2.31";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -154,6 +155,10 @@ namespace SailwindCoop
 
             Log.LogInfo($"{PluginName} v{PluginVersion} loading...");
 
+            // (v0.2.31) Shipyard Expansion soft-detect: must run in Awake so the lobby data and
+            // handshake mod signature are ready before any lobby is created or joined.
+            Compat.SECompat.Init();
+
             // Crew cap: host + up to 7 guests. Clamped to a sane Steam-lobby range. Bound before Steam
             // init so SteamLobbyManager.MaxPlayers reads the configured value when a lobby is created.
             MaxPlayersConfig = Config.Bind(
@@ -257,7 +262,7 @@ namespace SailwindCoop
                 "Lying in a bed while AWAKE (e.g. waiting for the rest of the crew, or just going AFK) slowly restores sleep up to 60/100 and freezes hunger/thirst/protein/vitamin drain. Real crew sleep is still the only way to rest fully. Per-player and local-only - each machine applies its own value.");
 
             AllowVersionMismatchConfig = Config.Bind("Coop", "AllowVersionMismatch", false,
-                "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it.");
+                "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it. This ALSO disables the Shipyard Expansion compatibility check, so a crew with mismatched Shipyard Expansion installs (or some with it and some without) will be let in too.");
 
             try
             {
@@ -734,6 +739,37 @@ namespace SailwindCoop
                             return;
                         }
                     }
+
+                    // (v0.2.31) MOD-SET GATE, guest side (layer 1): Shipyard Expansion changes boat
+                    // rigs structurally (bool[128] masts, extra sail prefabs); a mixed crew cannot
+                    // even instantiate each other's rigs, so refuse before P2P, symmetric in both
+                    // directions. Empty string means "no SE on the host" (also what pre-0.2.31
+                    // hosts report, since they never set the key - correct: they can't sync SE).
+                    // The signature is an OPAQUE token (it can carry a "/noSailData" or "/noSync"
+                    // suffix): compare it for exact equality, never parse it.
+                    var hostMods = LobbyManager.GetLobbyData("mods") ?? "";
+                    var ourMods = Compat.SECompat.ModSignature;
+                    if (hostMods != ourMods)
+                    {
+                        string modsMsg = $"Shipyard Expansion mismatch: host has [{(hostMods == "" ? "none" : hostMods)}], you have [{(ourMods == "" ? "none" : ourMods)}]. Everyone must run the same SE version (or nobody).";
+                        Log.LogError($"[MODS] {modsMsg}");
+                        if (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value)
+                        {
+                            Notify(modsMsg + "\n(Coop.AllowVersionMismatch is on - joining anyway; expect desyncs.)", 10f);
+                        }
+                        else if (SaveSlots.currentSlot == CoopSave.PhantomSlot)
+                        {
+                            _joinedAsGuest = true;
+                            EndGuestSessionAndQuit(modsMsg);
+                            return;
+                        }
+                        else
+                        {
+                            Notify(modsMsg, 12f);
+                            LobbyManager.LeaveLobby();
+                            return;
+                        }
+                    }
                 }
 
                 var hostId = LobbyManager.HostSteamId;
@@ -760,7 +796,14 @@ namespace SailwindCoop
                 // this handler finished, so _joinedAsGuest is already recorded by then.
                 if (!IsHost && joinedExistingPlayer)
                 {
-                    NetworkManager.SendReliable(hostId, PacketType.Handshake, w => w.Write(PluginVersion));
+                    // (v0.2.31) Handshake body: version + mod signature. Older hosts read only the
+                    // version string and ignore the trailing bytes (per-packet framing), so this is
+                    // not a wire break.
+                    NetworkManager.SendReliable(hostId, PacketType.Handshake, w =>
+                    {
+                        w.Write(PluginVersion);
+                        w.Write(Compat.SECompat.ModSignature);
+                    });
                 }
 
                 if (joinedExistingPlayer)
@@ -859,12 +902,21 @@ namespace SailwindCoop
             NetworkManager.RegisterHandler(PacketType.Handshake, (sender, reader) =>
             {
                 var version = reader.ReadString();
-                Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion})");
+                // (v0.2.31) Tolerant read: a pre-0.2.31 guest's handshake ends after the version
+                // string; treat a missing field as "no SE" - the symmetric compare below then
+                // refuses them exactly when this host runs SE (they could not sync SE anyway).
+                string guestMods = "";
+                try { guestMods = reader.ReadString(); } catch { /* legacy short payload */ }
+                Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion}), mods [{guestMods}] (ours [{Compat.SECompat.ModSignature}])");
 
                 if (!IsHost) return;
                 _versionHandshaked.Add(sender);
 
-                bool match = version == PluginVersion;
+                bool versionMatch = version == PluginVersion;
+                // Opaque token, exact equality only - never parse it (it can carry a "/noSailData"
+                // or "/noSync" suffix precisely so those cases mismatch and get refused).
+                bool modsMatch = guestMods == Compat.SECompat.ModSignature;
+                bool match = versionMatch && modsMatch;
                 bool allow = match || (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value);
 
                 string guestName = sender.ToString();
@@ -873,10 +925,16 @@ namespace SailwindCoop
 
                 if (!match)
                 {
+                    string what = !versionMatch
+                        ? $"is on mod v{version} (you run v{PluginVersion})"
+                        : $"has Shipyard Expansion [{(guestMods == "" ? "none" : guestMods)}] (you have [{(Compat.SECompat.ModSignature == "" ? "none" : Compat.SECompat.ModSignature)}])";
+                    string fix = !versionMatch
+                        ? $"Everyone must run v{PluginVersion}."
+                        : "Everyone must match the host's mod set.";
                     Notify(allow
-                        ? $"{guestName} is on mod v{version} (you run v{PluginVersion}) - allowed by Coop.AllowVersionMismatch; expect desyncs."
-                        : $"{guestName} is on mod v{version} - refused. Everyone must run v{PluginVersion}.", 10f);
-                    Log.LogWarning($"[VERSION] {guestName} ({sender}) version {version} vs host {PluginVersion}: {(allow ? "ALLOWED by config" : "REFUSED")}");
+                        ? $"{guestName} {what} - allowed by Coop.AllowVersionMismatch; expect desyncs."
+                        : $"{guestName} {what} - refused. {fix}", 10f);
+                    Log.LogWarning($"[VERSION] {guestName} ({sender}) version {version} mods [{guestMods}] vs host {PluginVersion} [{Compat.SECompat.ModSignature}]: {(allow ? "ALLOWED by config" : "REFUSED")}");
                 }
 
                 // Ack BEFORE any revoke, or the refusal could never reach the guest.
@@ -884,6 +942,7 @@ namespace SailwindCoop
                 {
                     w.Write(PluginVersion);
                     w.Write(allow);
+                    w.Write(Compat.SECompat.ModSignature); // (v0.2.31) trailing field, old guests ignore
                 });
 
                 if (!allow)
@@ -900,12 +959,21 @@ namespace SailwindCoop
             {
                 var version = reader.ReadString();
                 var accepted = reader.ReadBoolean();
-                Log.LogInfo($"[VERSION] Handshake response from {sender}: version {version}, accepted: {accepted}");
+                // (v0.2.31) Tolerant read: a pre-0.2.31 host's ack ends after the bool.
+                string hostMods = "";
+                try { hostMods = reader.ReadString(); } catch { /* pre-0.2.31 host */ }
+                Log.LogInfo($"[VERSION] Handshake response from {sender}: version {version}, mods [{hostMods}], accepted: {accepted}");
 
-                // (v0.2.27) The host refused our version - quit cleanly instead of playing a
-                // half-admitted session (the host has already revoked our admission).
+                // (v0.2.27) The host refused us - quit cleanly instead of playing a half-admitted
+                // session (the host has already revoked our admission). (v0.2.31) Name the actual
+                // mismatch: version when versions differ, otherwise the SE mod set.
                 if (!IsHost && !accepted)
-                    EndGuestSessionAndQuit($"Mod version mismatch: the host runs v{version}, you run v{PluginVersion}. Everyone must install the same version.");
+                {
+                    string reason = version != PluginVersion
+                        ? $"Mod version mismatch: the host runs v{version}, you run v{PluginVersion}. Everyone must install the same version."
+                        : $"Shipyard Expansion mismatch: host has [{(hostMods == "" ? "none" : hostMods)}], you have [{(Compat.SECompat.ModSignature == "" ? "none" : Compat.SECompat.ModSignature)}]. Everyone must run the same SE version (or nobody).";
+                    EndGuestSessionAndQuit(reason);
+                }
             });
 
             // Player position packet (boat-relative coordinates + held item)
@@ -1393,6 +1461,16 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadShipyardState(reader);
                 ShipyardSyncManager?.OnShipyardStateReceived(packet, sender);
+            });
+
+            // Shipyard Expansion sail-extras blob (215, v0.2.31): SE's angle/flip/texture/scale edits live
+            // outside vanilla SaveBoatCustomizationData, so they ride their own packet. The host star-relays
+            // it; the receiver applies it strictly AFTER any customization apply for that boat, or buffers it
+            // (see ShipyardSyncManager.OnSERigStateReceived).
+            NetworkManager.RegisterHandler(PacketType.SERigState, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadSERigState(reader);
+                ShipyardSyncManager?.OnSERigStateReceived(packet, sender);
             });
 
             // Mission sync packets
@@ -2211,6 +2289,12 @@ namespace SailwindCoop
             // them on their solo-save wallet). A failure is loud (LogError names the step) and the
             // remaining sends still go out.
             RunJoinStep("BoatWorldState", () => BoatSyncManager.SendBoatWorldStateTo(friend.Id));
+            // (v0.2.31) Shipyard Expansion sail extras: one SERigState blob per boat, sent right after the
+            // world snapshot on the same reliable, ordered channel. The guest's handler BUFFERS them while
+            // IsJoinInProgress; the join applies each one at the tail of Phase A, after that boat's vanilla
+            // customization rebuild and before the frame-wait that precedes the rope re-key. Hard no-op when
+            // SE is not installed, so a vanilla crew sends nothing at all.
+            RunJoinStep("SERigState", () => ShipyardSyncManager?.SendAllRigBlobsTo(friend.Id));
             // JOIN helm seed: HelmState is edge-triggered, so a guest joining while the host holds the
             // wheel steady would never receive the current rudder angle. Re-broadcast it now. This is a
             // host-side SEND of current helm state - orthogonal to the N-player helm LEASE (which arbitrates

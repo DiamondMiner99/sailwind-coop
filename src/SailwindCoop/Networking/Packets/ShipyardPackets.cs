@@ -41,4 +41,12 @@ namespace SailwindCoop.Networking.Packets
         public int Region;        // currency slot (Shipyard.region) - same slot vanilla ConfirmOrder charges
         public int Total;         // GetCurrentOrderTotal(); >0 = charge, <0 = refund (net), 0 = no-op
     }
+
+    /// <summary>(v0.2.31) Shipyard Expansion sail-extras blob for one boat. See PacketType.SERigState.</summary>
+    [Serializable]
+    public struct SERigStatePacket
+    {
+        public string BoatName;   // root SaveableObject.gameObject.name (matches BoatUtility.FindBoatByName)
+        public string RigBlob;    // SE "SEboatSails.{sceneIndex}" modData value
+    }
 }

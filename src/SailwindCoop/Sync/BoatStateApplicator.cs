@@ -288,7 +288,38 @@ namespace SailwindCoop.Sync
                     try
                     {
                         ApplyBoatStatePhaseA(boat, hostBoat);
+                        // Commit the boat to the Phase B list BEFORE the SE apply below. This list drives BOTH
+                        // Phase B and the physics re-enable loop further down, so a boat that never reaches it
+                        // is left KINEMATIC for the rest of the session. An optional third-party mod's rig
+                        // apply must never be able to cause that, hence: vanilla state first, extras second.
                         boatDataPairs.Add((boat, hostBoat));
+
+                        // (v0.2.31) Shipyard Expansion sail extras. MUST land HERE - inside Phase A, not in
+                        // Phase B. AFTER Phase A's LoadData, because SECompat.ApplyRigBlob applies the host's
+                        // blob by rebuilding this boat from ITS OWN CURRENT vanilla customization: run it any
+                        // earlier and that customization is still the GUEST's PRE-JOIN structure, so SE's
+                        // LoadSailConfig meets a rig the blob was never authored for and silently misapplies it
+                        // (it ignores entries past mast.sails.Count, breaks out on a missing entry and skips
+                        // unknown masts - it does not throw), then SE's postfix saves that mangled result back
+                        // into modData and Phase A's real LoadData re-applies the wreckage. The host's extras
+                        // would be lost with no error anywhere. And BEFORE the frame-wait below,
+                        // because ApplyRigBlob applies the blob by rebuilding the sails through vanilla
+                        // LoadData, and Unity defers Destroy() to end of frame: doing this in Phase B would
+                        // leave the just-destroyed RopeControllers in the freshly re-derived rope array and
+                        // shift every index ApplyRopeLengths writes to, silently trimming the WRONG ropes. The
+                        // single frame-wait below covers both rebuilds. No-op when nothing was buffered for
+                        // this boat, which is always the case without SE installed.
+                        //
+                        // Own try: SECompat.ApplyRigBlob already swallows everything and rolls modData back,
+                        // so this is belt-and-braces - but if the SE path ever did throw, the boat keeps its
+                        // fully-applied vanilla state (and its rope lengths, and its physics) and only loses
+                        // the cosmetic rig extras. The outer catch would otherwise mislabel it "PhaseA FAILED".
+                        try { ShipyardSyncManager.ApplyPendingRigBlob(boat); }
+                        catch (System.Exception e)
+                        {
+                            Plugin.Log.LogError($"[JOIN] SE rig apply FAILED for boat {hostBoat.Name} " +
+                                $"(vanilla boat state kept, rig extras skipped): {e}");
+                        }
                     }
                     catch (System.Exception e)
                     {

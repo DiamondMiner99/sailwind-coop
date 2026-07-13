@@ -1137,6 +1137,23 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        // SE rig state (sail-extras blob). Write order MUST equal Read order.
+
+        public static void WriteSERigState(BinaryWriter writer, SERigStatePacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+            writer.Write(packet.RigBlob ?? "");
+        }
+
+        public static SERigStatePacket ReadSERigState(BinaryReader reader)
+        {
+            return new SERigStatePacket
+            {
+                BoatName = reader.ReadString(),
+                RigBlob = reader.ReadString()
+            };
+        }
+
         #endregion
 
         #region Time Packets Serialization

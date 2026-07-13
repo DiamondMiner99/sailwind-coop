@@ -556,6 +556,21 @@ namespace SailwindCoop.Sync
             rope.currentLength = packet.Length;
             rope.changed = true;
 
+            // (v0.2.31, C1b) This is an AUTHORITATIVE value from a peer. Stamp the rope so a Shipyard
+            // Expansion rope-trim restore that is mid-flight (SE's rig apply rebuilds the sails at prefab
+            // default lengths and puts the pre-rebuild trim back a frame later) cannot overwrite it with the
+            // stale pre-rebuild length. A terminal RopeState is the LAST packet for that rope - nothing would
+            // ever re-send it - so a clobber here is permanent for the session: the v0.2.25 "phantom furled
+            // sails" bug. Gated on SE being installed, so without SE this is one static bool test and the
+            // rope-sync path is byte-for-byte what it was.
+            //
+            // (P3) MarkRopeAuthoritative itself early-outs unless a restore is actually in flight, so even WITH
+            // SE this costs one static bool test on the overwhelming majority of rope packets. Do not hoist that
+            // condition up here: it is the callee's own invariant (it owns _trimRestorePending) and duplicating
+            // it would just be a second thing to keep in sync.
+            if (Compat.SECompat.IsInstalled)
+                ShipyardSyncManager.MarkRopeAuthoritative(packet.BoatName, rope);
+
             // Update local cache to prevent echo feedback - ONLY when this packet is for the host's CURRENT
             // boat. _lastRopeLengths is a single array keyed to GetCurrentBoat() by PollBoatControls;
             // writing it by raw index for a DIFFERENT boat (host not standing on the steered boat, 3+ players)

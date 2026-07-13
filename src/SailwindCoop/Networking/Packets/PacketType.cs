@@ -237,5 +237,14 @@ namespace SailwindCoop.Networking.Packets
         CargoInserted = 212,             // Host -> all: item entered a carrier (apply locally, no payment; requester plays money UX)
         CargoWithdrawRequest = 213,      // Guest -> host: take this item out of this port's cargo carrier
         CargoWithdrawn = 214,            // Host -> all: item left a carrier (apply locally; requester picks it up + plays money UX)
+
+        // Shipyard Expansion rig sync (215, v0.2.31): SE stores per-sail extras (scaleZ/scaleY/
+        // angle/flipped/textureIndex) OUTSIDE SaveBoatCustomizationData, as a string in
+        // GameState.modData["SEboatSails.{sceneIndex}"]. Structural rig (masts/sails/options)
+        // already travels in ShipyardCustomization/BoatWorldState; this carries the SE extras.
+        // Boat keyed by NAME on the wire; each side re-keys to its own local sceneIndex.
+        // Sent per boat after the join snapshot and on live shipyard edits; host star-relays.
+        // Additive wire; only sent when SE is installed (handshake enforces SE parity anyway).
+        SERigState = 215,                // Editing peer -> all / host -> joiner: SE sail-extras blob for one boat
     }
 }
