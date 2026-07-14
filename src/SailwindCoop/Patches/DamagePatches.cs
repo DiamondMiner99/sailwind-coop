@@ -187,8 +187,19 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(BoatDamageWaterButton), "OnItemClick")]
         public static class BoatDamageWaterButtonOnItemClickPatch
         {
+            // (v0.2.32, P1) __runOriginal + HarmonyBefore: NANDTweaks patches this same method with a
+            // PREFIX THAT RETURNS FALSE (its bailingTweaks full replacement, NANDTweaks
+            // BoatDamagePatches.cs:54). In Harmony 2, once any prefix returns false, later prefixes are
+            // SKIPPED unless they declare __runOriginal - so without it, __state stayed 0, the postfix
+            // early-returned, and a guest running NANDTweaks bailed water locally while the host never
+            // received SendBailRequest (silent water-level divergence, snapped back by the next
+            // authoritative damage sync). HarmonyBefore additionally orders us first when both are
+            // present; __runOriginal is the belt-and-braces for any other mod that skips this method.
+            // The capture itself only reads bottle state, so it is safe to run whether or not the
+            // original (or NANDTweaks' replacement) executes.
             [HarmonyPrefix]
-            public static void Prefix(PickupableItem heldItem, out float __state)
+            [HarmonyBefore("com.nandbrew.nandtweaks")]
+            public static void Prefix(PickupableItem heldItem, out float __state, bool __runOriginal)
             {
                 __state = 0f;
 
@@ -222,7 +233,8 @@ namespace SailwindCoop.Patches
                 var prefab = bottle.GetComponent<SaveablePrefab>();
                 if (prefab == null) return;
 
-                // If bottle now has sea water, bailing occurred
+                // If bottle now has sea water, bailing occurred (true for vanilla AND for NANDTweaks'
+                // bailingTweaks replacement, which writes amount/health the same way).
                 if (bottle.amount == 9f && bottle.health > 0f)
                 {
                     DamageSyncManager.Instance?.SendBailRequest(prefab.instanceId, __state);

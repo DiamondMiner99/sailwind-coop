@@ -496,6 +496,48 @@ namespace SailwindCoop.Patches
 
                 // Convert dock position from local to real (offset-independent) coordinates
                 // Receiver will add their offset to find dock in their coordinate system
+                //
+                // (v0.2.32) Tow-aware target: a TowingCleat (Towable Boats; also baked into the
+                // Leopard prefab) is a GPButtonDockMooring ON A MOVING BOAT - a world position is
+                // stale the moment the tow boat moves, so boat targets travel as a
+                // (towBoatName, cleatPath) reference instead.
+                if (SailwindCoop.Compat.TowableBoatsCompat.IsTowingCleat(mooring))
+                {
+                    var towBoat = mooring.GetComponentInParent<SaveableObject>();
+                    var cleatPath = towBoat != null
+                        ? Sync.SyncPathUtil.GetRelativePath(towBoat.transform, mooring.transform) : null;
+                    if (towBoat != null)
+                    {
+                        if (string.IsNullOrEmpty(cleatPath))
+                        {
+                            // (v0.2.32 review) Path derivation failed (an unaddressable name, a cleat
+                            // re-parented off the boat root). Send the cleat packet ANYWAY, with an EMPTY
+                            // path: the receiver's cleat resolve fails cleanly (FindByRelativePath returns
+                            // null for an empty path) -> retry -> stow. NEVER fall back to the dock-position
+                            // send here: a moving cleat's world position can land within the receiver's 5m
+                            // XZ match radius of a REAL pier bollard and moor the boat to the DOCK instead
+                            // of the tow - a silent, physically wrong moor is far worse than a stowed rope.
+                            Plugin.Log.LogWarning($"Cleat moor could not derive a path on towBoat={towBoat.gameObject.name}; " +
+                                                  "sending an unresolvable cleat target (receiver stows the rope) rather than a dock position");
+                        }
+                        else
+                        {
+                            VerboseLogger.ControlLocal($"Mooring attached to CLEAT, boat={boat.gameObject.name}, rope={ropeIndex}, towBoat={towBoat.gameObject.name}, cleat={cleatPath}");
+                        }
+
+                        Sync.BoatUtility.UpdateTowStreamPin(boat); // (P4) host-only inside; rescan-based
+                        ControlSyncManager.Instance?.OnLocalMooringChanged(
+                            boat.gameObject.name, ropeIndex, true, Vector3.zero,
+                            __instance.currentRopeLengthSquared,
+                            Networking.Packets.MooringTargetKind.BoatCleat,
+                            towBoat.gameObject.name, cleatPath ?? string.Empty);
+                        return;
+                    }
+                    // No SaveableObject above the cleat at all: there is no boat reference to send, so the
+                    // dock-position path below is the only thing left (and its 5m match is a real chance).
+                    Plugin.Log.LogWarning("Cleat moor could not resolve a towing boat (no SaveableObject parent); falling back to dock-position sync");
+                }
+
                 var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
                 var realDockPos = mooring.transform.position - offset;
 
@@ -571,6 +613,8 @@ namespace SailwindCoop.Patches
                     Vector3.zero,
                     0f
                 );
+
+                Sync.BoatUtility.UpdateTowStreamPin(boat); // (P4) rescan: only unpins when NO rope still holds a tow, never the deployed cutter
             }
         }
 
@@ -605,6 +649,44 @@ namespace SailwindCoop.Patches
                     ropeIndex,
                     __instance.currentRopeLengthSquared
                 );
+            }
+        }
+
+        // === TOW-CLEAT TRIGGER GUARD (v0.2.32) ===
+        // Vanilla auto-moors an unheld, displaced rope to ANY GPButtonDockMooring collider it touches
+        // (decomp PickupableBoatMooringRope.cs:223-233). Towable Boats makes cleats-on-hulls such
+        // targets, so a loose rope brushing a passing boat spontaneously creates a TOW on whichever
+        // peers happen to run the trigger - including during load, where the save-restore overlap is
+        // the mod's (order-dependent, non-deterministic) tow resurrection path. Tows must be
+        // host-authoritative: guests never create one locally; the host's MoorTo broadcast
+        // (MooringAttachPatch cleat branch) re-creates it for them. Dock triggers keep their existing
+        // (playtested) local semantics. Also blocks SELF-tows on every machine: the mod's own guard
+        // only covers OnItemClick (TowingCleat.cs:13), not the trigger path, and a SpringJoint whose
+        // connectedBody is its own hull is undefined/explosive PhysX.
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "OnTriggerEnter")]
+        public static class MooringCleatTriggerGuardPatch
+        {
+            [HarmonyPrefix]
+            public static bool Prefix(PickupableBoatMooringRope __instance, Collider other)
+            {
+                if (other == null) return true;
+                if (!SailwindCoop.Compat.TowableBoatsCompat.HasTowingCleat(other.gameObject)) return true;
+
+                // Self-tow guard (all machines, singleplayer included - it is a real mod bug).
+                var cleatBoat = other.GetComponentInParent<SaveableObject>();
+                var ropeBoat = __instance.GetBoatRigidbody()?.GetComponent<SaveableObject>();
+                if (cleatBoat != null && cleatBoat == ropeBoat)
+                {
+                    VerboseLogger.ControlLocal($"Blocked SELF-tow trigger moor on {cleatBoat.gameObject.name}");
+                    return false;
+                }
+
+                if (!Plugin.IsMultiplayer) return true;
+                if (Plugin.IsHost) return true; // host is the tow authority
+
+                // Guest: never trigger-moor to a cleat locally; the host's broadcast re-creates real tows.
+                VerboseLogger.ControlLocal($"Suppressed guest trigger-moor to cleat {other.name}");
+                return false;
             }
         }
 

@@ -85,6 +85,27 @@ namespace SailwindCoop.Sync
         private readonly List<SaveableObject> _activeBoatsScratch = new List<SaveableObject>();
         private readonly HashSet<string> _activeBoatNamesScratch = new HashSet<string>();
 
+        // (v0.2.32, P4) Boats that must stream even with NOBODY aboard. The send loop below only
+        // covers lastBoat + boats carrying a remote crew member, so an empty deployed cutter or an
+        // unmanned towed boat got zero sync and guests pruned it after BoatStatePruneSeconds.
+        // Compat modules pin such boats here: LeopardSyncManager (deployed cutter) and the tow
+        // attach/detach path (towed boats). Host-side only; name = root SaveableObject name.
+        private static readonly HashSet<string> _alwaysStreamBoats = new HashSet<string>();
+
+        public static void RegisterAlwaysStream(string boatName)
+        {
+            if (string.IsNullOrEmpty(boatName)) return;
+            if (_alwaysStreamBoats.Add(boatName))
+                Plugin.Log.LogInfo($"[BOAT] Always-stream registered: {boatName}");
+        }
+
+        public static void UnregisterAlwaysStream(string boatName)
+        {
+            if (string.IsNullOrEmpty(boatName)) return;
+            if (_alwaysStreamBoats.Remove(boatName))
+                Plugin.Log.LogInfo($"[BOAT] Always-stream unregistered: {boatName}");
+        }
+
         // Physics-based correction parameters
         // Higher values = faster correction but more "snappy", lower = smoother but may lag behind
         private const float PositionCorrectionStrength = 5f;  // How aggressively to correct position error
@@ -228,6 +249,17 @@ namespace SailwindCoop.Sync
                         var crewedBoat = BoatUtility.FindBoatByName(crewedBoatName);
                         if (crewedBoat != null) _activeBoatsScratch.Add(crewedBoat);
                     }
+                }
+
+                // (v0.2.32, P4) Pinned boats: stream even with nobody aboard (deployed cutter, towed
+                // hulls). Same dedup rules as the crewed set; the primary is already excluded above.
+                foreach (var pinnedName in _alwaysStreamBoats)
+                {
+                    if (pinnedName == lastBoatName) continue;
+                    if (!_activeBoatNamesScratch.Add(pinnedName)) continue;
+                    var pinned = BoatUtility.FindBoatByName(pinnedName);
+                    // An inactive boat (recovered cutter) still resolves but must not stream.
+                    if (pinned != null && pinned.gameObject.activeInHierarchy) _activeBoatsScratch.Add(pinned);
                 }
 
                 foreach (var boatSaveable in _activeBoatsScratch)
@@ -706,6 +738,7 @@ namespace SailwindCoop.Sync
             _cachedBoatSaveable = null;
             _activeBoatsScratch.Clear();
             _activeBoatNamesScratch.Clear();
+            _alwaysStreamBoats.Clear(); // (v0.2.32, P4) static registry must not leak pinned names into the next session
         }
 
         /// <summary>

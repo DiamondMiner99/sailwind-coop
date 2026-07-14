@@ -109,5 +109,41 @@ namespace SailwindCoop.Patches
                 return Plugin.IsHost;
             }
         }
+
+        // (v0.2.32) Towable Boats neutralization, guest side. TB's own prefix on
+        // BoatPerformanceSwitcher.Update (BoatPerformancePatches.cs:28-42, returns false) forces full
+        // BoatProbes physics for boats in the tow chain, derived from GameState.lastBoat - a value
+        // that DIFFERS on every client. Host and guests would therefore disagree about which hulls
+        // run full physics, and a guest's local integration fights the authoritative transform
+        // stream with varying strength. On guests we replicate the VANILLA decision (lastBoat or
+        // sunk = full physics, everything else = performance mode) and return false, which also
+        // skips TB's prefix (it declares no __runOriginal; HarmonyBefore orders us first). Host and
+        // singleplayer keep TB's behavior untouched - the host IS the physics authority.
+        [HarmonyPatch(typeof(BoatPerformanceSwitcher), "Update")]
+        public static class BoatPerformanceSwitcherGuestPatch
+        {
+            private static readonly System.Reflection.MethodInfo SetPerformanceMode =
+                AccessTools.Method(typeof(BoatPerformanceSwitcher), "SetPerformanceMode");
+
+            [HarmonyPrefix]
+            [HarmonyBefore("com.nandbrew.towableboats")]
+            public static bool Prefix(BoatPerformanceSwitcher __instance)
+            {
+                if (!Plugin.IsMultiplayer || Plugin.IsHost) return true;
+                if (!SailwindCoop.Compat.TowableBoatsCompat.IsInstalled) return true;
+
+                var damage = __instance.GetComponent<BoatDamage>();
+                bool wantFullPhysics = GameState.lastBoat == __instance.transform
+                    || (damage != null && damage.sunk);
+                bool perfOn = __instance.performanceModeIsOn();
+
+                if (wantFullPhysics && perfOn)
+                    SetPerformanceMode?.Invoke(__instance, new object[] { false });
+                else if (!wantFullPhysics && !perfOn)
+                    SetPerformanceMode?.Invoke(__instance, new object[] { true });
+
+                return false; // skip TB's prefix AND vanilla (we just ran the vanilla decision)
+            }
+        }
     }
 }

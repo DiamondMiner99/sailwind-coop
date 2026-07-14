@@ -40,14 +40,23 @@ namespace SailwindCoop.Networking.Packets
         public float RopeLength;
     }
 
+    /// <summary>(v0.2.32) Where a moored rope is attached. Towable Boats reuses the vanilla mooring
+    /// SpringJoint with the bollard (TowingCleat) on a MOVING boat, so a world-space dock position
+    /// is wrong the instant the towing boat moves - boat targets travel as (towBoatName, cleatPath)
+    /// references instead.</summary>
+    public enum MooringTargetKind : byte { Dock = 0, BoatCleat = 1 }
+
     [Serializable]
     public struct MooringStatePacket
     {
         public string BoatName;
         public int RopeIndex;     // Index in BoatMooringRopes.ropes[]
         public bool IsMoored;
-        public Vector3 DockPosition;
+        public MooringTargetKind TargetKind;
+        public Vector3 DockPosition;  // Dock targets only (real coords); zero for boat cleats
         public float LengthSquared;
+        public string TowBoatName;    // BoatCleat targets: towing boat root name ("" for docks)
+        public string CleatPath;      // BoatCleat targets: SyncPathUtil path from the tow boat root ("" for docks)
     }
 
     [Serializable]

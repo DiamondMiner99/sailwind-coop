@@ -15,6 +15,11 @@ namespace SailwindCoop
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     [BepInDependency(Compat.SECompat.SEGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.SCFCompat.SCFGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.NANDTweaksCompat.NTGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.DeepPortsCompat.DPGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.TowableBoatsCompat.TBGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.LeopardCompat.LeopardGuid, BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
         public const string PluginGUID = "com.sailwindcoop.mod";
@@ -28,8 +33,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.31 build (Shipyard Expansion compatibility); shows as 0.2.31.
-        public const string PluginVersion = "0.2.31";
+        // load. This is the v0.2.32 build (HMS Leopard + mod-compat pass); shows as 0.2.32.
+        public const string PluginVersion = "0.2.32";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -83,6 +88,11 @@ namespace SailwindCoop
         // Handshake gate), so both peers must enable it to actually play mismatched.
         public static ConfigEntry<bool> AllowVersionMismatchConfig { get; private set; }
 
+        // (v0.2.32) Mod-set gate escape hatch, split out of AllowVersionMismatch: one flag unlocking
+        // BOTH the version gate and the mod gate was too blunt with six gated mods. Off by default.
+        // Checked on BOTH sides, so both peers must enable it to actually play mismatched.
+        public static ConfigEntry<bool> AllowModMismatchConfig { get; private set; }
+
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
         public static RemotePlayerManager RemotePlayerManager { get; private set; }
@@ -96,6 +106,8 @@ namespace SailwindCoop
         public static SleepSyncManager SleepSyncManager { get; private set; }
         public static DamageSyncManager DamageSyncManager { get; private set; }
         public static ShipyardSyncManager ShipyardSyncManager { get; private set; }
+        public static TrapdoorSyncManager TrapdoorSyncManager { get; private set; }
+        public static LeopardSyncManager LeopardSyncManager { get; private set; }
         public static MissionSyncManager MissionSyncManager { get; private set; }
         public static EconomySyncManager EconomySyncManager { get; private set; }
         public static TradingSyncManager TradingSyncManager { get; private set; }
@@ -155,9 +167,11 @@ namespace SailwindCoop
 
             Log.LogInfo($"{PluginName} v{PluginVersion} loading...");
 
-            // (v0.2.31) Shipyard Expansion soft-detect: must run in Awake so the lobby data and
-            // handshake mod signature are ready before any lobby is created or joined.
-            Compat.SECompat.Init();
+            // (v0.2.32) Mod-compat soft-detect: every module must init in Awake so the composed
+            // lobby-data / handshake token (CompatRegistry.ModSignature) is ready before any lobby
+            // is created or joined. InitAll runs the six module Inits in segment order AND clears
+            // any prematurely cached composed token (see CompatRegistry.InitAll).
+            Compat.CompatRegistry.InitAll();
 
             // Crew cap: host + up to 7 guests. Clamped to a sane Steam-lobby range. Bound before Steam
             // init so SteamLobbyManager.MaxPlayers reads the configured value when a lobby is created.
@@ -262,13 +276,19 @@ namespace SailwindCoop
                 "Lying in a bed while AWAKE (e.g. waiting for the rest of the crew, or just going AFK) slowly restores sleep up to 60/100 and freezes hunger/thirst/protein/vitamin drain. Real crew sleep is still the only way to rest fully. Per-player and local-only - each machine applies its own value.");
 
             AllowVersionMismatchConfig = Config.Bind("Coop", "AllowVersionMismatch", false,
-                "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it. This ALSO disables the Shipyard Expansion compatibility check, so a crew with mismatched Shipyard Expansion installs (or some with it and some without) will be let in too.");
+                "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it. Gameplay-mod differences are gated separately by Coop.AllowModMismatch.");
+
+            AllowModMismatchConfig = Config.Bind("Coop", "AllowModMismatch", false,
+                "Let players whose GAMEPLAY MOD SET differs from the host's join anyway (warning instead of refusal). Covers Shipyard Expansion, Sail Collision Fix, NAND Tweaks simulation options, Deep Ports (including its terrain bundle), Towable Boats and HMS Leopard. Mixed mod sets desync physics, terrain and rigs - leave this off unless you know exactly what differs. Both the host and the mismatched guest must enable it.");
 
             try
             {
                 _harmony = new Harmony(PluginGUID);
                 _harmony.PatchAll();
                 PatchVerifier.Verify(_harmony);
+                // (v0.2.32) Manual patches on HMS Leopard's own controller types (attribute patches
+                // cannot reference maybe-absent types). Hard no-op when Leopard is absent.
+                Compat.LeopardCompat.ApplyPatches(_harmony);
                 Log.LogInfo($"Harmony patches applied successfully");
             }
             catch (System.Exception ex)
@@ -328,6 +348,10 @@ namespace SailwindCoop
                 Log.LogInfo("DamageSyncManager added");
                 ShipyardSyncManager = gameObject.AddComponent<ShipyardSyncManager>();
                 Log.LogInfo("ShipyardSyncManager added");
+                TrapdoorSyncManager = gameObject.AddComponent<TrapdoorSyncManager>();
+                Log.LogInfo("TrapdoorSyncManager added");
+                LeopardSyncManager = gameObject.AddComponent<LeopardSyncManager>();
+                Log.LogInfo("LeopardSyncManager added");
                 MissionSyncManager = gameObject.AddComponent<MissionSyncManager>();
                 Log.LogInfo("MissionSyncManager added");
                 EconomySyncManager = gameObject.AddComponent<EconomySyncManager>();
@@ -585,6 +609,7 @@ namespace SailwindCoop
 
             LobbyManager.OnLobbyLeft += () =>
             {
+                Sync.BoatUtility.ClearCaches(); // (v0.2.32, P2) fresh session = fresh boat map
                 Notify("Lobby closed - playing solo", 5f);
 
                 // The HOST saves their world normally. A GUEST now ALSO saves on leave - but to the hidden
@@ -700,6 +725,11 @@ namespace SailwindCoop
 
             LobbyManager.OnLobbyJoined += lobby =>
             {
+                // (v0.2.32, P2) Boat-map rebuild: _cachedBoats was built once per PROCESS and never
+                // invalidated (ClearCaches had zero call sites), so a boat spawned after the first
+                // FindAllBoats() call - e.g. HMS Leopard's runtime-deployed cutter - stayed invisible
+                // to every name-keyed sync forever, and a leave/rejoin kept stale SaveableObject refs.
+                Sync.BoatUtility.ClearCaches();
                 // STAR topology (N-player): a GUEST connects to the HOST only (the lobby owner), NOT to
                 // every existing member. The host relays each guest's position to the other guests, so
                 // guests never open direct P2P sessions with each other. At N=1 the only other member IS
@@ -740,22 +770,22 @@ namespace SailwindCoop
                         }
                     }
 
-                    // (v0.2.31) MOD-SET GATE, guest side (layer 1): Shipyard Expansion changes boat
-                    // rigs structurally (bool[128] masts, extra sail prefabs); a mixed crew cannot
-                    // even instantiate each other's rigs, so refuse before P2P, symmetric in both
-                    // directions. Empty string means "no SE on the host" (also what pre-0.2.31
-                    // hosts report, since they never set the key - correct: they can't sync SE).
-                    // The signature is an OPAQUE token (it can carry a "/noSailData" or "/noSync"
-                    // suffix): compare it for exact equality, never parse it.
+                    // (v0.2.32) MOD-SET GATE, guest side (layer 1): the composed CompatRegistry token
+                    // covers SE + SCF + NAND Tweaks sim vector + Deep Ports (bundle-hashed) + Towable
+                    // Boats + HMS Leopard. Refuse before P2P, symmetric in both directions. The token
+                    // is OPAQUE for the gate (exact equality); DescribeMismatch splits it for the
+                    // MESSAGE only so the user learns which mod differs.
                     var hostMods = LobbyManager.GetLobbyData("mods") ?? "";
-                    var ourMods = Compat.SECompat.ModSignature;
+                    var ourMods = Compat.CompatRegistry.ModSignature;
                     if (hostMods != ourMods)
                     {
-                        string modsMsg = $"Shipyard Expansion mismatch: host has [{(hostMods == "" ? "none" : hostMods)}], you have [{(ourMods == "" ? "none" : ourMods)}]. Everyone must run the same SE version (or nobody).";
+                        string modsMsg = "Mod set mismatch - " +
+                            Compat.CompatRegistry.DescribeMismatch(hostMods, ourMods) +
+                            ". Everyone must run the same gameplay mods (and the same settings for the flagged ones).";
                         Log.LogError($"[MODS] {modsMsg}");
-                        if (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value)
+                        if (AllowModMismatchConfig != null && AllowModMismatchConfig.Value)
                         {
-                            Notify(modsMsg + "\n(Coop.AllowVersionMismatch is on - joining anyway; expect desyncs.)", 10f);
+                            Notify(modsMsg + "\n(Coop.AllowModMismatch is on - joining anyway; expect desyncs.)", 10f);
                         }
                         else if (SaveSlots.currentSlot == CoopSave.PhantomSlot)
                         {
@@ -796,13 +826,13 @@ namespace SailwindCoop
                 // this handler finished, so _joinedAsGuest is already recorded by then.
                 if (!IsHost && joinedExistingPlayer)
                 {
-                    // (v0.2.31) Handshake body: version + mod signature. Older hosts read only the
-                    // version string and ignore the trailing bytes (per-packet framing), so this is
+                    // (v0.2.32) Handshake body: version + composed mod-set token. Older hosts read only
+                    // the version string and ignore the trailing bytes (per-packet framing), so this is
                     // not a wire break.
                     NetworkManager.SendReliable(hostId, PacketType.Handshake, w =>
                     {
                         w.Write(PluginVersion);
-                        w.Write(Compat.SECompat.ModSignature);
+                        w.Write(Compat.CompatRegistry.ModSignature);
                     });
                 }
 
@@ -882,6 +912,11 @@ namespace SailwindCoop
 
             LobbyManager.OnLobbyCreated += lobby =>
             {
+                Sync.BoatUtility.ClearCaches(); // (v0.2.32, P2) fresh session = fresh boat map
+                // (v0.2.32 review) Tows created BEFORE the lobby existed (singleplayer, or restored
+                // during load under the phantom-load gates) never fired the moor-event pin. Rescan
+                // every boat once so a pre-existing towed hull streams from the first packet.
+                StartCoroutine(PinPreExistingTows());
                 _joinedAsGuest = false; // we're the host
                 _versionHandshaked.Clear(); // (v0.2.27) fresh lobby = fresh handshake set
                 // Registry population moved to OnPlayerJoined (save may not be loaded yet)
@@ -890,6 +925,40 @@ namespace SailwindCoop
 
             // Register basic packet handlers
             RegisterPacketHandlers();
+        }
+
+        /// <summary>
+        /// (v0.2.32 review) One-shot tow-pin rescan at lobby creation. The always-stream pin is
+        /// maintained on moor/unmoor EVENTS only, so a tow that already existed when the lobby opened
+        /// (built in singleplayer, or restored during load under the phantom-load gates that suppress
+        /// the mooring patches) has NO pin: the host would never stream the towed hull and it would
+        /// drift away from the towing boat on every guest.
+        ///
+        /// WHY A COROUTINE and not an inline foreach: BoatUtility.UpdateTowStreamPin is host-gated
+        /// (Plugin.IsHost), and IsHost is still FALSE while OnLobbyCreated runs - SteamLobbyManager
+        /// assigns _currentLobby (which IsHost is derived from) in the awaited CreateLobbyAsync
+        /// continuation and in HandleLobbyEntered, BOTH of which run after Steam's synchronous
+        /// LobbyCreated callback that raises this event. An inline rescan would silently no-op.
+        /// </summary>
+        private System.Collections.IEnumerator PinPreExistingTows()
+        {
+            float deadline = Time.realtimeSinceStartup + 10f;
+            while (!IsHost && Time.realtimeSinceStartup < deadline)
+                yield return null;
+
+            if (!IsHost)
+            {
+                Log.LogWarning("[Coop] Tow pin rescan skipped: host role never settled after lobby creation");
+                yield break;
+            }
+
+            int pinned = 0;
+            foreach (var b in Sync.BoatUtility.FindAllBoats().Values)
+            {
+                Sync.BoatUtility.UpdateTowStreamPin(b);
+                pinned++;
+            }
+            VerboseLogger.LobbyEvent($"Tow pin rescan at lobby creation: examined {pinned} boat(s) for pre-existing tows");
         }
 
         private void RegisterPacketHandlers()
@@ -903,11 +972,11 @@ namespace SailwindCoop
             {
                 var version = reader.ReadString();
                 // (v0.2.31) Tolerant read: a pre-0.2.31 guest's handshake ends after the version
-                // string; treat a missing field as "no SE" - the symmetric compare below then
-                // refuses them exactly when this host runs SE (they could not sync SE anyway).
+                // string; treat a missing field as an empty mod set - the symmetric compare below
+                // then refuses them exactly when this host runs SE (they could not sync SE anyway).
                 string guestMods = "";
                 try { guestMods = reader.ReadString(); } catch { /* legacy short payload */ }
-                Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion}), mods [{guestMods}] (ours [{Compat.SECompat.ModSignature}])");
+                Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion}), mods [{guestMods}] (ours [{Compat.CompatRegistry.ModSignature}])");
 
                 if (!IsHost) return;
                 _versionHandshaked.Add(sender);
@@ -915,9 +984,10 @@ namespace SailwindCoop
                 bool versionMatch = version == PluginVersion;
                 // Opaque token, exact equality only - never parse it (it can carry a "/noSailData"
                 // or "/noSync" suffix precisely so those cases mismatch and get refused).
-                bool modsMatch = guestMods == Compat.SECompat.ModSignature;
+                bool modsMatch = guestMods == Compat.CompatRegistry.ModSignature;
                 bool match = versionMatch && modsMatch;
-                bool allow = match || (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value);
+                bool allow = (versionMatch || (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value))
+                          && (modsMatch || (AllowModMismatchConfig != null && AllowModMismatchConfig.Value));
 
                 string guestName = sender.ToString();
                 foreach (var member in LobbyManager.LobbyMembers)
@@ -927,14 +997,15 @@ namespace SailwindCoop
                 {
                     string what = !versionMatch
                         ? $"is on mod v{version} (you run v{PluginVersion})"
-                        : $"has Shipyard Expansion [{(guestMods == "" ? "none" : guestMods)}] (you have [{(Compat.SECompat.ModSignature == "" ? "none" : Compat.SECompat.ModSignature)}])";
+                        : "has a different mod set - " + Compat.CompatRegistry.DescribeMismatch(
+                              Compat.CompatRegistry.ModSignature, guestMods);
                     string fix = !versionMatch
                         ? $"Everyone must run v{PluginVersion}."
-                        : "Everyone must match the host's mod set.";
+                        : "Everyone must match the host's gameplay mods.";
                     Notify(allow
-                        ? $"{guestName} {what} - allowed by Coop.AllowVersionMismatch; expect desyncs."
+                        ? $"{guestName} {what} - allowed by config; expect desyncs."
                         : $"{guestName} {what} - refused. {fix}", 10f);
-                    Log.LogWarning($"[VERSION] {guestName} ({sender}) version {version} mods [{guestMods}] vs host {PluginVersion} [{Compat.SECompat.ModSignature}]: {(allow ? "ALLOWED by config" : "REFUSED")}");
+                    Log.LogWarning($"[VERSION] {guestName} ({sender}) version {version} mods [{guestMods}] vs host {PluginVersion} [{Compat.CompatRegistry.ModSignature}]: {(allow ? "ALLOWED by config" : "REFUSED")}");
                 }
 
                 // Ack BEFORE any revoke, or the refusal could never reach the guest.
@@ -942,7 +1013,7 @@ namespace SailwindCoop
                 {
                     w.Write(PluginVersion);
                     w.Write(allow);
-                    w.Write(Compat.SECompat.ModSignature); // (v0.2.31) trailing field, old guests ignore
+                    w.Write(Compat.CompatRegistry.ModSignature); // (v0.2.31, token composed since v0.2.32) trailing field, old guests ignore
                 });
 
                 if (!allow)
@@ -966,12 +1037,14 @@ namespace SailwindCoop
 
                 // (v0.2.27) The host refused us - quit cleanly instead of playing a half-admitted
                 // session (the host has already revoked our admission). (v0.2.31) Name the actual
-                // mismatch: version when versions differ, otherwise the SE mod set.
+                // mismatch: version when versions differ, otherwise the composed mod-set token.
                 if (!IsHost && !accepted)
                 {
                     string reason = version != PluginVersion
                         ? $"Mod version mismatch: the host runs v{version}, you run v{PluginVersion}. Everyone must install the same version."
-                        : $"Shipyard Expansion mismatch: host has [{(hostMods == "" ? "none" : hostMods)}], you have [{(Compat.SECompat.ModSignature == "" ? "none" : Compat.SECompat.ModSignature)}]. Everyone must run the same SE version (or nobody).";
+                        : "Mod set mismatch - " + Compat.CompatRegistry.DescribeMismatch(
+                              hostMods, Compat.CompatRegistry.ModSignature) +
+                          ". Everyone must run the same gameplay mods.";
                     EndGuestSessionAndQuit(reason);
                 }
             });
@@ -1471,6 +1544,35 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadSERigState(reader);
                 ShipyardSyncManager?.OnSERigStateReceived(packet, sender);
+            });
+
+            // Trapdoor/door/hatch absolute state (216, v0.2.32). Peer-origin; host star-relays inside
+            // the manager. Applies with an inMotion retry (vanilla OnActivate no-ops mid-animation).
+            NetworkManager.RegisterHandler(PacketType.TrapdoorState, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadTrapdoorState(reader);
+                TrapdoorSyncManager?.OnRemoteTrapdoorState(packet, sender);
+            });
+
+            // Leopard cutter deploy/recover (217, v0.2.32).
+            NetworkManager.RegisterHandler(PacketType.CutterState, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCutterState(reader);
+                LeopardSyncManager?.OnCutterState(packet, sender);
+            });
+
+            // Leopard oar input (218, v0.2.32). Unreliable stream; manager relays + applies.
+            NetworkManager.RegisterHandler(PacketType.OarInput, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadOarInput(reader);
+                LeopardSyncManager?.OnOarInput(packet, sender);
+            });
+
+            // Leopard bell (219, v0.2.32).
+            NetworkManager.RegisterHandler(PacketType.BellRing, (sender, reader) =>
+            {
+                var authorId = reader.ReadUInt64();
+                LeopardSyncManager?.OnBellRing(authorId, sender);
             });
 
             // Mission sync packets
@@ -2295,6 +2397,13 @@ namespace SailwindCoop
             // customization rebuild and before the frame-wait that precedes the rope re-key. Hard no-op when
             // SE is not installed, so a vanilla crew sends nothing at all.
             RunJoinStep("SERigState", () => ShipyardSyncManager?.SendAllRigBlobsTo(friend.Id));
+            // (v0.2.32) Authoritative door/hatch/gunport states: the guest's phantom load may have
+            // restored ITS OWN door states (NAND Tweaks toggleDoors); the host's reliable sends win.
+            RunJoinStep("TrapdoorStates", () => TrapdoorSyncManager?.SendAllStatesTo(friend.Id));
+            // (v0.2.32) Cutter deployed/stowed + live transform: the mod persists cutterActive in
+            // modData, which co-op does NOT transfer - without this send host and guest diverge on
+            // the second boat from the first frame.
+            RunJoinStep("CutterState", () => LeopardSyncManager?.SendCutterStateTo(friend.Id));
             // JOIN helm seed: HelmState is edge-triggered, so a guest joining while the host holds the
             // wheel steady would never receive the current rudder angle. Re-broadcast it now. This is a
             // host-side SEND of current helm state - orthogonal to the N-player helm LEASE (which arbitrates

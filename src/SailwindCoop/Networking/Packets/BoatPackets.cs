@@ -8,8 +8,11 @@ namespace SailwindCoop.Networking.Packets
     public struct NetworkMooringData
     {
         public bool IsMoored;
+        public MooringTargetKind TargetKind;   // (v0.2.32) see MooringStatePacket
         public Vector3 DockPosition;
         public float LengthSquared;
+        public string TowBoatName;
+        public string CleatPath;
     }
 
     [Serializable]

@@ -272,6 +272,10 @@ namespace SailwindCoop.Sync
 
                 // Boat state application is split into two phases:
                 // Phase A: Apply everything EXCEPT rope lengths (LoadData marks old ropes for Destroy)
+                // (v0.2.32 review) Fresh join = fresh deferred-cleat ledger: an earlier join that aborted
+                // (a throwing step, a disconnect mid-apply) could otherwise leak entries that reference
+                // ropes/boats from the previous world into this one's second pass.
+                _deferredCleatMoors.Clear();
                 var boatDataPairs = new List<(SaveableObject boat, NetworkBoatData data)>();
                 foreach (var hostBoat in packet.Boats)
                 {
@@ -347,10 +351,19 @@ namespace SailwindCoop.Sync
                     }
                 }
 
+                // (v0.2.32 review) SECOND PASS: cleat (tow) moors deferred out of every boat's Phase A.
+                // MUST be here - after the LAST boat's Phase A/B (so the towing boat AND the towed boat
+                // both sit at the host's positions and the 35m/50m span guards measure real geometry
+                // instead of a not-yet-teleported boat's stale one) and BEFORE the settle waits and the
+                // kinematic re-enable below (so a bad spring still cannot impart an impulse, exactly the
+                // ordering guarantee the inline dock moors get).
+                ApplyDeferredCleatMoors();
+
                 // Re-enable physics on all boats (was disabled in PhaseA for safe teleport)
                 // ORDERING GUARANTEE (v0.2.28 Fix B): all mooring decisions (ApplyMooringRopes, Phase A
-                // step 7, including the pre-moor span check) run while the boat is still KINEMATIC from
-                // Phase A step 1 - a bad spring anchor can never impart an impulse before it is vetted.
+                // step 7, including the pre-moor span check, and the deferred cleat pass above) run while
+                // the boat is still KINEMATIC from Phase A step 1 - a bad spring anchor can never impart
+                // an impulse before it is vetted.
                 // Keep this re-enable AFTER Phase A/B; do not move mooring after it.
                 // Let physics settle. REALTIME waits, NOT WaitForFixedUpdate: at timeScale==0 (host paused)
                 // FixedUpdate never runs, so WaitForFixedUpdate would HANG the join here. Realtime advances
@@ -1319,7 +1332,11 @@ namespace SailwindCoop.Sync
             var anchor = BoatUtility.GetAnchor(boat);
             if (anchor == null)
             {
-                Plugin.Log.LogWarning($"ApplyAnchorState SKIPPED: no Anchor resolvable on boat '{boat?.gameObject.name}'");
+                // (v0.2.32, P3) Anchorless boats are legitimate now: HMS Leopard's cutter (212) has no
+                // Anchor and a null BoatMooringRopes.anchor. Info, not warning - this fires once per
+                // boat per join and is expected for the cutter; a WARN here would train users to ignore
+                // real anchor-resolve failures on vanilla boats.
+                Plugin.Log.LogInfo($"ApplyAnchorState skipped: no Anchor on boat '{boat?.gameObject.name}' (anchorless boats are valid, e.g. the Leopard cutter)");
                 return;
             }
 
@@ -1746,110 +1763,19 @@ namespace SailwindCoop.Sync
 
                 if (data.IsMoored)
                 {
-                    var dock = FindClosestDockMooring(data.DockPosition, out float nearestMissDist);
-                    if (dock != null)
+                    if (data.TargetKind == MooringTargetKind.BoatCleat)
                     {
-                        // (v0.2.28 Fix B, rejoin-yank) PRE-MOOR span check, BEFORE the spring exists. A
-                        // purchased boat keeps its purchase-dock mooring flags while the host sails away
-                        // with the ropes still "attached", so the join snapshot says IsMoored=true at a
-                        // cleat the boat is now nowhere near. The boat was just teleported to the host's
-                        // LIVE position (ApplyBoatStatePhaseA step 2) and is still KINEMATIC here (physics
-                        // re-enables only after Phase B in the join coroutine) - but the moment physics
-                        // resumed, the far-away SpringJoint installed by MoorTo would violently yank the
-                        // brig back to the purchase dock. The existing 50m guard below runs AFTER MoorTo
-                        // and only catches divergent-frame geometry; measure the span NOW and skip the
-                        // moor entirely when it is impossible. Geometry: measure cleat -> the rope's HULL
-                        // ATTACHMENT point (boatRb.TransformPoint(springAnchor) - the exact point MoorTo
-                        // wires as SpringJoint.connectedAnchor), NOT cleat -> boat origin: on a big boat
-                        // the origin sits up to ~15-20m from the attachment, so an origin-based threshold
-                        // either false-positives on legit long-slack moors or has to be so loose it lets
-                        // real yanks through (the post-moor guard's 50m = 30m rope + that hull allowance).
-                        // Against the attachment point the rope's own max length is the whole story:
-                        // sqrt(maxLength=900)=30m cleat-to-springAnchor, +5m margin => 35m. XZ only - the
-                        // cleat's Y is horizon-sunk view-dependent junk (same reason FindClosestDockMooring
-                        // matches in the horizontal plane).
-                        var boatRb = rope.GetBoatRigidbody();
-                        if (boatRb != null)
-                        {
-                            var hullAttach = boatRb.transform.TransformPoint(SpringAnchorRef(rope));
-                            var preSpan = dock.transform.position - hullAttach;
-                            preSpan.y = 0f;
-                            if (preSpan.magnitude > 35f)
-                            {
-                                Plugin.Log.LogWarning($"  Rope {i}: pre-moor cleat-to-hull-attach span {preSpan.magnitude:F0}m to dock {dock.name} exceeds any real rope " +
-                                    $"(stale mooring from a dock the boat has left, e.g. a freshly bought boat sailed away); skipping moor + stowing rope");
-                                StowRopeIfDisplaced(rope, $"Rope {i}");
-                                continue;
-                            }
-                        }
-
-                        Plugin.Log.LogInfo($"  Rope {i}: Found dock {dock.name} at {dock.transform.position}, mooring...");
-                        if (rope.IsMoored()) rope.Unmoor(); // release any prior spring before re-moor (join/recovery re-apply) so a different-dock-instance resolve can't leak a second spring dragging the hull under
-                        rope.MoorTo(dock);
-                        rope.currentRopeLengthSquared = data.LengthSquared;
-
-                        // E (moored-sink residual) FIX: vanilla MoorTo (decomp PickupableBoatMooringRope.cs:247-262)
-                        // recomputes currentRopeLengthSquared = GetCurrentDistanceSquared() from the boat's CURRENT
-                        // (guest-local, floating-origin-offset) geometry and sets SpringJoint.maxDistance from THAT
-                        // local guess - so the just-moored guest spring holds a stale/wrong slack and drags the hull
-                        // toward a bad anchor (bow-first sink) until a later runtime rope-length sync arrives. We just
-                        // overwrote the currentRopeLengthSquared FIELD with the host's authoritative value above, but
-                        // the actual physics constraint (SpringJoint.maxDistance) still carries MoorTo's local guess.
-                        // Restore the authoritative maxDistance now, mirroring ControlSyncManager.OnRemoteMooringRope
-                        // LengthChanged (~line 1227: springJoint.maxDistance = Mathf.Sqrt(packet.LengthSquared)), so
-                        // the spring matches the host immediately instead of after the first scroll/settle sync.
-                        // NOTE: the dock ANCHOR itself is NOT offset-wrong - MoorTo anchors to mooring.transform
-                        // (the offset-correct local dock object) and the boat-local springAnchor, both offset-
-                        // independent - so only maxDistance needs correcting; re-deriving the whole spring on the
-                        // guest is unnecessary and would re-introduce the stale guess.
-                        var springJoint = MooredToSpringRef(rope);
-                        if (springJoint != null)
-                        {
-                            springJoint.maxDistance = Mathf.Sqrt(data.LengthSquared);
-                            Plugin.Log.LogInfo($"  Rope {i}: restored authoritative spring maxDistance={springJoint.maxDistance:F2} from host snapshot (lenSq={data.LengthSquared:F2})");
-                        }
-                        else
-                        {
-                            Plugin.Log.LogWarning($"  Rope {i}: MoorTo did not produce a spring joint; could not restore authoritative maxDistance");
-                        }
-
-                        Plugin.Log.LogInfo($"  Rope {i}: MoorTo completed, IsMoored now={rope.IsMoored()}");
-
-                        // VISUAL-STRETCH GUARD (issue #5): the X/Z dock match can resolve a dock that, on THIS
-                        // client, is NOT co-located with where the boat ended up. The visible line is redrawn every
-                        // LateUpdate from the rope end (pinned by MoorTo to the dock cleat) to the boat: the cleat
-                        // inherits the horizon-sunk island Y (the loaded island scene is slaved to the IslandHorizon
-                        // proxy) while the boat floats at true sea level, and cross-region/floating-origin state can
-                        // also separate them horizontally - so the moor is "logically" correct (tied to the pier) yet
-                        // renders a rope raking across/into the ocean. The rope's own max length is
-                        // sqrt(maxLength=900)=30m (cleat->hull springAnchor); the check below measures cleat->boat
-                        // ORIGIN, which adds at most a hull's worth (~15-20m on the largest boats), so 50m is a
-                        // safe margin over any LEGIT near-dock moor while still catching a divergent frame -> unmoor
-                        // + stow rather than leave a kilometre-long dockline. (v0.2.24 handled the dock-MATCH and the
-                        // no-dock MISS; this is the "matched but impossible geometry on this client" branch.)
-                        var stretchRb = rope.GetBoatRigidbody();
-                        if (stretchRb != null)
-                        {
-                            float moorSpan = Vector3.Distance(rope.transform.position, stretchRb.transform.position);
-                            if (moorSpan > 50f)
-                            {
-                                Plugin.Log.LogWarning($"  Rope {i}: post-moor span {moorSpan:F0}m implausible " +
-                                    $"(dock/boat frames diverge on this client); unmooring + stowing to avoid a stretched dockline");
-                                rope.Unmoor();
-                                StowRopeIfDisplaced(rope, $"Rope {i}");
-                            }
-                        }
+                        // (v0.2.32 review) Cleat targets live on ANOTHER boat that may not have been
+                        // teleported yet (PhaseA runs per boat in packet order) - mooring now would
+                        // measure the span against a stale position and the 35m/50m guards would stow a
+                        // perfectly real tow. Defer to ApplyDeferredCleatMoors, which the join coroutine
+                        // runs after EVERY boat's PhaseA teleport and before physics re-enable (boats
+                        // still kinematic, same ordering guarantee as inline moors).
+                        _deferredCleatMoors.Add((mooringRopes, i, data));
+                        continue;
                     }
-                    else
-                    {
-                        // Dock resolve MISS. Do NOT leave the rope diverged (host: moored, guest: half-applied
-                        // mid-state) - that is how a guest ends up with a LineRenderer stretched kilometers to a
-                        // horizon-sunk island. Deterministically stow the rope back on its hanger instead, but
-                        // only if it is actually moored/out of place - never disturb an already-stowed rope.
-                        Plugin.Log.LogWarning($"  Rope {i}: Could not find dock mooring near {data.DockPosition} (5m XZ radius, " +
-                                              $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); stowing rope instead of leaving it diverged");
-                        StowRopeIfDisplaced(rope, $"Rope {i}");
-                    }
+
+                    ApplyOneMooredRope(mooringRopes, i, data);
                 }
                 else
                 {
@@ -1859,6 +1785,169 @@ namespace SailwindCoop.Sync
                     Plugin.Log.LogInfo($"  Rope {i}: Not moored in data; ensuring stowed");
                     StowRopeIfDisplaced(rope, $"Rope {i} (unmoored in snapshot)");
                 }
+            }
+        }
+
+        // (v0.2.32 review) Cleat moors deferred from PhaseA until all boats are positioned.
+        private static readonly System.Collections.Generic.List<(BoatMooringRopes ropes, int index, NetworkMooringData data)> _deferredCleatMoors
+            = new System.Collections.Generic.List<(BoatMooringRopes, int, NetworkMooringData)>();
+
+        /// <summary>
+        /// Apply cleat (tow) moors AFTER every boat's PhaseA teleport. MUST run while boats are
+        /// still kinematic (before the physics re-enable in the join coroutine) so a bad spring can
+        /// never impart an impulse - the same ordering guarantee inline moors have.
+        /// </summary>
+        public static void ApplyDeferredCleatMoors()
+        {
+            if (_deferredCleatMoors.Count > 0)
+                Plugin.Log.LogInfo($"[JOIN] Applying {_deferredCleatMoors.Count} deferred cleat (tow) moor(s) now that every boat is positioned");
+
+            foreach (var entry in _deferredCleatMoors)
+            {
+                try { ApplyOneMooredRope(entry.ropes, entry.index, entry.data); }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[JOIN] Deferred cleat moor failed for rope {entry.index}: {e.Message}");
+                }
+            }
+            _deferredCleatMoors.Clear();
+        }
+
+        /// <summary>
+        /// Apply ONE moored rope from a snapshot entry: resolve the target (dock by position, cleat by
+        /// (boat, path) reference), vet the span, moor, and restore the authoritative rope length/spring.
+        /// Shared by the inline dock path in ApplyMooringRopes and the deferred cleat pass above - the
+        /// ONLY difference between the two is WHEN it runs, never WHAT it does.
+        /// </summary>
+        private static void ApplyOneMooredRope(BoatMooringRopes mooringRopes, int i, NetworkMooringData data)
+        {
+            if (mooringRopes == null || mooringRopes.ropes == null) return;
+            if (i < 0 || i >= mooringRopes.ropes.Length) return;
+            var rope = mooringRopes.ropes[i];
+            if (rope == null) return;
+
+            // (v0.2.32) A tow target is a TowingCleat on a MOVING boat, so the snapshot carries a
+            // (towBoatName, cleatPath) reference instead of a world position. Everything below
+            // (pre-moor 35m span check, MoorTo, authoritative lenSq + spring.maxDistance overwrite,
+            // 50m stretch guard, miss-stow) is SHARED - only the target lookup differs.
+            GPButtonDockMooring dock;
+            float nearestMissDist = float.PositiveInfinity;
+            if (data.TargetKind == MooringTargetKind.BoatCleat)
+            {
+                var towBoat = BoatUtility.FindBoatByName(data.TowBoatName);
+                var cleatT = towBoat != null ? SyncPathUtil.FindByRelativePath(towBoat.transform, data.CleatPath) : null;
+                dock = cleatT != null ? cleatT.GetComponent<GPButtonDockMooring>() : null;
+            }
+            else
+            {
+                dock = FindClosestDockMooring(data.DockPosition, out nearestMissDist);
+            }
+
+            if (dock != null)
+            {
+                // (v0.2.28 Fix B, rejoin-yank) PRE-MOOR span check, BEFORE the spring exists. A
+                // purchased boat keeps its purchase-dock mooring flags while the host sails away
+                // with the ropes still "attached", so the join snapshot says IsMoored=true at a
+                // cleat the boat is now nowhere near. The boat was just teleported to the host's
+                // LIVE position (ApplyBoatStatePhaseA step 2) and is still KINEMATIC here (physics
+                // re-enables only after Phase B in the join coroutine) - but the moment physics
+                // resumed, the far-away SpringJoint installed by MoorTo would violently yank the
+                // brig back to the purchase dock. The existing 50m guard below runs AFTER MoorTo
+                // and only catches divergent-frame geometry; measure the span NOW and skip the
+                // moor entirely when it is impossible. Geometry: measure cleat -> the rope's HULL
+                // ATTACHMENT point (boatRb.TransformPoint(springAnchor) - the exact point MoorTo
+                // wires as SpringJoint.connectedAnchor), NOT cleat -> boat origin: on a big boat
+                // the origin sits up to ~15-20m from the attachment, so an origin-based threshold
+                // either false-positives on legit long-slack moors or has to be so loose it lets
+                // real yanks through (the post-moor guard's 50m = 30m rope + that hull allowance).
+                // Against the attachment point the rope's own max length is the whole story:
+                // sqrt(maxLength=900)=30m cleat-to-springAnchor, +5m margin => 35m. XZ only - the
+                // cleat's Y is horizon-sunk view-dependent junk (same reason FindClosestDockMooring
+                // matches in the horizontal plane).
+                var boatRb = rope.GetBoatRigidbody();
+                if (boatRb != null)
+                {
+                    var hullAttach = boatRb.transform.TransformPoint(SpringAnchorRef(rope));
+                    var preSpan = dock.transform.position - hullAttach;
+                    preSpan.y = 0f;
+                    if (preSpan.magnitude > 35f)
+                    {
+                        Plugin.Log.LogWarning($"  Rope {i}: pre-moor cleat-to-hull-attach span {preSpan.magnitude:F0}m to dock {dock.name} exceeds any real rope " +
+                            $"(stale mooring from a dock the boat has left, e.g. a freshly bought boat sailed away); skipping moor + stowing rope");
+                        StowRopeIfDisplaced(rope, $"Rope {i}");
+                        return;
+                    }
+                }
+
+                Plugin.Log.LogInfo($"  Rope {i}: Found dock {dock.name} at {dock.transform.position}, mooring...");
+                if (rope.IsMoored()) rope.Unmoor(); // release any prior spring before re-moor (join/recovery re-apply) so a different-dock-instance resolve can't leak a second spring dragging the hull under
+                rope.MoorTo(dock);
+                rope.currentRopeLengthSquared = data.LengthSquared;
+
+                // E (moored-sink residual) FIX: vanilla MoorTo (decomp PickupableBoatMooringRope.cs:247-262)
+                // recomputes currentRopeLengthSquared = GetCurrentDistanceSquared() from the boat's CURRENT
+                // (guest-local, floating-origin-offset) geometry and sets SpringJoint.maxDistance from THAT
+                // local guess - so the just-moored guest spring holds a stale/wrong slack and drags the hull
+                // toward a bad anchor (bow-first sink) until a later runtime rope-length sync arrives. We just
+                // overwrote the currentRopeLengthSquared FIELD with the host's authoritative value above, but
+                // the actual physics constraint (SpringJoint.maxDistance) still carries MoorTo's local guess.
+                // Restore the authoritative maxDistance now, mirroring ControlSyncManager.OnRemoteMooringRope
+                // LengthChanged (~line 1227: springJoint.maxDistance = Mathf.Sqrt(packet.LengthSquared)), so
+                // the spring matches the host immediately instead of after the first scroll/settle sync.
+                // NOTE: the dock ANCHOR itself is NOT offset-wrong - MoorTo anchors to mooring.transform
+                // (the offset-correct local dock object) and the boat-local springAnchor, both offset-
+                // independent - so only maxDistance needs correcting; re-deriving the whole spring on the
+                // guest is unnecessary and would re-introduce the stale guess.
+                var springJoint = MooredToSpringRef(rope);
+                if (springJoint != null)
+                {
+                    springJoint.maxDistance = Mathf.Sqrt(data.LengthSquared);
+                    Plugin.Log.LogInfo($"  Rope {i}: restored authoritative spring maxDistance={springJoint.maxDistance:F2} from host snapshot (lenSq={data.LengthSquared:F2})");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning($"  Rope {i}: MoorTo did not produce a spring joint; could not restore authoritative maxDistance");
+                }
+
+                Plugin.Log.LogInfo($"  Rope {i}: MoorTo completed, IsMoored now={rope.IsMoored()}");
+
+                // VISUAL-STRETCH GUARD (issue #5): the X/Z dock match can resolve a dock that, on THIS
+                // client, is NOT co-located with where the boat ended up. The visible line is redrawn every
+                // LateUpdate from the rope end (pinned by MoorTo to the dock cleat) to the boat: the cleat
+                // inherits the horizon-sunk island Y (the loaded island scene is slaved to the IslandHorizon
+                // proxy) while the boat floats at true sea level, and cross-region/floating-origin state can
+                // also separate them horizontally - so the moor is "logically" correct (tied to the pier) yet
+                // renders a rope raking across/into the ocean. The rope's own max length is
+                // sqrt(maxLength=900)=30m (cleat->hull springAnchor); the check below measures cleat->boat
+                // ORIGIN, which adds at most a hull's worth (~15-20m on the largest boats), so 50m is a
+                // safe margin over any LEGIT near-dock moor while still catching a divergent frame -> unmoor
+                // + stow rather than leave a kilometre-long dockline. (v0.2.24 handled the dock-MATCH and the
+                // no-dock MISS; this is the "matched but impossible geometry on this client" branch.)
+                var stretchRb = rope.GetBoatRigidbody();
+                if (stretchRb != null)
+                {
+                    float moorSpan = Vector3.Distance(rope.transform.position, stretchRb.transform.position);
+                    if (moorSpan > 50f)
+                    {
+                        Plugin.Log.LogWarning($"  Rope {i}: post-moor span {moorSpan:F0}m implausible " +
+                            $"(dock/boat frames diverge on this client); unmooring + stowing to avoid a stretched dockline");
+                        rope.Unmoor();
+                        StowRopeIfDisplaced(rope, $"Rope {i}");
+                    }
+                }
+            }
+            else
+            {
+                // Dock resolve MISS. Do NOT leave the rope diverged (host: moored, guest: half-applied
+                // mid-state) - that is how a guest ends up with a LineRenderer stretched kilometers to a
+                // horizon-sunk island. Deterministically stow the rope back on its hanger instead, but
+                // only if it is actually moored/out of place - never disturb an already-stowed rope.
+                string missDesc = data.TargetKind == MooringTargetKind.BoatCleat
+                    ? $"Could not resolve tow cleat '{data.CleatPath}' on boat '{data.TowBoatName}'"
+                    : $"Could not find dock mooring near {data.DockPosition} (5m XZ radius, " +
+                      $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")})";
+                Plugin.Log.LogWarning($"  Rope {i}: {missDesc}; stowing rope instead of leaving it diverged");
+                StowRopeIfDisplaced(rope, $"Rope {i}");
             }
         }
 

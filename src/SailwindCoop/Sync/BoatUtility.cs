@@ -1,12 +1,16 @@
 using System.Collections.Generic;
 using System.Linq;
+using HarmonyLib;
 using UnityEngine;
 
 namespace SailwindCoop.Sync
 {
     public static class BoatUtility
     {
-        // Cache boats - boats don't change during gameplay, only refresh on scene load
+        // Cache boats. (v0.2.32) Boats CAN change during gameplay - modded boats (HMS Leopard's
+        // cutter) are spawned/activated at runtime - so the cache is invalidated on every lobby
+        // create/join/leave (Plugin lobby handlers) and whenever a compat module spawns or toggles
+        // a boat (LeopardSyncManager.ApplyCutterState).
         private static Dictionary<string, SaveableObject> _cachedBoats;
 
         // Cache rope controllers per boat - must be invalidated when sails change (via LoadData)
@@ -14,8 +18,8 @@ namespace SailwindCoop.Sync
             new Dictionary<SaveableObject, RopeController[]>();
 
         /// <summary>
-        /// Find all boats in the scene (cached indefinitely until ClearCaches is called).
-        /// Boats don't change during gameplay - there are always the same 7 boats.
+        /// Find all boats in the scene (cached until ClearCaches is called - lobby lifecycle events
+        /// and boat spawn/activation invalidate it; see the field comment above).
         /// </summary>
         public static Dictionary<string, SaveableObject> FindAllBoats()
         {
@@ -248,6 +252,75 @@ namespace SailwindCoop.Sync
         {
             _cachedBoats = null;
             _cachedRopes.Clear();
+        }
+
+        // (v0.2.32) Tow-pin rescan: mooring state changes on FOUR host-side paths (local attach
+        // patch, local detach patch, relayed-moor apply, relayed-unmoor apply), and per-rope
+        // bookkeeping cannot know whether OTHER ropes still hold a tow (a boat can be towed by two
+        // ropes) or whether the boat's pin is owned elsewhere (the deployed cutter's pin belongs to
+        // LeopardSyncManager). Rescan the boat's ropes instead: pinned iff ANY rope is currently
+        // moored to a TowingCleat; the active cutter is never unpinned here.
+        // (final review) LAZY, not a static initializer: a FieldRefAccess throw in the static ctor
+        // would be a TypeInitializationException that kills EVERY BoatUtility caller (FindAllBoats,
+        // GetAnchor, the rope sort key - the whole mod) for the session. Lazy + try means a vanilla
+        // rename degrades exactly one feature (tow pinning) with a log line.
+        private static HarmonyLib.AccessTools.FieldRef<PickupableBoatMooringRope, UnityEngine.SpringJoint> _towPinSpringRef;
+        private static bool _towPinSpringRefFailed;
+
+        private static UnityEngine.SpringJoint GetMooredSpring(PickupableBoatMooringRope rope)
+        {
+            if (_towPinSpringRefFailed) return null;
+            if (_towPinSpringRef == null)
+            {
+                try { _towPinSpringRef = HarmonyLib.AccessTools.FieldRefAccess<PickupableBoatMooringRope, UnityEngine.SpringJoint>("mooredToSpring"); }
+                catch (System.Exception e)
+                {
+                    _towPinSpringRefFailed = true;
+                    Plugin.Log.LogWarning("[BoatUtility] mooredToSpring did not resolve (vanilla changed?); tow stream pinning disabled. " + e.Message);
+                    return null;
+                }
+            }
+            return _towPinSpringRef(rope);
+        }
+
+        /// <summary>
+        /// Host-only: re-derive whether a boat should be pinned into the always-stream set because
+        /// it is under tow. Call after ANY moor/unmoor that could involve a towing cleat.
+        /// </summary>
+        public static void UpdateTowStreamPin(SaveableObject boat)
+        {
+            if (!Plugin.IsHost || boat == null) return;
+            // Tows only exist with TB; the cutter's pin is owned by LeopardSyncManager. Without TB
+            // HasTowingCleat is always false, so this helper could only ever UNPIN sets it does not own.
+            if (!Compat.TowableBoatsCompat.IsInstalled) return;
+
+            var mooringRopes = boat.GetComponent<BoatMooringRopes>();
+            if (mooringRopes?.ropes == null) return;
+
+            bool towed = false;
+            foreach (var rope in mooringRopes.ropes)
+            {
+                if (rope == null || !rope.IsMoored()) continue;
+                var spring = GetMooredSpring(rope);
+                if (spring != null && Compat.TowableBoatsCompat.HasTowingCleat(spring.gameObject))
+                {
+                    towed = true;
+                    break;
+                }
+            }
+
+            if (towed)
+            {
+                BoatSyncManager.RegisterAlwaysStream(boat.gameObject.name);
+            }
+            else
+            {
+                // The deployed cutter's pin is OWNED by LeopardSyncManager (deploy/stow events);
+                // a mere rope detach must not strip it.
+                if (boat.gameObject.name == Compat.LeopardCompat.CutterRootName
+                    && Compat.LeopardCompat.GetCutterActive()) return;
+                BoatSyncManager.UnregisterAlwaysStream(boat.gameObject.name);
+            }
         }
     }
 }

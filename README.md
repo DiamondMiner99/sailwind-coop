@@ -7,7 +7,7 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.2.31-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-v0.2.32-blue)](../../releases)
 [![game](https://img.shields.io/badge/Sailwind-v0.38-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -73,8 +73,63 @@ The requirement is the same as for the mod itself: either every player has the s
 Expansion version installed, or nobody does. A crew with mismatched Shipyard Expansion
 installs is refused at join, with a message naming the mismatch.
 
-Note that the `Coop.AllowVersionMismatch` config option is an escape hatch that also bypasses
+Note that the `Coop.AllowModMismatch` config option is an escape hatch that also bypasses
 this check, so turning it on lets a crew with mismatched Shipyard Expansion installs in too.
+
+### HMS Leopard (v0.2.32+)
+
+Full co-op support for winterspices' **HMS Leopard**: the whole crew can deploy and recover
+the cutter (its rowable tender), row it, ring the bell, and open or close all three gunport
+groups (lower, upper, quarter) - flooding included.
+
+Every player needs the exact same HMS Leopard version installed, or nobody does. A
+mismatched crew is refused at join, with a message naming HMS Leopard as the problem.
+
+Note that the `Coop.AllowModMismatch` config option is an escape hatch that also bypasses
+this check, so turning it on lets a crew with mismatched HMS Leopard installs in too.
+
+### Sail Collision Fix (v0.2.32+)
+
+Compatible with nandbrew's **Sail Collision Fix**. Its three options (ignore sail collision,
+ignore obstructed, ignore angle limits) change what rig an identical shipyard edit actually
+builds, so version and all three options are checked, not just whether the mod is present.
+
+A crew with mismatched Sail Collision Fix installs or settings is refused at join.
+`Coop.AllowModMismatch` is the same escape hatch as above.
+
+### NAND Tweaks (v0.2.32+)
+
+Compatible with nandbrew's **NAND Tweaks**. Most of it is cosmetic (outlines, camera, UI,
+decals, thumbnails, keybinds) and can differ freely between players. Only its six
+simulation-affecting options - bailing, drunken sleep, wheel centering, the Albacore fishing
+area, save/load state restore, and door toggling - have to match across the crew. A player
+without NAND Tweaks at all is treated the same as one with all six of those switched off.
+
+A mismatch in any of the six simulation options is refused at join, with a message naming
+which option differs. `Coop.AllowModMismatch` bypasses this check too. Note that NAND
+Tweaks' DEFAULTS are not vanilla (four of the six options default to on), so a host running
+it at defaults and a guest without the mod is a real simulation difference and will be
+refused - the refusal message lists the exact options that differ.
+
+### Deep Ports (v0.2.32+)
+
+Compatible with winterspices' **Deep Ports**. Because it replaces the physics terrain at
+Gold Rock, Fort (Aestrin) and Dragon Cliffs, presence, version, and the terrain asset bundle
+itself are all checked - down to a hash of the bundle file - so a corrupted or missing
+bundle is caught at join, the same as a plain version mismatch.
+
+A crew with mismatched Deep Ports installs is refused at join. `Coop.AllowModMismatch`
+bypasses this check.
+
+### Towable Boats (v0.2.32+)
+
+Compatible with nandbrew's **Towable Boats**: tows sync to the whole crew, creating a tow is
+host-authoritative so a guest can't start one by accident, and a towed hull keeps streaming
+to everyone even while nobody is standing on it. Its "Small boats can tow" option changes
+which hulls get a towing cleat at all, so it's checked alongside presence and version.
+
+A crew with mismatched Towable Boats installs, or a mismatched "Small boats can tow"
+setting, is refused at join. `Coop.AllowModMismatch` bypasses this check as well.
 
 ## Install
 

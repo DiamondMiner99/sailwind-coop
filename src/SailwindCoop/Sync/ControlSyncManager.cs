@@ -1298,18 +1298,27 @@ namespace SailwindCoop.Sync
 
         public void OnLocalMooringChanged(string boatName, int ropeIndex, bool isMoored,
             Vector3 dockPosition, float lengthSquared)
+            => OnLocalMooringChanged(boatName, ropeIndex, isMoored, dockPosition, lengthSquared,
+                MooringTargetKind.Dock, null, null);
+
+        public void OnLocalMooringChanged(string boatName, int ropeIndex, bool isMoored,
+            Vector3 dockPosition, float lengthSquared,
+            MooringTargetKind targetKind, string towBoatName, string cleatPath)
         {
             if (!Plugin.IsMultiplayer) return;
 
-            VerboseLogger.ControlSend($"MooringState, boat={boatName}, rope={ropeIndex}, moored={isMoored}, dockPos={dockPosition}");
+            VerboseLogger.ControlSend($"MooringState, boat={boatName}, rope={ropeIndex}, moored={isMoored}, kind={targetKind}, dockPos={dockPosition}, towBoat={towBoatName}, cleat={cleatPath}");
 
             var packet = new MooringStatePacket
             {
                 BoatName = boatName,
                 RopeIndex = ropeIndex,
                 IsMoored = isMoored,
+                TargetKind = targetKind,
                 DockPosition = dockPosition,
-                LengthSquared = lengthSquared
+                LengthSquared = lengthSquared,
+                TowBoatName = towBoatName ?? "",
+                CleatPath = cleatPath ?? ""
             };
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.MooringState, w =>
@@ -1423,10 +1432,30 @@ namespace SailwindCoop.Sync
 
                 if (packet.IsMoored)
                 {
-                    var dock = FindClosestDockMooring(packet.DockPosition, out float nearestMissDist);
+                    GPButtonDockMooring dock;
+                    float nearestMissDist = float.PositiveInfinity;
+                    if (packet.TargetKind == MooringTargetKind.BoatCleat)
+                    {
+                        // (v0.2.32) Cleat reference: resolve towing boat by name, cleat by path. The
+                        // rest of the moor apply (Unmoor-before-remoor, authoritative lenSq +
+                        // spring.maxDistance overwrite, 50m stretch guard, retry ledger) is SHARED
+                        // with docks - the cleat is just a GPButtonDockMooring that happens to move.
+                        // Guests must never re-derive spring params: spring = towedMass * 6 is baked
+                        // at MoorTo time and mass differs per client (+160 kg local-player term).
+                        dock = ResolveCleat(packet.TowBoatName, packet.CleatPath);
+                    }
+                    else
+                    {
+                        dock = FindClosestDockMooring(packet.DockPosition, out nearestMissDist);
+                    }
+
                     if (dock != null)
                     {
-                        _moorRetryCounts.Remove(retryKey);
+                        // NOTE: the retry ledger is NOT cleared here. The cleat branch of the stretch
+                        // guard below RE-USES it (a resolved cleat whose span is still bad = the towed
+                        // hull has not streamed yet), and clearing on resolve would reset its attempt
+                        // count every retry - an infinite retry loop. Cleared once the moor is settled,
+                        // below the guard.
                         // Release any prior dock SpringJoint before re-mooring. Vanilla MoorTo
                         // never clears an existing spring (only Unmoor does), so a re-moor that resolves a
                         // DIFFERENT dock instance than the one currently held would leave a leaked second spring
@@ -1458,15 +1487,58 @@ namespace SailwindCoop.Sync
                         var stretchRb = rope.GetBoatRigidbody();
                         if (stretchRb != null && Vector3.Distance(rope.transform.position, stretchRb.transform.position) > 50f)
                         {
+                            // Undo the bad spring first either way - it must never survive this frame.
                             rope.Unmoor();
+
+                            if (packet.TargetKind == MooringTargetKind.BoatCleat)
+                            {
+                                // (v0.2.32 review) A tow target is a MOVING boat: on a guest, the towed
+                                // hull's always-stream pin was created on the host at the same instant as
+                                // this moor, so our local copy may still be drifted when the first apply
+                                // lands and the span check fails spuriously. Retry like a dock miss - one
+                                // second later the pinned boat's transform has snapped and the moor holds.
+                                // Docks keep the immediate stow (they are static; a failed span there is real).
+                                _moorRetryCounts.TryGetValue(retryKey, out int spanAttempts);
+                                spanAttempts++;
+                                if (spanAttempts < MoorResolveMaxAttempts)
+                                {
+                                    _moorRetryCounts[retryKey] = spanAttempts;
+                                    Plugin.Log.LogWarning($"Cleat moor span implausible for rope {packet.RopeIndex} ({packet.BoatName}) " +
+                                                          $"to cleat '{packet.CleatPath}' on '{packet.TowBoatName}' (towed hull likely not streamed to its host position yet); " +
+                                                          $"unmoored + retry {spanAttempts}/{MoorResolveMaxAttempts - 1} in {MoorResolveRetryDelay:F0}s");
+                                    StartCoroutine(RetryMoorAfterDelay(packet, sender, retryKey,
+                                        _moorPacketGen.TryGetValue(retryKey, out int spanGen) ? spanGen : 0));
+                                    return;
+                                }
+                                // Retries exhausted: the span is real. Fall through to the conservative stow.
+                                _moorRetryCounts.Remove(retryKey);
+                            }
+
                             BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
                             VerboseLogger.ControlApply($"Rope {packet.RopeIndex}: post-moor span implausible; stowed instead of a stretched dockline");
                             // Host + originator must not diverge: tell the crew the moor was abandoned.
                             BroadcastCorrectiveUnmoor(packet, "post-moor span implausible");
                         }
+
+                        // Target resolved and the span was either fine or terminally abandoned: this
+                        // packet is done with the retry ledger. (A cleat span retry returned above and
+                        // deliberately keeps its count.)
+                        _moorRetryCounts.Remove(retryKey);
+
+                        // (v0.2.32, P4) The attach/detach patches are suppressed while applying remote
+                        // state, so the host must maintain the tow pin here for guest-initiated changes.
+                        BoatUtility.UpdateTowStreamPin(boat);
                     }
                     else
                     {
+                        // (v0.2.32) A cleat can be momentarily unresolvable too (island/boat streaming,
+                        // Towable Boats' deferred cleat instantiation), so it shares the retry ledger -
+                        // only the miss DESCRIPTION differs (DockPosition is zero for cleats).
+                        string missDesc = packet.TargetKind == MooringTargetKind.BoatCleat
+                            ? $"no cleat '{packet.CleatPath}' on tow boat '{packet.TowBoatName}'"
+                            : $"no dock near {packet.DockPosition} (5m XZ radius, nearest candidate " +
+                              $"{(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")})";
+
                         _moorRetryCounts.TryGetValue(retryKey, out int attempts);
                         attempts++;
                         if (attempts < MoorResolveMaxAttempts)
@@ -1476,8 +1548,7 @@ namespace SailwindCoop.Sync
                             // stowing on the first miss (which deleted a real moor on this side only - the
                             // "rope vanished for the host but not the client" report).
                             _moorRetryCounts[retryKey] = attempts;
-                            Plugin.Log.LogWarning($"Mooring resolve miss for rope {packet.RopeIndex} ({packet.BoatName}): no dock near " +
-                                                  $"{packet.DockPosition} (5m XZ radius, nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); " +
+                            Plugin.Log.LogWarning($"Mooring resolve miss for rope {packet.RopeIndex} ({packet.BoatName}): {missDesc}; " +
                                                   $"retry {attempts}/{MoorResolveMaxAttempts - 1} in {MoorResolveRetryDelay:F0}s");
                             StartCoroutine(RetryMoorAfterDelay(packet, sender, retryKey,
                                 _moorPacketGen.TryGetValue(retryKey, out int gen) ? gen : 0));
@@ -1488,8 +1559,8 @@ namespace SailwindCoop.Sync
                         // island" class. Stow it deterministically; guarded so an already-stowed rope is
                         // untouched, and (host) broadcast the abandonment so the originator agrees.
                         _moorRetryCounts.Remove(retryKey);
-                        Plugin.Log.LogWarning($"Mooring FAILED after {MoorResolveMaxAttempts} attempts: no dock near {packet.DockPosition} (5m XZ radius, " +
-                                              $"nearest candidate {(float.IsPositiveInfinity(nearestMissDist) ? "none" : nearestMissDist.ToString("F1") + "m")}); stowing rope {packet.RopeIndex} instead of leaving it diverged");
+                        Plugin.Log.LogWarning($"Mooring FAILED after {MoorResolveMaxAttempts} attempts: {missDesc}; " +
+                                              $"stowing rope {packet.RopeIndex} instead of leaving it diverged");
                         BoatStateApplicator.StowRopeIfDisplaced(rope, $"Rope {packet.RopeIndex} ({packet.BoatName})");
                         if (!rope.IsMoored())
                             BroadcastCorrectiveUnmoor(packet, "dock unresolved after retries");
@@ -1519,12 +1590,26 @@ namespace SailwindCoop.Sync
                     }
 
                     VerboseLogger.ControlApply($"Unmoored rope {packet.RopeIndex}, boat={packet.BoatName}");
+
+                    // (v0.2.32, P4) The attach/detach patches are suppressed while applying remote
+                    // state, so the host must maintain the tow pin here for guest-initiated changes.
+                    BoatUtility.UpdateTowStreamPin(boat);
                 }
             }
             finally
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        /// <summary>(v0.2.32) Resolve a tow-cleat mooring target from its wire reference.</summary>
+        private GPButtonDockMooring ResolveCleat(string towBoatName, string cleatPath)
+        {
+            var towBoat = BoatUtility.FindBoatByName(towBoatName);
+            if (towBoat == null) return null;
+            var cleatT = SyncPathUtil.FindByRelativePath(towBoat.transform, cleatPath);
+            // TowingCleat IS-A GPButtonDockMooring, so the vanilla component fetch covers both.
+            return cleatT != null ? cleatT.GetComponent<GPButtonDockMooring>() : null;
         }
 
         // Matches on X/Z ONLY: island (and thus dock) Y is VIEW-DEPENDENT - vanilla

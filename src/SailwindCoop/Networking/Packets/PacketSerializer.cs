@@ -303,6 +303,9 @@ namespace SailwindCoop.Networking.Packets
                     writer.Write(mooring.DockPosition.y);
                     writer.Write(mooring.DockPosition.z);
                     writer.Write(mooring.LengthSquared);
+                    writer.Write((byte)mooring.TargetKind);
+                    writer.Write(mooring.TowBoatName ?? "");
+                    writer.Write(mooring.CleatPath ?? "");
                 }
             }
 
@@ -398,7 +401,10 @@ namespace SailwindCoop.Networking.Packets
                         reader.ReadSingle(),
                         reader.ReadSingle()
                     ),
-                    LengthSquared = reader.ReadSingle()
+                    LengthSquared = reader.ReadSingle(),
+                    TargetKind = (MooringTargetKind)reader.ReadByte(),
+                    TowBoatName = reader.ReadString(),
+                    CleatPath = reader.ReadString()
                 };
             }
 
@@ -794,10 +800,13 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.BoatName);
             writer.Write(packet.RopeIndex);
             writer.Write(packet.IsMoored);
+            writer.Write((byte)packet.TargetKind);
             writer.Write(packet.DockPosition.x);
             writer.Write(packet.DockPosition.y);
             writer.Write(packet.DockPosition.z);
             writer.Write(packet.LengthSquared);
+            writer.Write(packet.TowBoatName ?? "");
+            writer.Write(packet.CleatPath ?? "");
         }
 
         public static MooringStatePacket ReadMooringState(BinaryReader reader)
@@ -807,12 +816,15 @@ namespace SailwindCoop.Networking.Packets
                 BoatName = reader.ReadString(),
                 RopeIndex = reader.ReadInt32(),
                 IsMoored = reader.ReadBoolean(),
+                TargetKind = (MooringTargetKind)reader.ReadByte(),
                 DockPosition = new Vector3(
                     reader.ReadSingle(),
                     reader.ReadSingle(),
                     reader.ReadSingle()
                 ),
-                LengthSquared = reader.ReadSingle()
+                LengthSquared = reader.ReadSingle(),
+                TowBoatName = reader.ReadString(),
+                CleatPath = reader.ReadString()
             };
         }
 
@@ -1151,6 +1163,74 @@ namespace SailwindCoop.Networking.Packets
             {
                 BoatName = reader.ReadString(),
                 RigBlob = reader.ReadString()
+            };
+        }
+
+        #endregion
+
+        #region Trapdoor Packets Serialization
+
+        // (v0.2.32) Trapdoor state. Write order MUST equal Read order.
+        public static void WriteTrapdoorState(BinaryWriter writer, TrapdoorStatePacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+            writer.Write(packet.Key ?? "");
+            writer.Write(packet.IsOpen);
+            writer.Write(packet.IsGunportGroup);
+        }
+
+        public static TrapdoorStatePacket ReadTrapdoorState(BinaryReader reader)
+        {
+            return new TrapdoorStatePacket
+            {
+                BoatName = reader.ReadString(),
+                Key = reader.ReadString(),
+                IsOpen = reader.ReadBoolean(),
+                IsGunportGroup = reader.ReadBoolean()
+            };
+        }
+
+        #endregion
+
+        #region Cutter Packets Serialization
+
+        // (v0.2.32) Leopard cutter state. Write order MUST equal Read order.
+        public static void WriteCutterState(BinaryWriter writer, CutterStatePacket packet)
+        {
+            writer.Write(packet.Active);
+            WriteVector3(writer, packet.RealPosition);
+            WriteQuaternion(writer, packet.Rotation);
+            writer.Write(packet.IsRequest);
+        }
+
+        public static CutterStatePacket ReadCutterState(BinaryReader reader)
+        {
+            return new CutterStatePacket
+            {
+                Active = reader.ReadBoolean(),
+                RealPosition = ReadVector3(reader),
+                Rotation = ReadQuaternion(reader),
+                IsRequest = reader.ReadBoolean()
+            };
+        }
+
+        #endregion
+
+        #region Oar Packets Serialization
+
+        // (v0.2.32) Leopard oar input. Write order MUST equal Read order.
+        public static void WriteOarInput(BinaryWriter writer, OarInputPacket packet)
+        {
+            writer.Write(packet.KeyBits);
+            writer.Write(packet.AuthorId);
+        }
+
+        public static OarInputPacket ReadOarInput(BinaryReader reader)
+        {
+            return new OarInputPacket
+            {
+                KeyBits = reader.ReadByte(),
+                AuthorId = reader.ReadUInt64()
             };
         }
 

@@ -8,6 +8,12 @@ namespace SailwindCoop.Sync
 {
     public static class BoatStateCollector
     {
+        // (v0.2.32) Private vanilla field holding the live mooring SpringJoint - the joint's GameObject
+        // IS the bollard the rope is tied to (dock cleat or, under Towable Boats, a TowingCleat on
+        // another boat). Mirrors the FieldRef in BoatStateApplicator.
+        private static readonly HarmonyLib.AccessTools.FieldRef<PickupableBoatMooringRope, UnityEngine.SpringJoint> MooredToSpringRef =
+            HarmonyLib.AccessTools.FieldRefAccess<PickupableBoatMooringRope, UnityEngine.SpringJoint>("mooredToSpring");
+
         /// <summary>
         /// Collect full state of all boats for initial sync.
         /// </summary>
@@ -530,29 +536,53 @@ namespace SailwindCoop.Sync
                 var rope = mooringRopes.ropes[i];
                 bool isMoored = rope.IsMoored();
                 Vector3 dockPos = Vector3.zero;
+                var targetKind = MooringTargetKind.Dock;
+                string towBoatName = "";
+                string cleatPath = "";
 
                 if (isMoored)
                 {
-                    // Use rope's current world position when moored (the rope end is at the dock),
-                    // converted to real coords for cross-region sync.
-                    dockPos = rope.transform.position - offset;
+                    // (v0.2.32) Tow-aware: a rope moored to a TowingCleat serializes a boat+path
+                    // reference; a world position on a MOVING bollard would be stale immediately.
+                    var spring = MooredToSpringRef(rope);
+                    if (spring != null && Compat.TowableBoatsCompat.HasTowingCleat(spring.gameObject))
+                    {
+                        var towBoat = spring.GetComponentInParent<SaveableObject>();
+                        var path = towBoat != null ? SyncPathUtil.GetRelativePath(towBoat.transform, spring.transform) : null;
+                        if (towBoat != null && !string.IsNullOrEmpty(path))
+                        {
+                            targetKind = MooringTargetKind.BoatCleat;
+                            towBoatName = towBoat.gameObject.name;
+                            cleatPath = path;
+                        }
+                    }
 
-                    // Y SANITIZATION (wire format unchanged): the rope is parented to the dock cleat, and
-                    // vanilla IslandHorizon.ApplyNewHorizon sinks far island roots by -(d^2/(2*515662))-2*camY
-                    // every LateUpdate (uncapped; ~-10km at 100km), so this Y is a VIEW-DEPENDENT render value,
-                    // not a stable world coordinate (observed dockPos y=-10110 in a join snapshot). Receivers
-                    // on this build match docks by X/Z only, but older receivers (v0.2.22/23) still 3D-match
-                    // within 5m - replace Y with the boat's own Y (a moored boat floats at the dock, so this
-                    // is within a couple meters of the true cleat height) so at least LOCAL docks still
-                    // resolve for them instead of being off by kilometers.
-                    dockPos.y = boat.transform.position.y - offset.y;
+                    if (targetKind == MooringTargetKind.Dock)
+                    {
+                        // Use rope's current world position when moored (the rope end is at the dock),
+                        // converted to real coords for cross-region sync.
+                        dockPos = rope.transform.position - offset;
+
+                        // Y SANITIZATION (wire format unchanged): the rope is parented to the dock cleat, and
+                        // vanilla IslandHorizon.ApplyNewHorizon sinks far island roots by -(d^2/(2*515662))-2*camY
+                        // every LateUpdate (uncapped; ~-10km at 100km), so this Y is a VIEW-DEPENDENT render value,
+                        // not a stable world coordinate (observed dockPos y=-10110 in a join snapshot). Receivers
+                        // on this build match docks by X/Z only, but older receivers (v0.2.22/23) still 3D-match
+                        // within 5m - replace Y with the boat's own Y (a moored boat floats at the dock, so this
+                        // is within a couple meters of the true cleat height) so at least LOCAL docks still
+                        // resolve for them instead of being off by kilometers.
+                        dockPos.y = boat.transform.position.y - offset.y;
+                    }
                 }
 
                 data[i] = new NetworkMooringData
                 {
                     IsMoored = isMoored,
+                    TargetKind = targetKind,
                     DockPosition = dockPos,
-                    LengthSquared = rope.currentRopeLengthSquared
+                    LengthSquared = rope.currentRopeLengthSquared,
+                    TowBoatName = towBoatName,
+                    CleatPath = cleatPath
                 };
             }
             return data;

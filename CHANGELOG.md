@@ -14,6 +14,75 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.32 - 2026-07-14
+
+> **All players must update.** The network format changed: mooring (including the join
+> snapshot) now carries a reference to what a rope is actually tied to - a dock or a boat's
+> own towing cleat - instead of a bare position, because a moving cleat can't be described
+> that way. Four packets are new (door/trapdoor state, and three for the Leopard: cutter,
+> oars, bell). This release also adds full co-op support for two more community mods -
+> winterspices' **HMS Leopard** and nandbrew's **Towable Boats** - and replaces the old single-mod
+> (Shipyard Expansion only) join gate with a proper compatibility gate that covers five
+> mods at once, tiered by what actually needs to match.
+>
+> If nobody in your crew runs any of these mods, nothing changes for you beyond updating.
+
+### Added
+- **Tiered mod-compatibility gate.** The join-time mod check (added in v0.2.31 for Shipyard
+  Expansion alone) is now a registry covering **HMS Leopard**, **Sail Collision Fix**,
+  **Deep Ports**, **Towable Boats** and **NAND Tweaks**. Most of these are gated on hard
+  parity - install and relevant settings must match exactly, because they change what a
+  shipyard edit builds or swap the physics terrain itself (Deep Ports is checked down to a
+  hash of its terrain bundle file, so a corrupted or missing bundle is caught too, not just
+  a version number). NAND Tweaks is the exception: only its six simulation-affecting options
+  (bailing, drunken sleep, wheel centering, the Albacore fishing area, save/load restore,
+  door toggling) are gated - its cosmetic options (outlines, camera, UI, decals) stay free
+  per player, and a peer without the mod at all is treated the same as one with every sim
+  option switched off. Refusal messages name the specific mod (and for NAND Tweaks, the
+  specific option) that differs. New config `Coop.AllowModMismatch`, split out of
+  `Coop.AllowVersionMismatch`, is the escape hatch for this check specifically.
+- **Generic door/hatch/trapdoor sync**, for the first time on every boat, not just modded
+  ones. HMS Leopard's gunports are handled as a special case: one click fans out to a whole
+  port group, and the flooding masks that come with it are forced to an absolute state on
+  receivers (rather than toggled) so repeated open/close spam can never leave a guest's
+  flooding inverted from the host's.
+- **HMS Leopard co-op support.** The cutter (its rowable tender) can be deployed and
+  recovered by host or guest - the host still runs the mod's own gates (speed limit to
+  deploy, no recovering with anyone left aboard), a guest only sends the request. Rowing is
+  host-authoritative (the host applies the oar force so its own boat-motion frame rate
+  matches the mod's own frame-rate-dependent thrust), with everyone else seeing the oars
+  animate. The bell and all three gunport groups (lower, upper, quarter) sync to the crew.
+- **Towable Boats co-op support.** A tow is synced as a reference to the towing cleat it's
+  attached to, not a world position - a bollard on a moving boat has no fixed position to
+  send. Tow creation is host-authoritative (a guest dragging a loose rope near a cleat
+  cannot start a tow on its own), and a towed hull keeps streaming to the whole crew even
+  while nobody is standing on it. Guests now run the vanilla performance-mode decision
+  instead of Towable Boats' tow-chain override, so guest-side hull physics no longer fights
+  the host's authoritative transform stream with varying strength.
+
+### Fixed
+- **Bailing water did nothing for the rest of the crew when a guest had NAND Tweaks
+  installed** - a live bug that predates this release. NAND Tweaks replaces the bailing
+  routine with a prefix that skips the original method; the mod's own bail-broadcast hook
+  lived in that skipped original, so it never ran on a guest's machine. The prefix now
+  passes `__runOriginal` through correctly.
+- **A boat built or spawned after the session started could be invisible to sync** (the
+  Leopard's cutter, a purchased ship, a shipyard build). The boat-name lookup cache is now
+  invalidated on lobby create, join and leave instead of being trusted for the rest of the
+  session.
+- **Boats with no anchor** (the cutter has none) no longer produce anchor-sync errors in the
+  log; anchor paths are verified before use instead of assumed.
+- **An empty deployed cutter, or a towed boat with nobody aboard, could be silently pruned**
+  from the stream list as if it had gone out of relevance. Both now stay on an always-stream
+  list so they keep syncing unmanned.
+
+### Notes
+- HMS Leopard, Sail Collision Fix, NAND Tweaks, Deep Ports and Towable Boats support is
+  entirely optional and implemented as soft dependencies: with none of them installed, none
+  of this code runs and behaviour is unchanged.
+- Untested in live play, like every release here. If a Leopard or a tow looks wrong on one
+  machine, grab `BepInEx/LogOutput.log` from everyone.
+
 ## v0.2.31 - 2026-07-13
 
 > Adds compatibility with nandbrew's **Shipyard Expansion**. Custom rigs (extra masts,

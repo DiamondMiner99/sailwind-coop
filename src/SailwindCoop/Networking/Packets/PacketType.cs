@@ -246,5 +246,33 @@ namespace SailwindCoop.Networking.Packets
         // Sent per boat after the join snapshot and on live shipyard edits; host star-relays.
         // Additive wire; only sent when SE is installed (handshake enforces SE parity anyway).
         SERigState = 215,                // Editing peer -> all / host -> joiner: SE sail-extras blob for one boat
+
+        // Trapdoor/door/hatch sync (216, v0.2.32): vanilla GPButtonTrapdoor open/close is purely
+        // local (no co-op sync existed for ANY door), and HMS Leopard drives its flooding through 60
+        // gunport trapdoors. Carries ABSOLUTE open state keyed by boat name + a name~occurrence key
+        // over the boat's trapdoor set (prefab-baked, so the occurrence order matches cross-machine).
+        // For Leopard gunports the key is the GROUP ("lower"/"upper"/"quarter") and the receiver
+        // reproduces the mod's own fan-out then forces the flooding masks absolute
+        // (LeopardCompat.ForceGunportAbsolutes). Peer-origin; host star-relays.
+        TrapdoorState = 216,             // Any peer -> all: absolute trapdoor/gunport-group open state
+
+        // HMS Leopard cutter (217, v0.2.32): the mod deploys/recovers a SECOND full boat with purely
+        // local gates (Leopard rigidbody velocity, items-left-aboard child count) that read state a
+        // guest does not own. Guests send intent (IsRequest); the host runs the mod's OWN controller
+        // (gates included) and broadcasts the authoritative result. Sent to joiners after the world
+        // snapshot - the mod persists cutterActive in modData, which co-op does NOT transfer.
+        CutterState = 217,               // Guest -> host (IsRequest) / host -> all (authoritative)
+
+        // Leopard oars (218, v0.2.32): OarController.ExtraLateUpdate applies AddForce/AddTorque from
+        // LOCAL WASD to the cutter rigidbody. The rower keeps its local prediction (reconciled by the
+        // boat-transform correction, like wind/buoyancy); these key bits let the HOST apply the same
+        // force to the authoritative hull and let everyone else animate the oars. Unreliable, 10Hz,
+        // zero-bits sent once on release; host relays to other guests.
+        OarInput = 218,                  // Rower -> all (host relays): held-key bits for the cutter oars
+
+        // Leopard bell (219, v0.2.32): one-shot "ring the bell" audio event. Receiver plays the
+        // bell's own AudioSource directly (never OnActivate - no echo possible). Empty body except
+        // the author id; host relays.
+        BellRing = 219,                  // Ringer -> all (host relays): play the Leopard's bell
     }
 }
