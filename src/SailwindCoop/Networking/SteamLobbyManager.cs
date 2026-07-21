@@ -477,7 +477,11 @@ namespace SailwindCoop.Networking
 
         private void HandleLobbyInvite(Friend friend, Lobby lobby)
         {
-            VerboseLogger.LobbyEvent($"Invite received from {friend.Name}, lobby={lobby.Id}");
+            VerboseLogger.LobbyEvent($"Invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
+            // Mirror to the main BepInEx log with the sender's SteamID, so an unexpected or unwanted invite
+            // can be traced to an exact account (and blocked) even without the verbose log - persona names
+            // are user-changeable and can collide, so the name alone can't positively identify the account.
+            Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
 
             // Do NOT auto-join. Auto-joining yanked the friend out of their own game with no consent (and
             // risked their save). Let Steam show its own clickable invite; ACCEPTING it fires
@@ -495,8 +499,11 @@ namespace SailwindCoop.Networking
             _lastInviteToastTime = now;
 
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
-            string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "A friend" : friend.Name;
-            Plugin.Notify($"{name} invited you to co-op - accept it in Steam to join", 6f);
+            string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
+            // Steam only surfaces its OWN invite popup for friends (and only with the overlay enabled), yet the
+            // LobbyInvite callback still reaches us either way - so don't promise a Steam prompt that may never
+            // appear. Say how to join if one shows, and what it means when it doesn't.
+            Plugin.Notify($"{name} invited you to co-op. Accept it in Steam to join - if no Steam invite appears, they are likely not on your Steam friends list.", 8f);
         }
 
         private void HandleLobbyGameCreated(Lobby lobby, uint ip, ushort port, SteamId gameServerId)

@@ -14,6 +14,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.33 - 2026-07-21
+
+> Compatible with v0.2.32 - no network format change, so crew do not need to update in
+> lockstep. This is a diagnostics and wording fix only.
+
+### Changed
+- **Co-op invite toast wording.** The pop-up shown when someone invites you no longer
+  promises a Steam invite that may never appear. Steam only surfaces its own invite
+  notification for people on your friends list (and only with the Steam overlay enabled),
+  but the co-op mod receives the invite callback either way - so the toast now tells you to
+  accept in Steam *if* a prompt shows, and notes that no prompt usually means the sender is
+  not on your Steam friends list.
+
+### Diagnostics
+- The received-invite log line now records the sender's **SteamID** alongside their persona
+  name, and mirrors it to the main BepInEx log (`LogOutput.log`), not just the co-op verbose
+  log. An unexpected or unwanted invite can now be traced to an exact account and blocked in
+  Steam - persona names are user-changeable and can collide, so the name alone could not
+  positively identify who sent it.
+
 ## v0.2.32 - 2026-07-14
 
 > **All players must update.** The network format changed: mooring (including the join
