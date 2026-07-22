@@ -121,7 +121,12 @@ namespace SailwindCoop.Sync
 
         private void SendWeatherState()
         {
-            if (Time.time - _lastSyncTime < SyncInterval) return;
+            // (v0.2.35) Apply the co-op-sleep throttle like the other high-frequency senders (boat/control/
+            // time/damage). This gate compares scaled Time.time, so during the 16x sleep warp it otherwise
+            // fires ~16x faster in REAL time (~32Hz on the RELIABLE channel, which is never coalesced) - the
+            // one sender the v0.2.25 scaling pass missed. HostSleepSendIntervalScale=16 during sleep cancels
+            // the warp back to the ~2Hz design rate.
+            if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.HostSleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
             var packet = CollectWeatherState();

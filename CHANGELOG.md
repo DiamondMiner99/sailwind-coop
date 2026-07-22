@@ -14,6 +14,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.35 - 2026-07-22
+
+> Everyone must update (the version handshake refuses mixed crews as usual), but there is no
+> network-format change - the fix is entirely host-side send timing.
+
+### Fixed
+
+- **Crewmate hard-crashes / freezes when sleeping (had to force-close and rejoin).** v0.2.34 fixed
+  the *host* side (the host now wakes correctly and is no longer stuck), but the crewmate still
+  froze. Root cause, confirmed from host + client logs: during a sleep the host streams updates on a
+  timer measured in *game* time, which runs at 16x while sleeping - so a "10 per second" channel
+  actually fired ~80 per second. On an **unmoored** sleep the moving ship pushes the rudder, so the
+  wheel drifts every frame and the host sent a steering-wheel update *every* frame, flooding the
+  crewmate until their game locked up. The sleep-time send throttle now actually cancels the 16x
+  speed-up (so the real rate matches normal play instead of ~8x it), and the steering-wheel stream -
+  which is invisible on the sleep screen anyway - is suppressed entirely while asleep and resynced on
+  waking. Moored/tavern sleeps were less affected because the ship (and rudder) sit still.
+
 ## v0.2.34 - 2026-07-21
 
 > **All players must update.** Built for the Sailwind **0.38.1** hotfix, and two existing

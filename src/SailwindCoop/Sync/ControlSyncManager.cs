@@ -290,8 +290,16 @@ namespace SailwindCoop.Sync
             var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
             if (wheel != null)
             {
-                // Poll helm input
-                if (Mathf.Abs(wheel.currentInput - _lastHelmInput) > 0.001f)
+                // Poll helm input. SUPPRESSED during a co-op sleep warp (v0.2.35): the wheel/rudder is
+                // invisible on the guest's black sleep screen, but on an UNMOORED sleep the moving boat
+                // pushes the rudder so the wheel drifts every frame - at 16x that fired an on-change
+                // HelmState ~80x/sec (confirmed in a guest crash log), the dominant packet flood that froze
+                // the guest. Nothing on the guest needs it while asleep (its boat is host-snapped, not
+                // rudder-driven). We deliberately do NOT update _lastHelmInput while asleep, so the first
+                // post-wake poll sees the accumulated drift and sends ONE catch-up HelmState to resync the
+                // guest's wheel.
+                if (!SleepSyncManager.IsCoopSleepWarpActive &&
+                    Mathf.Abs(wheel.currentInput - _lastHelmInput) > 0.001f)
                 {
                     _lastHelmInput = wheel.currentInput;
                     OnLocalHelmChanged(boatName, wheel.currentInput, false);
