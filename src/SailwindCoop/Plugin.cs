@@ -34,7 +34,7 @@ namespace SailwindCoop
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
         // load. This is the v0.2.33 build (invite-log SteamID + toast reword); shows as 0.2.33.
-        public const string PluginVersion = "0.2.33";
+        public const string PluginVersion = "0.2.34";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -844,6 +844,13 @@ namespace SailwindCoop
                     // host's join-time one-shot weather send.)
                 }
 
+                // (v0.2.34) SESSION-START sleep reset (join side): the sleep machine was only ever reset by
+                // TEARDOWN paths, so a half-torn previous session (vanilla GameState.sleeping stuck true
+                // after a failed wake) survived into the next lobby - the reported "host re-invites and is
+                // permanently stuck sleeping, crew can never sleep with them again". AbortSleep is a no-op
+                // when clean and (since its v0.2.34 guard) also repairs vanilla-only leftovers.
+                Sync.SleepSyncManager.Instance?.AbortSleep();
+
                 // Record our session role NOW (before any later ownership transfer) and, for a guest, suppress
                 // autosave + save-on-sleep so co-op state never overwrites their own solo slot.
                 _joinedAsGuest = !IsHost;
@@ -913,6 +920,8 @@ namespace SailwindCoop
             LobbyManager.OnLobbyCreated += lobby =>
             {
                 Sync.BoatUtility.ClearCaches(); // (v0.2.32, P2) fresh session = fresh boat map
+                // (v0.2.34) SESSION-START sleep reset (create side) - see the OnLobbyJoined twin above.
+                Sync.SleepSyncManager.Instance?.AbortSleep();
                 // (v0.2.32 review) Tows created BEFORE the lobby existed (singleplayer, or restored
                 // during load under the phantom-load gates) never fired the moor-event pin. Rescan
                 // every boat once so a pre-existing towed hull streams from the first packet.

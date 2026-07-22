@@ -381,6 +381,56 @@ namespace SailwindCoop.Patches
             }
         }
 
+        /// <summary>
+        /// (v0.2.34 windlass catastrophe guard) Guest-side taut-guard on the anchor joint. Vanilla
+        /// RopeControllerAnchor.Update rewrites joint.linearLimit.limit = Lerp(0, maxLength, currentLength)
+        /// every frame, and the windlass drives currentLength directly (GPButtonRopeWinch) - none of which
+        /// the v0.2.29 SetAnchor/ReleaseAnchor gating touches. If the guest's anchor body is STRANDED
+        /// (kinematic SET anchor left behind by a boat teleport, or reloaded far away from the phantom
+        /// save), the joint's fixed end is the ANCHOR, so shrinking the limit below the boat-anchor span
+        /// hammers the HULL with corrective impulses each physics step: the reported "boat glitches out,
+        /// clips into itself, violently shaking, and eventually sinks" when a crewman works the windlass.
+        /// Whenever the span exceeds the rope's physical maximum (impossible geometry), keep the limit at
+        /// least the span so the joint can never pull. Non-kinematic (unset) far anchors are left alone -
+        /// for those the joint correctly reels the light ANCHOR body back to the hull (the v0.2.26
+        /// self-heal). Purely guest-local; the host's authoritative reel-in still syncs via RopeState.
+        /// </summary>
+        [HarmonyPatch(typeof(RopeControllerAnchor), "Update")]
+        public static class AnchorJointTautGuardPatch
+        {
+            private static float _lastTautGuardLog;
+
+            [HarmonyPostfix]
+            public static void Postfix(RopeControllerAnchor __instance)
+            {
+                if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
+
+                var joint = __instance.joint;
+                if (joint == null) return;
+
+                var anchorRb = joint.GetComponent<Rigidbody>();
+                if (anchorRb == null || !anchorRb.isKinematic) return; // unset anchor: joint reels IT in (good)
+
+                float maxLen = __instance.maxLength > 0f ? __instance.maxLength : 50f;
+                float span = Vector3.Distance(joint.transform.position, __instance.transform.position);
+                if (span <= maxLen + 5f) return; // physically possible - vanilla physics untouched
+
+                var limit = joint.linearLimit;
+                if (limit.limit >= span) return; // already slack
+
+                // +2m matches RelaxGuestAnchorTether's shipped slack margin (same hawse-based span
+                // basis) and absorbs any hawse-vs-connectedAnchor offset on large hulls.
+                limit.limit = span + 2f;
+                joint.linearLimit = limit;
+
+                if (UnityEngine.Time.unscaledTime - _lastTautGuardLog > 5f)
+                {
+                    _lastTautGuardLog = UnityEngine.Time.unscaledTime;
+                    Plugin.Log.LogWarning($"[ANCHOR] taut-guard: set anchor stranded {span:F0}m from its hawse (rope max {maxLen:F0}m); holding joint slack so it cannot yank the hull. A snap/teleport re-couple should follow.");
+                }
+            }
+        }
+
         [HarmonyPatch(typeof(Anchor), "SetAnchor")]
         public static class AnchorSetPatch
         {
@@ -771,6 +821,9 @@ namespace SailwindCoop.Patches
                                 __instance.UnStickyClick();
                             }
                         }
+                        // (v0.2.34) Re-read the lock AFTER the toggle so a lock-request frame doesn't leak one
+                        // frame of steering input through the !isLocked gate below on the stale pre-toggle value.
+                        isLocked = LockedRef(__instance);
                     }
 
                     // Only process steering input if not locked
@@ -861,6 +914,31 @@ namespace SailwindCoop.Patches
                 // It will read rudder.currentAngle (from physics) and update wheel visual smoothly
                 PatchProfiler.End("SteeringWheel.ExtraLateUpdate");
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// (v0.2.34, GAP B) Guest click-to-unlock sync. Vanilla GPButtonSteeringWheel.OnActivate calls the
+        /// private Unlock() when a LOCKED wheel is clicked, clearing the LOCAL locked flag with no packet ->
+        /// the host kept the wheel locked and the guest's steering stayed gated behind the stale lock (a
+        /// confirmed cause of the stuck-rudder report). Route the guest's vanilla unlock through the absolute
+        /// HelmLock sync. Guest-only: the host's own unlock is caught by the lock poll in
+        /// ControlSyncManager.PollBoatControls; remote applies set the field directly (never via Unlock), so
+        /// there is no echo loop, and the mod's own alt-toggle sets the field directly too (not via Unlock),
+        /// so this fires ONLY for the genuine vanilla click-to-unlock.
+        /// </summary>
+        [HarmonyPatch(typeof(GPButtonSteeringWheel), "Unlock")]
+        public static class SteeringWheelUnlockGuestPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(GPButtonSteeringWheel __instance)
+            {
+                if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
+                if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+                var boat = __instance.GetComponentInParent<SaveableObject>();
+                if (boat != null)
+                    ControlSyncManager.Instance?.OnLocalHelmClickUnlock(boat.gameObject.name);
             }
         }
 

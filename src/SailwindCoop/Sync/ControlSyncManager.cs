@@ -1020,81 +1020,87 @@ namespace SailwindCoop.Sync
         private bool _lastHelmLocked = false;
 
         /// <summary>
-        /// Guest sends helm lock toggle request to host
+        /// (v0.2.34) Set the shared wheel's lock to an ABSOLUTE desired state (host-authoritative). This
+        /// used to be a blind TOGGLE request - the guest sent a value-less "flip it" and the host flipped
+        /// its OWN state - so a single dropped/reordered HelmLock permanently INVERTED guest-vs-host lock
+        /// parity. Once inverted, a guest could sit {locked=true} while the host thought unlocked, and the
+        /// steering prefix gates all rudder input behind !locked, so the guest's wheel input went dead (a
+        /// confirmed cause of the stuck-rudder report). Absolute-set is idempotent and self-correcting: the
+        /// host re-broadcasts the authoritative value, so at worst one action is lost, never inverted.
+        /// desiredLocked is the caller's intended NEW lock state.
         /// </summary>
-        public void OnLocalHelmLockToggle(string boatName)
+        public void OnLocalHelmLockSet(string boatName, bool desiredLocked)
         {
             if (!Plugin.IsMultiplayer) return;
 
-            // Guest sends toggle request to host
-            if (!Plugin.IsHost)
+            var boats = BoatUtility.FindAllBoats();
+            if (!boats.TryGetValue(boatName, out var boat)) return;
+            var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
+            if (wheel == null) return;
+
+            if (Plugin.IsHost)
             {
-                VerboseLogger.ControlSend($"HelmLock toggle request, boat={boatName}");
-
-                // Get current local state and invert for optimistic UI
-                var boats = BoatUtility.FindAllBoats();
-                if (boats.TryGetValue(boatName, out var boat))
-                {
-                    var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
-                    if (wheel != null)
-                    {
-                        bool currentLocked = LockedRef(wheel);
-                        bool newLocked = !currentLocked;
-
-                        // Optimistic local update
-                        LockedRef(wheel) = newLocked;
-
-                        // Play sound locally for immediate feedback
-                        Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, newLocked ? 0.88f : 1f);
-
-                        VerboseLogger.ControlLocal($"Guest helm lock optimistic: {currentLocked} -> {newLocked}");
-                    }
-                }
-
-                // Send packet to host (host will broadcast authoritative state)
-                var packet = new HelmLockPacket
-                {
-                    BoatName = boatName,
-                    IsLocked = true  // Value doesn't matter - host will toggle
-                };
-
-                Plugin.NetworkManager.SendToAllReliable(PacketType.HelmLock, w =>
-                    PacketSerializer.WriteHelmLock(w, packet));
+                LockedRef(wheel) = desiredLocked;
+                // Keep the poll baseline in sync only for the host's CURRENT boat (see the cross-boat guard
+                // in OnRemoteHelmLockToggle); off-boat, the poll doesn't track this wheel anyway.
+                if (BoatUtility.GetCurrentBoat()?.gameObject.name == boatName)
+                    _lastHelmLocked = desiredLocked;
+                Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, desiredLocked ? 0.88f : 1f);
+                VerboseLogger.ControlLocal($"Host helm lock set: {desiredLocked}, boat={boatName}");
+                BroadcastHelmLock(boatName, desiredLocked);
             }
             else
             {
-                // Host: toggle locally and broadcast
-                var boats = BoatUtility.FindAllBoats();
-                if (boats.TryGetValue(boatName, out var boat))
-                {
-                    var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
-                    if (wheel != null)
-                    {
-                        bool currentLocked = LockedRef(wheel);
-                        bool newLocked = !currentLocked;
-                        LockedRef(wheel) = newLocked;
-                        _lastHelmLocked = newLocked;
-
-                        // Play sound
-                        Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, newLocked ? 0.88f : 1f);
-
-                        VerboseLogger.ControlLocal($"Host helm lock toggled: {currentLocked} -> {newLocked}");
-
-                        // Broadcast to guest
-                        BroadcastHelmLock(boatName, newLocked);
-                    }
-                }
+                // Optimistic local set + absolute request; the host echoes the authoritative state.
+                LockedRef(wheel) = desiredLocked;
+                Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, desiredLocked ? 0.88f : 1f);
+                SendGuestHelmLockRequest(boatName, desiredLocked);
             }
         }
 
         /// <summary>
-        /// Host receives helm lock toggle from guest - toggle and broadcast
+        /// Alt-click toggle entry: reads the current lock and requests its inverse as an absolute value.
+        /// </summary>
+        public void OnLocalHelmLockToggle(string boatName)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            var boats = BoatUtility.FindAllBoats();
+            if (!boats.TryGetValue(boatName, out var boat)) return;
+            var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
+            if (wheel == null) return;
+            OnLocalHelmLockSet(boatName, !LockedRef(wheel));
+        }
+
+        /// <summary>
+        /// (v0.2.34, GAP B) Guest vanilla click-to-unlock sync. Vanilla GPButtonSteeringWheel.OnActivate
+        /// calls the private Unlock() when you click a LOCKED wheel, clearing the LOCAL locked flag with NO
+        /// packet - so the host kept the wheel locked and the guest's steering stayed gated behind the stale
+        /// lock. Vanilla already did the local set + sound, so this only sends the absolute request.
+        /// Guest-only (the host's own unlock is caught by the lock poll in PollBoatControls).
+        /// </summary>
+        public void OnLocalHelmClickUnlock(string boatName)
+        {
+            if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
+            SendGuestHelmLockRequest(boatName, false);
+        }
+
+        private void SendGuestHelmLockRequest(string boatName, bool desiredLocked)
+        {
+            VerboseLogger.ControlSend($"Guest helm lock request (absolute): {desiredLocked}, boat={boatName}");
+            var packet = new HelmLockPacket { BoatName = boatName, IsLocked = desiredLocked };
+            Plugin.NetworkManager.SendToAllReliable(PacketType.HelmLock, w =>
+                PacketSerializer.WriteHelmLock(w, packet));
+        }
+
+        /// <summary>
+        /// Host receives a guest's ABSOLUTE helm-lock request - SET (not toggle) and broadcast. The blind
+        /// toggle it replaced inverted parity permanently on any dropped request (see OnLocalHelmLockSet).
         /// </summary>
         public void OnRemoteHelmLockToggle(HelmLockPacket packet)
         {
             if (!Plugin.IsHost) return;
 
-            VerboseLogger.ControlRecv($"HelmLock toggle request, boat={packet.BoatName}");
+            VerboseLogger.ControlRecv($"HelmLock request, boat={packet.BoatName}, locked={packet.IsLocked}");
 
             var boats = BoatUtility.FindAllBoats();
             if (!boats.TryGetValue(packet.BoatName, out var boat)) return;
@@ -1102,19 +1108,21 @@ namespace SailwindCoop.Sync
             var wheel = boat.GetComponentInChildren<GPButtonSteeringWheel>();
             if (wheel == null) return;
 
-            // Toggle lock state
-            bool currentLocked = LockedRef(wheel);
-            bool newLocked = !currentLocked;
-            LockedRef(wheel) = newLocked;
-            _lastHelmLocked = newLocked;
-
-            // Play sound on host
-            Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, newLocked ? 0.88f : 1f);
-
-            VerboseLogger.ControlApply($"Host helm lock set from guest request: {newLocked}");
-
-            // Broadcast authoritative state to all (including back to guest for confirmation)
-            BroadcastHelmLock(packet.BoatName, newLocked);
+            if (LockedRef(wheel) != packet.IsLocked)
+            {
+                LockedRef(wheel) = packet.IsLocked;
+                Juicebox.juice.PlaySoundAt("lock unlock", wheel.transform.position, 0f, 0.66f, packet.IsLocked ? 0.88f : 1f);
+                VerboseLogger.ControlApply($"Host helm lock set from guest request: {packet.IsLocked}");
+            }
+            // Stamp the poll baseline ONLY when the locked boat is the host's CURRENT boat (mirrors the
+            // helm-INPUT guard above): _lastHelmLocked is a single flag keyed to PollBoatControls'
+            // GetCurrentBoat(), so stamping it with a DIFFERENT boat's value (a guest locking a boat the
+            // host isn't standing on, N>=3 multi-boat) would cross-boat-alias the poll and suppress a later
+            // genuine lock of the host's own boat.
+            if (BoatUtility.GetCurrentBoat()?.gameObject.name == packet.BoatName)
+                _lastHelmLocked = packet.IsLocked;
+            // Re-broadcast authoritative state so every peer (incl. the requester) converges.
+            BroadcastHelmLock(packet.BoatName, packet.IsLocked);
         }
 
         /// <summary>
@@ -1154,6 +1162,22 @@ namespace SailwindCoop.Sync
             {
                 LockedRef(wheel) = packet.IsLocked;
                 VerboseLogger.ControlApply($"Guest helm lock set: {packet.IsLocked}");
+
+                // (v0.2.34, GAP A) A remote LOCK must release the LOCAL steerer, or a guest holding the wheel
+                // when another crew member locks it is left {holding, locked=true} -> the steering prefix
+                // gates all input behind !locked, so the guest's wheel input goes dead until it manually lets
+                // go (a confirmed cause of the stuck-rudder report). Vanilla Lock() only UnStickyClicks (the
+                // keyboard/VR sticky grab); we ALSO Unclick() so a MOUSE steerer (isClicked) is freed too -
+                // otherwise the "input dead on remote lock" symptom would persist for the mouse-steer case.
+                // UnStickyClick self-guards on stickyClickedBy != null (GoPointerButton.cs:127) and Unclick is
+                // an unconditional field clear (GoPointerButton.cs:111-115); both are safe no-ops when not
+                // held. Only on the unlocked->locked transition (skipped when the guest already matched the
+                // state for its OWN lock).
+                if (packet.IsLocked)
+                {
+                    wheel.UnStickyClick();
+                    wheel.Unclick();
+                }
             }
         }
 

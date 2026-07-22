@@ -121,6 +121,15 @@ namespace SailwindCoop.Patches
                 // Wait for the 3s fade to complete (matching Sleep.StartSleepTimeWarp)
                 yield return new WaitForSeconds(3.1f);
 
+                // (v0.2.34) The sleep may have ended during the fade (fast wake/abort) - don't warp-bound
+                // an already-awake host (SendSleepCycleState is internally gated the same way).
+                if (!SleepSyncManager.IsCoopSleepWarpActive) yield break;
+
+                // (v0.2.34) Bound the HOST's own physics catch-up during the warp, mirroring the guest's
+                // v0.2.19 bound (min(vanilla maximumDeltaTime, fixedDeltaTime*2)). No-op at Sailwind's
+                // configured 0.1, but closes the host FixedUpdate-spiral hole if that config ever changes.
+                SleepSyncManager.BoundMaxDeltaTimeForWarp();
+
                 // Sleep values: timeScale=16, fixedDeltaTime=0.02222*10=0.2222
                 SleepSyncManager.Instance?.SendSleepCycleState(
                     eyesClosed: true,
@@ -157,6 +166,7 @@ namespace SailwindCoop.Patches
             // True when THIS WakeUp call was suppressed by the gate. Read by the Postfix so a gated
             // (never-happened) wake doesn't broadcast the eyes-open/timeScale=1 cycle-state to the guest.
             private static bool _blockedThisCall;
+
 
             // Log throttles: the wake gate and duration-cap check run every frame during a warp (~40
             // lines/s). Throttle each to ~1 per 2s of REAL time (unscaledTime), matching the
@@ -304,6 +314,15 @@ namespace SailwindCoop.Patches
                 // folds in the host-rested requirement - so it covers a slow HOST as well as a slow guest.
                 // At N=1 these are equivalent.
                 var sm = SleepSyncManager.Instance;
+                // Suppress the vanilla 4.5h boat cap while the crew is not yet all-rested, so a moored crew
+                // sleeps to FULL rest (the v0.2.15 intent) instead of the vanilla partial-rest point. This is
+                // gated purely on !AllCrewRested with NO real-time ceiling: AllCrewRested waits for the
+                // slowest ALIVE crewmate correctly (frame-rate independent - each fills on its own machine
+                // and reports at its own 99.99%), a truly FROZEN (non-streaming) crewmate is caught by the
+                // 12s silence watchdog, and a genuine stall by the 60s/90s backstops. (v0.2.34 briefly added
+                // a fixed wall-clock ceiling here; adversarial verification showed it force-woke a
+                // legitimately-slow-but-progressing crewmate mid-fill on a low-end PC, because the warp
+                // degrades with frame rate while the ceiling did not - so it was removed.)
                 bool waitingForCrew = Plugin.HasConnectedGuest && sm != null &&
                     sm.CurrentState == SleepSyncManager.SleepState.Sleeping &&
                     sm.IsTimeskipEnabled && !sm.AllCrewRested;

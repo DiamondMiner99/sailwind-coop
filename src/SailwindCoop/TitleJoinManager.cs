@@ -95,6 +95,16 @@ namespace SailwindCoop
                     Plugin.Log.LogInfo("[TitleJoin] fresh phantom: reset needs to baseline after load");
                 }
 
+                // (v0.2.34 stranded-anchor persistence) The phantom save carries each boat's ANCHOR as its
+                // own SaveableObject (IsSet + rope length + world position; vanilla Anchor.OnLoad calls
+                // SetAnchor, freezing the body kinematic wherever it deserialized). A session that ended
+                // with a stranded SET anchor therefore reloads it stranded BEFORE any multiplayer
+                // correction can exist - the reported restart-proof "rope to the horizon" that only
+                // deleting coop.save cleared. The host's authoritative anchor state is re-applied during
+                // the join, so a set anchor loaded from the phantom is never worth keeping: release + stow
+                // every one now, while we are still pre-lobby (no peers, so nothing broadcasts).
+                NeutralizeLoadedAnchors();
+
                 // WALLET AUTHORITY: we deliberately do NOT touch PlayerGold.currency here. The vanilla
                 // LoadGame above left the guest's rich SOLO-save balance in currency[], but the host's
                 // authoritative CurrencySync overwrites it reliably on join: the guest's join coroutine
@@ -134,6 +144,43 @@ namespace SailwindCoop
                 Plugin.LobbyManager.JoinLobby(lobbyId);
             }
             finally { _busy = false; SuppressLoadErrors = false; }
+        }
+
+        /// <summary>
+        /// (v0.2.34) Release + stow every SET anchor the phantom load just restored. Runs pre-lobby on the
+        /// guest's title-join path only (the host's own solo load keeps vanilla behavior). SnapStrandedAnchor
+        /// re-homes a far body; ReleaseAnchor un-freezes the kinematic state so the zeroed joint limit reels
+        /// the body to the hull; ResetAnchor zeroes currentLength so the rope renders stowed. Non-throwing:
+        /// a failure here must never break the join (worst case = pre-fix behavior).
+        /// </summary>
+        private static void NeutralizeLoadedAnchors()
+        {
+            int neutralized = 0;
+            try
+            {
+                foreach (var boat in Sync.BoatUtility.FindAllBoats().Values)
+                {
+                    if (boat == null) continue;
+                    var anchor = Sync.BoatUtility.GetAnchor(boat);
+                    if (anchor == null || !anchor.IsSet()) continue;
+
+                    var mooring = boat.GetComponent<BoatMooringRopes>();
+                    var ropeCtrl = mooring != null ? mooring.GetAnchorController() : null;
+
+                    // Re-home a far body first (works on the still-kinematic pose), then un-set it.
+                    Sync.BoatStateApplicator.SnapStrandedAnchor(boat, anchor, ropeCtrl, isAnchored: false, ropeLength: 0f);
+                    try { Traverse.Create(anchor).Method("ReleaseAnchor").GetValue(); }
+                    catch (System.Exception ex) { Plugin.Log.LogWarning($"[TitleJoin] anchor release failed on '{boat.gameObject.name}': {ex.Message}"); }
+                    ropeCtrl?.ResetAnchor();
+                    neutralized++;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.Log.LogWarning($"[TitleJoin] anchor neutralize sweep failed (non-fatal): {ex.Message}");
+            }
+            if (neutralized > 0)
+                Plugin.Log.LogInfo($"[TitleJoin] neutralized {neutralized} SET anchor(s) loaded from the phantom save (stranded-anchor guard; host state re-applies on join)");
         }
 
         // Non-throwing: if the reflected field can't be read, return 0 ("no anims") so the F-gate loop

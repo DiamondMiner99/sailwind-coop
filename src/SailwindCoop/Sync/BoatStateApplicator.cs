@@ -1657,13 +1657,28 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// POCKET-INHERIT FIX: deterministic clean slate for the LOCAL guest on a fresh JOIN.
-        /// Sets the joiner's OWN survival bars to full and empties their OWN personal inventory pockets,
-        /// so a joiner never starts a session with leftover/host items or half-empty needs. This is purely
-        /// local (no packet, no broadcast) and is only called for a fresh join (not a recovery reseat).
+        /// POCKET-INHERIT FIX: deterministic clean slate for the LOCAL guest on a FIRST-EVER join to
+        /// this host (fresh phantom only). Sets the joiner's OWN survival bars to full and empties their
+        /// OWN personal inventory pockets, so a first-time joiner never starts with leftover solo-save
+        /// items or half-empty needs. A RETURNING guest (reused phantom) keeps BOTH the needs and the
+        /// pockets their coop_session save just restored - needs persist across coop sessions exactly
+        /// like solo save/reload (players reported the late needs-to-full snap as a bug: "needs preserved
+        /// upon joining, then reset after a short while"). Purely local (no packet); only called for a
+        /// fresh join (not a recovery reseat).
         /// </summary>
         private static void ResetLocalSurvivalAndInventory()
         {
+            // FRESH-PHANTOM ONLY: mirrors CoopSave.ResetNeedsToBaseline's fresh-only gate
+            // (TitleJoinManager runs it only when the phantom was just created). A returning guest's
+            // phantom already carries their persisted needs AND pocket items; this function used to
+            // gate only the pocket half, so STEP 7 snapped a returning guest's needs to 100 several
+            // seconds after join (after the snapshot waits) - the reported "needs reset" bug.
+            if (!CoopSave.PhantomWasFreshlyCreated)
+            {
+                Plugin.Log.LogInfo("[JOIN] Reusing phantom - keeping the needs + inventory it just restored (issue #1)");
+                return;
+            }
+
             // 1. Survival bars to full (mirrors PlayerNeeds.Reset/defaults: 100 = full, debts 100 = no debt,
             //    alcohol 0 = sober). Same static-field API the rest of the survival code uses
             //    (SurvivalSyncManager / SurvivalPatches operate on these exact statics).
@@ -1697,18 +1712,13 @@ namespace SailwindCoop.Sync
             //    only consumer of Mission.spawnedGoods (Mission.AbandonMission, decomp Mission.cs:177-183)
             //    null-checks each entry, so a destroyed good is safely skipped there; no separate Good/PlayerMissions
             //    deregistration is needed, and mission save data never iterates the destroyed reference.
-            // INVENTORY PERSISTENCE (issue #1): only clean-slate the pockets on a FRESH phantom (first-ever
-            // join to this host). A RETURNING guest's phantom coop_session.save already round-trips their pocket
+            // INVENTORY PERSISTENCE (issue #1): the fresh-phantom gate at the top of this function covers
+            // this destroy too. A RETURNING guest's phantom coop_session.save already round-trips their pocket
             // items (vanilla SaveablePrefab persists each item + its inventorySlot; the join LoadGame restores
             // them), and destroying them here is what lost the client's inventory between sessions. The original
             // "don't carry over the host's items" purpose is now handled on the SENDER side (BoatStateCollector
             // excludes the host's own pocket items), so this destroy is only needed to zap a genuinely fresh
-            // phantom's leftover solo pockets. Needs are still reset to full every join (above), unchanged.
-            if (!CoopSave.PhantomWasFreshlyCreated)
-            {
-                Plugin.Log.LogInfo("[JOIN] Reusing phantom - keeping the inventory it just restored (issue #1)");
-                return;
-            }
+            // phantom's leftover solo pockets.
 
             var itemSync = ItemSyncManager.Instance;
             bool restoreApplying = false;
@@ -2039,10 +2049,11 @@ namespace SailwindCoop.Sync
         /// to that stranded point: the "anchor rope stretched to the horizon / ship pivots around the
         /// rope" report (GH #5 follow-up, DarthDino92 2026-07-10; host holding the anchor during the
         /// join sidestepped it because IsAnchored=false skips SetAnchor - confirming this mechanism).
-        /// Threshold mirrors the v0.2.25 dockline stretch guard: anything beyond maxLength + 50m is
-        /// impossible geometry (the rope physically cannot span it), so a legit locally-simulated
-        /// anchor is never touched. Runs on both the join/recovery path (ApplyAnchorState) and the
-        /// runtime relay path (ControlSyncManager.OnRemoteAnchorChanged).
+        /// Threshold (v0.2.34): anything beyond the rope's physical maxLength + 5m settle margin is
+        /// impossible geometry (the rope cannot span it), so a legit locally-simulated anchor is never
+        /// touched. Runs on the join/recovery path (ApplyAnchorState), the runtime relay path
+        /// (ControlSyncManager.OnRemoteAnchorChanged), and the phantom-load neutralize sweep
+        /// (TitleJoinManager.NeutralizeLoadedAnchors).
         /// </summary>
         internal static void SnapStrandedAnchor(SaveableObject boat, Anchor anchor, RopeControllerAnchor ropeCtrl, bool isAnchored, float ropeLength)
         {
@@ -2051,7 +2062,11 @@ namespace SailwindCoop.Sync
             var hawse = ropeCtrl != null ? ropeCtrl.transform.position : boat.transform.position;
             float span = Vector3.Distance(anchor.transform.position, hawse);
             float maxLen = ropeCtrl != null && ropeCtrl.maxLength > 0f ? ropeCtrl.maxLength : 50f;
-            if (span <= maxLen + 50f) return;
+            // (v0.2.34) Threshold tightened from maxLen+50 to maxLen+5: the old slack left a 50-100m
+            // stranding band that was never snapped (still far enough to tether/drag the hull visibly).
+            // Anything beyond the rope's physical maximum plus a small settle margin is impossible
+            // geometry, so a legit locally-simulated anchor is still never touched.
+            if (span <= maxLen + 5f) return;
 
             // Anchored: place it most of the rope length straight down (approximates the host's
             // seabed drop and keeps the joint inside its limit). Not anchored: hang it at the hawse;

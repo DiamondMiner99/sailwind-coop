@@ -104,7 +104,17 @@ namespace SailwindCoop.Sync
         // NEVER pre-empts a legit host-driven wake in normal operation (the host resolves first at 90s); this is
         // a pure last-resort safety valve, not part of the normal wake path. Measured with Time.unscaledTime
         // against _sleepingSince (stamped on the guest in TransitionToSleeping, bounce-guarded, real time).
-        private const float GuestSleepingSelfTimeout = CrewSleepBackstop + 30f; // ~120s guest-only SLEEPING cap
+        private const float GuestCommittedSelfTimeout = CrewSleepBackstop + 30f; // ~120s guest-only committed cap (WAITING superset)
+        // Guest SLEEPING self-timeout: a flat last-resort valve for a guest whose host is alive-but-wedged
+        // (still streaming position -> the 12s silence watchdog never fires; not disconnected; never
+        // broadcasts WakeUp). 75s sits ABOVE the host's own primary resolution (SleepingBackstop 60s) so a
+        // healthy host always resolves and broadcasts WakeUp FIRST in normal operation (host-authoritative
+        // wake preserved), and BELOW CrewSleepBackstop(90s). Was ~120s; this frees a truly-wedged-host guest
+        // ~45s sooner. The WAITING/committed valve keeps the longer GuestCommittedSelfTimeout because its
+        // host counterpart WaitingTimeout is still 90s. (v0.2.34 dropped the tight timeskip hard-cap this
+        // used to be pegged to - see the NOTE in Update() - because a fixed wall-clock cap cut legit
+        // slow-machine fills short; the layered watchdog/backstops are the safety net.)
+        private const float GuestSleepingSelfTimeout = 75f; // guest-only SLEEPING last-resort cap
         // GUEST-FREEZE (WAITING window): the guest SLEEPING self-timeout above only rescues a guest already in
         // SLEEPING (_sleepingSince, stamped in TransitionToSleeping). The earlier wedge is a guest that has
         // COMMITTED to a co-op sleep - OnLocalEnterBed set _localPlayerInBed=true and sent its SleepRequest - yet
@@ -118,6 +128,11 @@ namespace SailwindCoop.Sync
         // the WAITING->SLEEPING edge. Cleared in TransitionToAwake with the other sleep clocks.
         private float _committedToSleepAt;
         private float _lastQuorumHeartbeatLog; // Time.unscaledTime of the last [SLEEP:QUORUM] heartbeat (throttle)
+        // (v0.2.34) Main-log heartbeat throttle. The verbose [SLEEP:QUORUM] heartbeat is dark for normal
+        // players (VerboseLogger is F8-gated), which is exactly why every sleep-freeze report arrived with
+        // "no errors in the logs". A 5s copy of the heartbeat goes to the BepInEx main log unconditionally
+        // during any co-op sleep so the NEXT report carries usable state without needing F8.
+        private float _lastSleepInfoLog;
         // Per-peer rested deadline: Time.unscaledTime by which EACH peer must have reported rested once the
         // crew is SLEEPING. One peer that fills very slowly (or never reports) must not wedge the AllCrewRested
         // quorum indefinitely; if a peer blows past this real-time deadline the host force-marks it rested so the
@@ -258,9 +273,17 @@ namespace SailwindCoop.Sync
             // (no co-op sleep), the host is not vanilla-sleeping, yet timeScale is still warped, reset it.
             // No false positives: a real co-op warp has CurrentState==Sleeping; recovery's legit warp has
             // GameState.sleeping==true; a normal awake host has timeScale==1.
-            if (CurrentState == SleepState.Awake && Plugin.IsHost && !GameState.sleeping && Time.timeScale != 1f)
+            // (v0.2.34) Also runs when NOT in a session at all (post-lobby-close, either former role): the
+            // old Plugin.IsHost gate went false the moment the lobby closed, so a residual 16x from a wedged
+            // sleep survived "close lobby" unhealed - one of the reported stuck-host states. An in-session
+            // GUEST stays excluded (its timeScale legitimately follows host cycle-state packets).
+            // timeScale > 1f (NOT != 1f): a real orphan warp is always 16x (>1); the vanilla SOLO PAUSE menu
+            // sets timeScale = 0 (<1), and SleepSyncManager.Update runs in solo too - a != 1f test would
+            // false-fire on every solo pause and un-freeze the menu (review BLOCKER 2). >1f targets only warps.
+            if (CurrentState == SleepState.Awake && (Plugin.IsHost || !Plugin.IsMultiplayer) &&
+                !GameState.sleeping && Time.timeScale > 1f)
             {
-                VerboseLogger.SleepEvent($"Orphan vanilla timewarp detected (Awake+!sleeping, timeScale={Time.timeScale}); self-healed: timeScale=1, fixedDeltaTime=0.02222, eyesFullyClosed=false, timeskipSleep=false");
+                Plugin.Log.LogWarning($"[SLEEP] Orphan vanilla timewarp detected (Awake+!sleeping, timeScale={Time.timeScale}); self-healed: timeScale=1, fixedDeltaTime=0.02222, eyesFullyClosed=false, timeskipSleep=false");
                 Time.timeScale = 1f;
                 Time.fixedDeltaTime = 0.02222f;
                 if (_vanillaMaxDeltaTime.HasValue) Time.maximumDeltaTime = _vanillaMaxDeltaTime.Value; // undo the 16x catch-up bound (GLOBAL - restore the game's own value on every un-warp path)
@@ -302,16 +325,16 @@ namespace SailwindCoop.Sync
             // the 12s host-SILENCE watchdog only trips if the host STOPS streaming position (alive-but-wedged host
             // keeps streaming), and _sleepingSince is still 0 so the SLEEPING timeout can't apply - the guest is
             // frozen on the sleep/bed screen. This is the guest-only absolute committed-to-sleep valve covering the
-            // WAITING (and, as a superset, Sleeping) window: once we've been committed past GuestSleepingSelfTimeout
-            // (~120s, longer than the host's 90s CrewSleepBackstop so it never pre-empts a legit host-driven wake),
+            // WAITING (and, as a superset, Sleeping) window: once we've been committed past GuestCommittedSelfTimeout
+            // (~120s, longer than the host's 90s WaitingTimeout/CrewSleepBackstop so it never pre-empts a legit wake),
             // self-recover via AbortSleep, which routes through vanilla Sleep.WakeUp + TransitionToAwake, restoring
             // Time.timeScale=1/fixedDeltaTime/eyes and clearing the bed/black fade. Placed BEFORE the Awake
             // early-return (this fires in WAITING and the state is not Awake); the separate SLEEPING timeout below
             // still coexists as the tighter _sleepingSince-anchored valve for the warp case. No wire change.
             if (!Plugin.IsHost && CurrentState != SleepState.Sleeping && _localPlayerInBed &&
-                _committedToSleepAt > 0f && Time.unscaledTime - _committedToSleepAt > GuestSleepingSelfTimeout)
+                _committedToSleepAt > 0f && Time.unscaledTime - _committedToSleepAt > GuestCommittedSelfTimeout)
             {
-                VerboseLogger.SleepEvent($"[SLEEP] GUEST committed self-timeout ({GuestSleepingSelfTimeout}s) in {CurrentState}; host never approved/woke (alive-but-wedged: no SleepApproved, no disconnect). Self-recovering via AbortSleep. committedAge={Time.unscaledTime - _committedToSleepAt:F0}s, timeScale={Time.timeScale:F1}");
+                Plugin.Log.LogWarning($"[SLEEP] GUEST committed self-timeout ({GuestCommittedSelfTimeout}s) in {CurrentState}; host never approved/woke (alive-but-wedged: no SleepApproved, no disconnect). Self-recovering via AbortSleep. committedAge={Time.unscaledTime - _committedToSleepAt:F0}s, timeScale={Time.timeScale:F1}");
                 ShowNotification("Sleep timed out", 3f);
                 AbortSleep(); // vanilla WakeUp + TransitionToAwake: restores timeScale/fixedDeltaTime/eyes, clears bed/fade
                 return;
@@ -337,7 +360,7 @@ namespace SailwindCoop.Sync
                 float sunTs = Sun.sun != null ? Sun.sun.timescale : -1f;
                 float crewAge = _crewSleepStartedAt > 0f ? Time.unscaledTime - _crewSleepStartedAt : 0f;
                 float sleepAge = (CurrentState == SleepState.Sleeping && _sleepingSince > 0f) ? Time.unscaledTime - _sleepingSince : 0f;
-                VerboseLogger.SleepEvent(
+                string heartbeat =
                     $"[SLEEP:QUORUM] state={CurrentState} host={Plugin.IsHost} peers={peerCount} " +
                     $"inBed={_inBedPeers.Count} rested={_restedPeers.Count} localInBed={_localPlayerInBed} " +
                     $"timeScale={Time.timeScale:F1} sunTimescale={sunTs:F2} timeskipSleep={Sleep.timeskipSleep} " +
@@ -346,8 +369,29 @@ namespace SailwindCoop.Sync
                     $"crewSleepAge={crewAge:F0}s sleepingAge={sleepAge:F0}s" +
                     // Triage note: on a NON-host, inBed/rested only count packets this client happened to see
                     // relayed - the HOST owns the quorum. inBed=0 with localInBed=True here is NORMAL, not a bug.
-                    (Plugin.IsHost ? "" : " (quorum host-owned; tallies are relay-counts)"));
+                    (Plugin.IsHost ? "" : " (quorum host-owned; tallies are relay-counts)");
+                VerboseLogger.SleepEvent(heartbeat);
+                // (v0.2.34) Unconditional 5s copy to the BepInEx main log: every sleep-freeze report so far
+                // arrived with "no errors in the logs" because ALL sleep diagnostics were F8-verbose-gated.
+                if (Time.unscaledTime - _lastSleepInfoLog > 5f)
+                {
+                    _lastSleepInfoLog = Time.unscaledTime;
+                    Plugin.Log.LogInfo(heartbeat);
+                }
             }
+
+            // (v0.2.34) NOTE - an earlier cut of this fix added a host TIMESKIP HARD-CAP and a
+            // TimeskipCapSuppressionCeiling (both fixed REAL-time bounds). Adversarial verification proved
+            // them WRONG: sleep-fill DURATION scales inversely with frame rate (below ~10fps the held
+            // maximumDeltaTime=0.1 clamp degrades the 16x warp toward 8x, roughly doubling the real fill
+            // time), so a fixed wall-clock cap force-woke a legitimately-slow-but-progressing crewmate
+            // mid-fill (~44-58% rested) on a low-end PC. They were also REDUNDANT: a slow-but-alive guest
+            // is handled by AllCrewRested (it keeps streaming and eventually reports rested, and the quorum
+            // waits for it - frame-rate-correct); a truly FROZEN (non-streaming) guest is caught by the 12s
+            // silence watchdog below; and a stalled host / rested-then-frozen guest is caught by the 60s
+            // SleepingBackstop and 90s CrewSleepBackstop. The TimeSync stale-packet guard (this release)
+            // removes the day-event double-fire that was the actual freeze amplifier. So the tight caps were
+            // dropped; the layered valves below remain the safety net.
 
             // HOST-STUCK-ON-GUEST-DROP: guest-liveness watchdog. If we're in a sleep handshake and have
             // heard NOTHING from the partner for GuestSilenceTimeout, the partner is frozen/hung or
@@ -394,7 +438,7 @@ namespace SailwindCoop.Sync
                         if (!rpm.HasStreamedPacket(peer)) continue;
                         if (!rpm.TryGetPeerSilence(peer, out float silence) || silence <= GuestSilenceTimeout)
                             continue;
-                        VerboseLogger.SleepEvent($"Crewmate silent {silence:F0}s during {CurrentState}; aborting sleep (frozen/rejoining crewmate)");
+                        Plugin.Log.LogWarning($"[SLEEP] Crewmate silent {silence:F0}s during {CurrentState}; aborting sleep (frozen/rejoining crewmate)");
                         ShowNotification("Crewmate unresponsive - sleep cancelled", 3f);
                         // From SLEEPING, SleepCancelled is IGNORED by the crew (it only acts in WAITING),
                         // which would free only us and leave the rest wedged at 16x. Broadcast WakeUp instead
@@ -489,7 +533,7 @@ namespace SailwindCoop.Sync
                 Time.unscaledTime - _crewSleepStartedAt > CrewSleepBackstop &&
                 !(CurrentState == SleepState.Sleeping && AllCrewRested))
             {
-                VerboseLogger.SleepEvent($"CREW-SLEEP absolute backstop timed out ({CrewSleepBackstop}s) in {CurrentState}; force-resolving. localInBed={_localPlayerInBed}, allCrewRested={(CurrentState == SleepState.Sleeping ? AllCrewRested.ToString() : "n/a")}, host_sleep={PlayerNeeds.sleep:F1}%");
+                Plugin.Log.LogWarning($"[SLEEP] CREW-SLEEP absolute backstop timed out ({CrewSleepBackstop}s) in {CurrentState}; force-resolving. localInBed={_localPlayerInBed}, allCrewRested={(CurrentState == SleepState.Sleeping ? AllCrewRested.ToString() : "n/a")}, host_sleep={PlayerNeeds.sleep:F1}%");
                 ShowNotification("Sleep timed out", 3f);
                 // Broadcast BOTH: SleepCancelled frees anyone stuck in WAITING; WakeUp frees anyone desynced into
                 // SLEEPING (which ignores SleepCancelled). Belt-and-suspenders so no peer is left wedged.
@@ -511,14 +555,15 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            // GUEST-FREEZE (client-side self-timeout): the GUEST mirror of the host CrewSleepBackstop above.
+            // GUEST-FREEZE (client-side self-timeout): the GUEST mirror of the host backstops above.
             // Every host backstop is Plugin.IsHost-gated, so a guest whose host is alive-but-wedged (still
             // streaming position -> the 12s host-SILENCE watchdog never fires, not disconnected -> the
             // AbortSleep-on-disconnect path never fires) and which never receives the reliable WakeUp is stuck
             // SLEEPING with Time.timeScale warped - a client freeze. Give the guest its own ABSOLUTE real-time
-            // cap: once it has been SLEEPING past GuestSleepingSelfTimeout (~120s, deliberately LONGER than the
-            // host's 90s CrewSleepBackstop so it NEVER pre-empts a legit host-driven wake in normal operation),
-            // self-recover via AbortSleep - which routes through vanilla Sleep.WakeUp + TransitionToAwake,
+            // cap: once it has been SLEEPING past GuestSleepingSelfTimeout (75s - ABOVE the host's primary 60s
+            // SleepingBackstop so a healthy host always resolves and broadcasts WakeUp FIRST, and BELOW the 90s
+            // CrewSleepBackstop; v0.2.34 tightened it from ~120s), self-recover via AbortSleep - which routes
+            // through vanilla Sleep.WakeUp + TransitionToAwake, restoring Time.timeScale=1, fixedDeltaTime,
             // restoring Time.timeScale=1, fixedDeltaTime, eyesFullyClosed and clearing the black fade.
             // _sleepingSince is the guest's real-time anchor: stamped in TransitionToSleeping with
             // Time.unscaledTime, bounce-guarded (survives a Sleeping<->Waiting flicker), reset only in
@@ -527,7 +572,7 @@ namespace SailwindCoop.Sync
             if (!Plugin.IsHost && CurrentState == SleepState.Sleeping && _sleepingSince > 0f &&
                 Time.unscaledTime - _sleepingSince > GuestSleepingSelfTimeout)
             {
-                VerboseLogger.SleepEvent($"[SLEEP] GUEST self-timeout ({GuestSleepingSelfTimeout}s) while SLEEPING; host alive-but-wedged (no WakeUp, no disconnect). Self-recovering via AbortSleep. sleepingAge={Time.unscaledTime - _sleepingSince:F0}s, timeScale={Time.timeScale:F1}");
+                Plugin.Log.LogWarning($"[SLEEP] GUEST self-timeout ({GuestSleepingSelfTimeout}s) while SLEEPING; host alive-but-wedged (no WakeUp, no disconnect). Self-recovering via AbortSleep. sleepingAge={Time.unscaledTime - _sleepingSince:F0}s, timeScale={Time.timeScale:F1}");
                 ShowNotification("Sleep timed out", 3f);
                 AbortSleep(); // vanilla WakeUp + TransitionToAwake: restores timeScale/fixedDeltaTime/eyes, clears fade
                 return;
@@ -545,7 +590,7 @@ namespace SailwindCoop.Sync
                 (_isTavernSleep || !AllCrewRested) &&
                 Time.unscaledTime - _sleepingSince > SleepingBackstop)
             {
-                VerboseLogger.SleepEvent($"SLEEPING backstop timed out ({SleepingBackstop}s); force-waking crew. allCrewRested={AllCrewRested}, host_sleep={PlayerNeeds.sleep:F1}%");
+                Plugin.Log.LogWarning($"[SLEEP] SLEEPING backstop timed out ({SleepingBackstop}s); force-waking crew. allCrewRested={AllCrewRested}, host_sleep={PlayerNeeds.sleep:F1}%");
                 MarkAllConnectedPeersRested(); // unblock the quorum gate for the guest-laggard case
                 if (Sleep.instance != null)
                 {
@@ -676,8 +721,11 @@ namespace SailwindCoop.Sync
 
             VerboseLogger.SleepSend($"WakeUp, manual={wasManual}");
 
-            // Both host and guest transition locally (symmetric handling)
-            TransitionToAwake();
+            // Both host and guest transition locally (symmetric handling). vanillaWakeFollows: this is
+            // called from SleepWakeUpPatch.Prefix, which returns true right after -> vanilla Sleep.WakeUp
+            // runs next and does the full teardown (fade, justWokeUp grace, etc.); we must not pre-clear
+            // eyesFullyClosed here or it early-returns.
+            TransitionToAwake(vanillaWakeFollows: true);
         }
 
         #endregion
@@ -881,14 +929,23 @@ namespace SailwindCoop.Sync
             // during the 3s fade period
             GameState.eyesFullyClosed = true;
 
-            // Must transition state BEFORE calling WakeUp so the patch allows it through
-            TransitionToAwake();
+            // Must transition state BEFORE calling WakeUp so the patch allows it through. vanillaWakeFollows:
+            // this leaves GameState.sleeping/eyes intact so vanilla WakeUp below does the richer teardown
+            // (smooth fade, justWokeUp grace) - pre-clearing them here would make WakeUp early-return AND make
+            // the `&& GameState.sleeping` guard below skip it entirely (review BLOCKER 1).
+            TransitionToAwake(vanillaWakeFollows: true);
 
             // Actually wake up the game (triggers fade-in, exits bed, etc.)
             // The WakeUp patch prefix checks CurrentState - since we're now AWAKE, it will proceed
             if (Sleep.instance != null && GameState.sleeping)
             {
                 Sleep.instance.WakeUp();
+            }
+            else if (GameState.sleeping || GameState.eyesFullyClosed)
+            {
+                // Half-torn fallback: vanilla WakeUp couldn't run (no Sleep.instance / flag desync), so
+                // the vanillaWakeFollows skip above would leave the black screen up - force it awake now.
+                ForceVanillaAwakeState();
             }
             RestoreLookAfterTavernWake(wasTavern); // vanilla WakeUp skipped this (flag already cleared)
         }
@@ -1083,7 +1140,14 @@ namespace SailwindCoop.Sync
             }
         }
 
-        private void TransitionToAwake()
+        /// <param name="vanillaWakeFollows">True when the CALLER runs vanilla Sleep.WakeUp immediately
+        /// after this (the normal wake paths: SleepWakeUpPatch.Prefix returns true right after
+        /// OnLocalWakeUp; OnWakeUpReceived calls WakeUp next). In that case vanilla WakeUp does the proper
+        /// teardown (smooth 5s fade, GameState.justWokeUp post-wake boat-damage grace, sleepCooldown,
+        /// ocean-renderer kick) and we must NOT pre-clear GameState.eyesFullyClosed here - doing so makes
+        /// vanilla WakeUp early-return (its `if (!eyesFullyClosed) return`) and skip ALL of that on every
+        /// healthy wake (review BLOCKER 1). Only the abort/teardown paths (default false) force-clear.</param>
+        private void TransitionToAwake(bool vanillaWakeFollows = false)
         {
             // Arm the boat-bunk control-restore watchdog only after a REAL co-op wake (leaving the
             // SLEEPING state), so it never fires in solo or during the vanilla pre-sleep cooldown.
@@ -1116,7 +1180,26 @@ namespace SailwindCoop.Sync
             // Defensive: clear the guest-side timeskip mirror on wake. Vanilla WakeUp already
             // resets Sleep.timeskipSleep=false, but clear it here too in case wake routed around it.
             Sleep.timeskipSleep = false;
+            // (v0.2.34) Stale wake-intent flags must not leak into the NEXT sleep: HostManualWake set by a
+            // backstop whose WakeUp never reached the gate (half-torn state) would make the next sleep's
+            // first AUTO wake read as "manual" and release the crew instantly.
+            Patches.SleepPatches.SleepWakeUpPatch.HostManualWake = false;
+            Patches.SleepPatches.SleepWakeUpPatch.GuestManualWake = false;
             HideNotification();
+
+            // (v0.2.34) SELF-SUFFICIENT TEARDOWN. Every abort/cancel/disconnect path funnels here, but the
+            // vanilla restore used to depend on Sleep.WakeUp having run AND succeeded - it early-returns
+            // while "falling asleep" (!eyesFullyClosed), needs Sleep.instance, and some paths transition
+            // without calling it at all (guest WAITING fake-sleep, exception mid-wake). The half-torn result
+            // (mod state Awake, vanilla GameState.sleeping still true, black screen up) was permanent: the
+            // old AbortSleep early-returned on CurrentState==Awake, so no disconnect, lobby close, or
+            // re-invite could ever repair it - the reported "host permanently stuck sleeping". Force the
+            // vanilla flags/screen awake here whenever they survived the wake path - UNLESS the caller is
+            // about to run vanilla WakeUp itself (vanillaWakeFollows), which does the richer teardown.
+            if (!vanillaWakeFollows && (GameState.sleeping || GameState.eyesFullyClosed))
+            {
+                ForceVanillaAwakeState();
+            }
 
             VerboseLogger.SleepEvent("State -> AWAKE");
 
@@ -1124,6 +1207,50 @@ namespace SailwindCoop.Sync
             Time.timeScale = 1f;
             Time.fixedDeltaTime = 0.02222f;
             if (_vanillaMaxDeltaTime.HasValue) Time.maximumDeltaTime = _vanillaMaxDeltaTime.Value; // undo the 16x catch-up bound (GLOBAL - restore the game's own value on every wake path)
+        }
+
+        /// <summary>
+        /// (v0.2.34) Force the vanilla sleep flags + black screen awake WITHOUT relying on vanilla
+        /// Sleep.WakeUp. Used only on paths where vanilla WakeUp cannot or did not run (abort/disconnect/
+        /// session-start, or a wake path where Sleep.instance was null / WakeUp early-returned). NOT used on
+        /// the healthy wake paths - there vanilla WakeUp does a richer teardown (smooth fade, justWokeUp
+        /// grace, sleepCooldown), so pre-empting it here would degrade every co-op wake (review BLOCKER 1).
+        /// </summary>
+        private static void ForceVanillaAwakeState()
+        {
+            Plugin.Log.LogWarning($"[SLEEP] Vanilla sleep state survived the wake path (sleeping={GameState.sleeping}, eyes={GameState.eyesFullyClosed}); force-clearing");
+            GameState.sleeping = false;
+            GameState.eyesFullyClosed = false;
+            GameState.sleepingInTavern = false;
+            ForceClearBlackout();
+            // Vanilla WakeUp restores control only when not in a bed (a bunk sleeper gets up manually
+            // via LeaveBed); mirror that exactly.
+            if (GameState.inBed == null) Refs.SetPlayerControl(true);
+        }
+
+        /// <summary>
+        /// (v0.2.34) Kill the black sleep screen instantly, without vanilla's fade coroutine. Vanilla
+        /// Blackout.FadeTo lerps with SCALED Time.deltaTime on the camera's OVRScreenFade - a fade started
+        /// around a timeScale=0 pause (ESC menu) never completes, and on the abort paths we want the screen
+        /// back NOW regardless of timescale. OVRScreenFade lives in Oculus.VR (not referenced at compile
+        /// time), so resolve the component by name and invoke SetFadeLevel reflectively; failure is benign
+        /// (worst case the vanilla fade finishes whenever it can).
+        /// </summary>
+        private static void ForceClearBlackout()
+        {
+            try
+            {
+                var cam = Camera.main;
+                if (cam == null) return;
+                var fade = cam.GetComponent("OVRScreenFade");
+                if (fade == null) return;
+                var method = fade.GetType().GetMethod("SetFadeLevel");
+                method?.Invoke(fade, new object[] { 0f });
+            }
+            catch (System.Exception e)
+            {
+                VerboseLogger.SleepEvent($"ForceClearBlackout failed (benign): {e.Message}");
+            }
         }
 
         #endregion
@@ -1134,6 +1261,19 @@ namespace SailwindCoop.Sync
         // first warp override so every restore site can write back the game's true value. Static: survives
         // manager resets so a mid-session re-capture can never snapshot our own warped override.
         private static float? _vanillaMaxDeltaTime;
+
+        /// <summary>
+        /// (v0.2.34) Bound Time.maximumDeltaTime for a warp on the HOST, exactly as the guest's
+        /// ApplySleepCycleState does: min(vanilla value, fixedDeltaTime*2). The guest got this bound in
+        /// v0.2.19 (its FixedUpdate spiral froze it); the host never did - with the current 0.1 config the
+        /// bound is a no-op there, but it costs nothing and protects the host if a game update or another
+        /// mod ever loosens maximumDeltaTime. Restored on every un-warp path via _vanillaMaxDeltaTime.
+        /// </summary>
+        public static void BoundMaxDeltaTimeForWarp()
+        {
+            if (!_vanillaMaxDeltaTime.HasValue) _vanillaMaxDeltaTime = Time.maximumDeltaTime;
+            Time.maximumDeltaTime = Mathf.Min(_vanillaMaxDeltaTime.Value, Time.fixedDeltaTime * 2f);
+        }
 
         private void ApplySleepCycleState(SleepCycleStatePacket packet)
         {
@@ -1249,9 +1389,12 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void AbortSleep()
         {
-            if (CurrentState == SleepState.Awake) return;
+            // (v0.2.34) Also proceed when the mod already thinks it is Awake but VANILLA sleep state
+            // survived (half-torn wedge: black screen up, GameState.sleeping true). The old early-return
+            // made that state permanent - no later disconnect/lobby-close/re-invite could repair it.
+            if (CurrentState == SleepState.Awake && !GameState.sleeping && !GameState.eyesFullyClosed) return;
 
-            VerboseLogger.SleepEvent($"AbortSleep from {CurrentState}");
+            Plugin.Log.LogInfo($"[SLEEP] AbortSleep from {CurrentState} (vanillaSleeping={GameState.sleeping})");
 
             bool wasTavern = _isTavernSleep; // capture before WakeUp/TransitionToAwake clears it
 
@@ -1274,7 +1417,10 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void ForceWakeCrew()
         {
-            if (CurrentState == SleepState.Awake) return;
+            // (v0.2.34) Same half-torn-state allowance as AbortSleep: a vanilla sleep that survived a
+            // failed wake must still be forcible (the broadcast is harmless to awake peers - WakeUp is
+            // ignored outside SLEEPING).
+            if (CurrentState == SleepState.Awake && !GameState.sleeping && !GameState.eyesFullyClosed) return;
 
             VerboseLogger.SleepEvent($"ForceWakeCrew from {CurrentState}");
 

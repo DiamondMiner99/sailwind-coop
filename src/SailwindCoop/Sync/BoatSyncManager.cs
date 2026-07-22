@@ -440,8 +440,10 @@ namespace SailwindCoop.Sync
                 if (errorMagnitude > 5f)
                 {
                     VerboseLogger.TeleportDebug($"SLEEP_SNAP: error={errorMagnitude:F1}m during co-op sleep, snapping to host");
+                    var prevSleepSnapPos = boat.position;
                     boat.position = targetLocalPosition;
                     boat.rotation = extrapolatedRotation;
+                    CarryAnchorWithBoatTeleport(boatSaveable, boat.position - prevSleepSnapPos);
                 }
                 rb.velocity = state.TargetVelocity;
                 rb.angularVelocity = state.TargetAngularVelocity;
@@ -461,11 +463,13 @@ namespace SailwindCoop.Sync
                 VerboseLogger.TeleportDebug($"TELEPORT: error={errorMagnitude:F1}m (threshold={TeleportThreshold}m, staleSnap={state.SnapOnNextApply}), " +
                     $"from={boat.position} to={targetLocalPosition}");
 
+                var prevTeleportPos = boat.position;
                 boat.position = targetLocalPosition;
                 boat.rotation = extrapolatedRotation;
                 rb.velocity = state.TargetVelocity;
                 rb.angularVelocity = state.TargetAngularVelocity;
                 state.SnapOnNextApply = false;
+                CarryAnchorWithBoatTeleport(boatSaveable, boat.position - prevTeleportPos);
             }
             else
             {
@@ -701,8 +705,10 @@ namespace SailwindCoop.Sync
             var rb = boat.GetComponent<Rigidbody>();
             var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
 
+            var prevLivePos = boat.position;
             boat.position = state.TargetRealPosition + offset;
             boat.rotation = state.TargetRotation;
+            CarryAnchorWithBoatTeleport(boatSaveable, boat.position - prevLivePos);
             if (rb != null && !rb.isKinematic)
             {
                 rb.velocity = state.TargetVelocity;
@@ -717,6 +723,36 @@ namespace SailwindCoop.Sync
             state.HasPrevValues = true;
             Plugin.Log.LogInfo($"[JOIN] Snapped boat '{boat.name}' to LIVE host transform before embark: realPos={state.TargetRealPosition}, vel={state.TargetVelocity.magnitude:F1}m/s");
             return true;
+        }
+
+        /// <summary>
+        /// (v0.2.34 stranded-anchor re-couple) Translate a boat's ANCHOR body by the same delta as a boat
+        /// teleport. The anchor is a physics SIBLING of the boat root (vanilla Anchor.Awake reparents it to
+        /// boatRoot.parent), tied to the hull only by a ConfigurableJoint whose kinematic SET state makes it
+        /// the joint's FIXED end - so every boat.position teleport (join, >50m correction, stale snap,
+        /// sleep snap, live-target snap) left a set anchor stranded at the old spot, re-growing the
+        /// "rope to the horizon" and hard-tethering the hull to open water (the joint limit then yanks the
+        /// BOAT, not the kinematic anchor). Guest-local, no packets, mirrors SnapStrandedAnchor's body-write
+        /// pattern. Sub-0.5m nudges are skipped (the joint absorbs them like vanilla motion).
+        /// </summary>
+        private static void CarryAnchorWithBoatTeleport(SaveableObject boatSaveable, Vector3 delta)
+        {
+            if (boatSaveable == null || delta.sqrMagnitude < 0.25f) return;
+            var anchor = BoatUtility.GetAnchor(boatSaveable);
+            if (anchor == null) return;
+
+            anchor.transform.position += delta;
+            var arb = anchor.GetComponent<Rigidbody>();
+            if (arb != null)
+            {
+                arb.position = anchor.transform.position; // transform writes alone don't reliably move the physics pose
+                if (!arb.isKinematic)
+                {
+                    arb.velocity = Vector3.zero;
+                    arb.angularVelocity = Vector3.zero;
+                }
+            }
+            VerboseLogger.TeleportDebug($"ANCHOR_CARRY: moved anchor of '{boatSaveable.gameObject.name}' by {delta.magnitude:F1}m with boat teleport");
         }
 
         /// <summary>

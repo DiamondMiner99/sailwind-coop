@@ -1239,6 +1239,8 @@ namespace SailwindCoop.Sync
             _heldItems.Clear();
             _remoteHeldItems.Clear();
             _guestInventoryItems.Clear();
+            _recentCargoWithdrawGrace.Clear(); // (v0.2.34) stale grace must not leak into the next session
+            _pendingCargoRetryOps.Clear();     // (v0.2.34) also makes any in-flight retry coroutine exit without applying
             _joinDestructionGuardCount = 0;
             _lastHealthSyncTime.Clear();
             _recentlyRemoteSyncedItems.Clear();
@@ -2457,6 +2459,36 @@ namespace SailwindCoop.Sync
 
             VerboseLogger.ItemRecv($"ItemPickupRequest, id={packet.ItemInstanceId}, prefab={packet.PrefabIndex}, slot={packet.InventorySlot}, pos={packet.Position}, boat={packet.ParentBoatName}, from={sender}");
 
+            // (v0.2.34 cargo-withdraw grace) A guest's cargo-carrier withdraw is a HIDDEN DOUBLE round
+            // trip: the CargoWithdrawn apply auto-picks the item into the requester's hand, which files
+            // this normal ItemPickupRequest as a second, independent transaction. The generic guards
+            // below could deny it (phantom-grab frame signature; the unsold-shop-item guard - mission
+            // cargo near a port shop area is unsold; a stale held entry) - and a denied optimistic
+            // pickup force-drops the item at the guest's CURRENT position with the drop broadcast
+            // suppressed: silent permanent per-peer divergence, the reported "cart crates fly off /
+            // non-interactable until save load". The host just authorized this exact (item, requester)
+            // pair, so honor a short grace and approve directly. A conflicting REAL holder still wins
+            // (someone genuinely grabbed it in the gap - fall through to the normal deny).
+            if (_recentCargoWithdrawGrace.TryGetValue(packet.ItemInstanceId, out var withdrawGrace))
+            {
+                bool fresh = Time.unscaledTime - withdrawGrace.Value <= CargoWithdrawGraceSeconds;
+                if (!fresh || withdrawGrace.Key != sender)
+                {
+                    if (!fresh) _recentCargoWithdrawGrace.Remove(packet.ItemInstanceId);
+                }
+                else if (!IsItemHeld(packet.ItemInstanceId) || GetItemHolder(packet.ItemInstanceId) == sender)
+                {
+                    var graceItem = FindItemByInstanceId(packet.ItemInstanceId);
+                    if (graceItem != null)
+                    {
+                        _recentCargoWithdrawGrace.Remove(packet.ItemInstanceId);
+                        VerboseLogger.ItemApply($"Cargo-withdraw grace: direct-approving pickup of {packet.ItemInstanceId} for {sender}");
+                        ApprovePickupRequest(graceItem, packet, sender);
+                        return;
+                    }
+                }
+            }
+
             // Check if item is already held by someone
             if (IsItemHeld(packet.ItemInstanceId))
             {
@@ -2629,6 +2661,16 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            ApprovePickupRequest(item, packet, sender);
+        }
+
+        /// <summary>
+        /// (v0.2.34, extracted unchanged from OnRemoteItemPickupRequest) The approval tail: register,
+        /// record holder, hang-disconnect, hide/show + physics-disarm, broadcast ItemPickedUp. Shared by
+        /// the normal guarded flow and the cargo-withdraw grace bypass.
+        /// </summary>
+        private void ApprovePickupRequest(ShipItem item, ItemPickupRequestPacket packet, SteamId sender)
+        {
             // Always register - whether found by ID or correlation
             _itemRegistry[packet.ItemInstanceId] = packet.PrefabIndex;
 
@@ -3071,7 +3113,15 @@ namespace SailwindCoop.Sync
                 if (boatSaveable != null)
                 {
                     parentBoatName = boatSaveable.gameObject.name;
-                    position = item.currentActualBoat.InverseTransformPoint(item.transform.position);
+                    // (v0.2.34) Encode in the boat ROOT (SaveableObject) frame - the SAME transform the
+                    // receiver decodes with (OnRemoteItemSpawned -> BoatStateApplicator.SpawnItem does
+                    // boat.transform.TransformPoint) and the same convention the join snapshot uses.
+                    // This used to encode in the currentActualBoat (boatModel CHILD) frame, so every LIVE
+                    // boat-parented spawn - fish cutlets from ExecuteCutFood, fishing catches, mission
+                    // spawns - materialized DISPLACED by the boatModel-root delta on every remote machine,
+                    // invisible until a later held-item sync re-placed it ("cutlets do not appear for the
+                    // crewman until interacted with by the host").
+                    position = boatSaveable.transform.InverseTransformPoint(item.transform.position);
                     isLocalPosition = true;
                 }
             }
@@ -3181,7 +3231,15 @@ namespace SailwindCoop.Sync
                 if (boatSaveable != null)
                 {
                     parentBoatName = boatSaveable.gameObject.name;
-                    position = item.currentActualBoat.InverseTransformPoint(item.transform.position);
+                    // (v0.2.34) Encode in the boat ROOT (SaveableObject) frame - the SAME transform the
+                    // receiver decodes with (OnRemoteItemSpawned -> BoatStateApplicator.SpawnItem does
+                    // boat.transform.TransformPoint) and the same convention the join snapshot uses.
+                    // This used to encode in the currentActualBoat (boatModel CHILD) frame, so every LIVE
+                    // boat-parented spawn - fish cutlets from ExecuteCutFood, fishing catches, mission
+                    // spawns - materialized DISPLACED by the boatModel-root delta on every remote machine,
+                    // invisible until a later held-item sync re-placed it ("cutlets do not appear for the
+                    // crewman until interacted with by the host").
+                    position = boatSaveable.transform.InverseTransformPoint(item.transform.position);
                     isLocalPosition = true;
                 }
             }
@@ -4228,6 +4286,24 @@ namespace SailwindCoop.Sync
         // attribution so the money UX targets the paying guest instead of the host.
         private SteamId? _cargoInsertRequester;
 
+        // (v0.2.34) Host-side grace ledger for the requester's follow-up ItemPickupRequest after a
+        // cargo withdraw: itemInstanceId -> (requester, Time.unscaledTime granted). See the grace block
+        // at the top of OnRemoteItemPickupRequest. Entries expire by time / are consumed on approval;
+        // cleared in Reset.
+        private readonly Dictionary<int, KeyValuePair<SteamId, float>> _recentCargoWithdrawGrace =
+            new Dictionary<int, KeyValuePair<SteamId, float>>();
+        private const float CargoWithdrawGraceSeconds = 10f;
+
+        // (v0.2.34) Receiver-side retry for CargoInserted/CargoWithdrawn lookup misses: an
+        // already-connected peer that misses one apply (item not streamed in yet, transient find race)
+        // used to LogWarning and silently diverge until the next full load. Keyed per item id with the
+        // LATEST missed operation (newest wins): if a missed insert is superseded by a missed withdraw
+        // of the same item before the retry lands, only the final state is replayed - replaying the
+        // stale insert would resurrect an item the host has already handed out. The running coroutine
+        // re-reads this dict each attempt, so a Reset() (session end) makes it exit without applying.
+        private readonly Dictionary<int, KeyValuePair<CargoInsertedPacket?, CargoWithdrawnPacket?>> _pendingCargoRetryOps =
+            new Dictionary<int, KeyValuePair<CargoInsertedPacket?, CargoWithdrawnPacket?>>();
+
         private static CargoCarrier FindCargoCarrier(int portIndex)
         {
             var arr = CargoCarrier.carriers;
@@ -4366,6 +4442,10 @@ namespace SailwindCoop.Sync
 
             var item = carrier.cargo[index];
             ApplyCargoWithdrawLocal(carrier, item);
+            // (v0.2.34) Arm the pickup grace BEFORE broadcasting: the requester's follow-up
+            // ItemPickupRequest races the broadcast on the same reliable channel, and the grace must
+            // already be on the ledger when it lands (see OnRemoteItemPickupRequest).
+            _recentCargoWithdrawGrace[packet.ItemInstanceId] = new KeyValuePair<SteamId, float>(sender, Time.unscaledTime);
             BroadcastCargoWithdrawn(carrier, packet.ItemInstanceId, price, sender);
         }
 
@@ -4375,11 +4455,19 @@ namespace SailwindCoop.Sync
         {
             VerboseLogger.ItemRecv($"CargoInserted, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}");
 
+            // (v0.2.34) Mirror of the withdraw handler's cancel-pending-op: an authoritative INSERT
+            // supersedes any still-pending WITHDRAW-retry for this item, even when the insert applies
+            // directly below. Without this, a missed-then-pending withdraw whose item streams in during the
+            // gap would be re-applied by its retry AFTER this insert, removing an item the host has just
+            // inserted (the exact mirror of MINOR-5). Cancelling the pending op here closes it.
+            _pendingCargoRetryOps.Remove(packet.ItemInstanceId);
+
             var carrier = FindCargoCarrier(packet.PortIndex);
             var item = FindItemByInstanceId(packet.ItemInstanceId);
             if (carrier == null || item == null)
             {
-                Plugin.Log.LogWarning($"CargoInserted: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found");
+                Plugin.Log.LogWarning($"CargoInserted: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found; scheduling retry");
+                ScheduleCargoRetry(packet, null);
                 return;
             }
 
@@ -4417,11 +4505,20 @@ namespace SailwindCoop.Sync
         {
             VerboseLogger.ItemRecv($"CargoWithdrawn, port={packet.PortIndex}, item={packet.ItemInstanceId}, price={packet.Price}");
 
+            // (v0.2.34) An authoritative withdraw ALWAYS supersedes any still-pending insert-retry for this
+            // item, even when the withdraw itself finds the item and no-ops below (item already not in the
+            // carrier on this peer). Without this, a missed-then-pending insert whose item streams in during
+            // the gap would be re-applied by its retry AFTER this withdraw, re-inserting an item the host has
+            // already handed out - the narrow window the newest-wins supersede alone doesn't cover (review
+            // MINOR-5). Cancelling the pending op here closes it.
+            _pendingCargoRetryOps.Remove(packet.ItemInstanceId);
+
             var carrier = FindCargoCarrier(packet.PortIndex);
             var item = FindItemByInstanceId(packet.ItemInstanceId);
             if (carrier == null || item == null)
             {
-                Plugin.Log.LogWarning($"CargoWithdrawn: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found");
+                Plugin.Log.LogWarning($"CargoWithdrawn: carrier {packet.PortIndex} or item {packet.ItemInstanceId} not found; scheduling retry");
+                ScheduleCargoRetry(null, packet);
                 return;
             }
 
@@ -4450,6 +4547,52 @@ namespace SailwindCoop.Sync
                 UISoundPlayer.instance?.PlayUISound(UISounds.itemInventoryOut, 1f, 0.6f);
                 CargoStorageUI.instance?.EnableLoadingMode();
                 GameState.unloadedCargoFromCart = true;
+            }
+        }
+
+        /// <summary>
+        /// (v0.2.34) Retry a missed CargoInserted/CargoWithdrawn apply for up to 15s (the item or
+        /// carrier may simply not have streamed in yet on this peer). Exactly one of the two packets is
+        /// non-null. Re-entry goes through the ORIGINAL handler so the apply logic stays single-sourced;
+        /// the handler's own miss branch re-schedules only if the id is not already pending (dedup via
+        /// _pendingCargoRetries). Without this, one missed apply diverged the carrier state until the
+        /// next full save/load ("stay down and non-interactable until save load").
+        /// </summary>
+        private void ScheduleCargoRetry(CargoInsertedPacket? insertPacket, CargoWithdrawnPacket? withdrawPacket)
+        {
+            int itemId = insertPacket.HasValue ? insertPacket.Value.ItemInstanceId : withdrawPacket.Value.ItemInstanceId;
+            bool alreadyRunning = _pendingCargoRetryOps.ContainsKey(itemId);
+            // Newest wins: a later missed op on the same item SUPERSEDES the stored one (review MAJOR-1:
+            // replaying a stale insert after the host already withdrew the item would re-hide it).
+            _pendingCargoRetryOps[itemId] = new KeyValuePair<CargoInsertedPacket?, CargoWithdrawnPacket?>(insertPacket, withdrawPacket);
+            if (!alreadyRunning) StartCoroutine(RetryCargoApply(itemId));
+        }
+
+        private System.Collections.IEnumerator RetryCargoApply(int itemId)
+        {
+            try
+            {
+                for (int attempt = 0; attempt < 15; attempt++)
+                {
+                    yield return new WaitForSecondsRealtime(1f);
+                    // Re-read the CURRENT op each attempt: a supersede swaps it, a session Reset() clears
+                    // it (exit without applying - the coroutine outlives the session on the persistent
+                    // Plugin GameObject, and a cross-session apply must be impossible).
+                    if (!_pendingCargoRetryOps.TryGetValue(itemId, out var op)) yield break;
+                    int portIndex = op.Key.HasValue ? op.Key.Value.PortIndex : op.Value.Value.PortIndex;
+                    if (FindCargoCarrier(portIndex) == null || FindItemByInstanceId(itemId) == null) continue;
+
+                    VerboseLogger.ItemApply($"Cargo retry succeeded on attempt {attempt + 1} for item {itemId}");
+                    _pendingCargoRetryOps.Remove(itemId); // consume BEFORE re-entry (handler may re-schedule on a fresh miss)
+                    if (op.Key.HasValue) OnRemoteCargoInserted(op.Key.Value);
+                    else OnRemoteCargoWithdrawn(op.Value.Value);
+                    yield break;
+                }
+                Plugin.Log.LogWarning($"Cargo retry gave up after 15s for item {itemId} (carrier or item never appeared)");
+            }
+            finally
+            {
+                _pendingCargoRetryOps.Remove(itemId);
             }
         }
 

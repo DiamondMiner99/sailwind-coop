@@ -153,10 +153,21 @@ namespace SailwindCoop.Patches
 
         /// <summary>
         /// Patch CrateInventory.InsertItem to sync crate insertions.
+        /// The PREFIX captures the item's PRE-insert crate latch: vanilla InsertItem writes
+        /// currentCrateId inside itself, so only a prefix can distinguish a mechanical RE-insert
+        /// (stream-in/load reconstruction, where the item's SAVED currentCrateId already equals this
+        /// crate) from a genuine player action that merely coincides with a load window.
         /// </summary>
         [HarmonyPatch(typeof(CrateInventory), "InsertItem")]
+        [HarmonyPrefix]
+        public static void OnCrateInsertItemPrefix(ShipItem item, ref int __state)
+        {
+            __state = item != null ? (item.GetComponent<SaveablePrefab>()?.currentCrateId ?? 0) : 0;
+        }
+
+        [HarmonyPatch(typeof(CrateInventory), "InsertItem")]
         [HarmonyPostfix]
-        public static void OnCrateInsertItem(CrateInventory __instance, ShipItem item)
+        public static void OnCrateInsertItem(CrateInventory __instance, ShipItem item, int __state)
         {
             if (!Plugin.IsMultiplayer) return;
             if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
@@ -167,14 +178,27 @@ namespace SailwindCoop.Patches
             var crateId = __instance.GetComponent<SaveablePrefab>()?.instanceId ?? 0;
             if (crateId != 0 && ItemSyncManager.Instance?.IsCrateUnsealing(crateId) == true) return;
 
-            // BOAT STREAM-IN respawn (v0.2.29): when a boat streams back into range, vanilla respawns
-            // its cached items and each item's load coroutine re-inserts itself by currentCrateId
-            // (ShipItem start coroutine -> CrateInventory.InsertItem). That re-insert is local
-            // reconstruction, not a player action - broadcasting it spams peers whose own copies are
-            // still cached/not yet respawned ("item or crate not found") and re-orders their crate
-            // state. Same rationale as the unseal suppression above; peers rebuild from their own
-            // caches (and the stream-out destroy broadcast is suppressed to match).
-            if (GameState.loadingBoatLocalItems || GameState.currentlyLoading) return;
+            // BOAT STREAM-IN respawn (v0.2.29, NARROWED v0.2.34): when ANY boat streams back into range
+            // (or a save/join is loading), vanilla reconstructs cached items and each item's load
+            // coroutine re-inserts itself by its SAVED currentCrateId. Those mechanical re-inserts must
+            // not broadcast (peers rebuild from their own caches; the stream-out destroy broadcast is
+            // suppressed to match). But GameState.loadingBoatLocalItems is a PROCESS-WIDE flag raised by
+            // any boat crossing the horizon on THIS client (multi-frame window, frequent near NPC
+            // traffic) and by the whole join-apply - so the old bare-flag guard also silently ate a
+            // genuine PLAYER insert that merely coincided with an unrelated stream-in: permanent
+            // contents divergence, the reported "crates sometimes appear empty for either host or crew,
+            // and might appear fine on next load". Discriminator: a mechanical re-insert acts on an item
+            // whose PRE-insert currentCrateId (prefix __state) already equals this crate; a player
+            // insert arrives latched to 0 or a different crate. Suppress only the former.
+            if (GameState.loadingBoatLocalItems || GameState.currentlyLoading)
+            {
+                if (crateId != 0 && __state == crateId)
+                {
+                    VerboseLogger.Log("ITEM", "CRATE", $"suppressed mechanical crate re-insert broadcast (load window, item pre-latched to crate {crateId})");
+                    return;
+                }
+                VerboseLogger.Log("ITEM", "CRATE", $"load window active but insert is a player action (preCrateId={__state}, crate={crateId}); broadcasting");
+            }
 
             ItemSyncManager.Instance?.OnLocalItemInsertedInCrate(item, __instance);
         }
@@ -255,6 +279,13 @@ namespace SailwindCoop.Patches
                 _hostWithdrawPrice = Mathf.RoundToInt(__instance.GetWithdrawPrice(index));
                 return true;
             }
+
+            // (v0.2.34) Mirror vanilla's own hands-full precondition (decomp CargoCarrier.WithdrawItem
+            // no-ops with an error log while holding an item). Without this the guest routed the
+            // withdraw anyway; the CargoWithdrawn apply's hand-guard then left the item lying at the
+            // cart instead of in hand - one of the "cart service sketchy for a crewman" shapes.
+            if (activatingPointer != null && activatingPointer.GetHeldItem() != null)
+                return false;
 
             // Guest: mirror vanilla's money reject locally, then route
             if (PlayerGold.currency[(int)__instance.currency] < Mathf.RoundToInt(__instance.GetWithdrawPrice(index)))
@@ -635,6 +666,32 @@ namespace SailwindCoop.Patches
             {
                 PacketSerializer.WriteLightState(w, packet);
             });
+        }
+
+        /// <summary>
+        /// Patch ShipItemLight.LoadFuel to sync the lamp's fuel (ShipItem.health) after a refill.
+        /// Vanilla LoadFuel writes health directly (candle: health = initialHealth; oil: health += amount)
+        /// with no other hookable side effect, and the receive path for LightState calls the REAL
+        /// SetLight, whose "if (health <= 0) state = false" gate forces a remote lamp back off unless
+        /// its health was also synced. Without this, a crewman's refill consumed the candle everywhere
+        /// (DestroyItem broadcasts) while every OTHER machine kept a dead lamp.
+        /// Mirrors ShipItemBottleOnItemClickPatch's container-health sync (SurvivalPatches).
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemLight), "LoadFuel")]
+        [HarmonyPostfix]
+        public static void OnLoadFuel(ShipItemLight __instance, ShipItemLanternFuel fuel)
+        {
+            if (!Plugin.IsMultiplayer) return;
+            if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
+
+            Plugin.ItemSyncManager?.OnLocalItemHealthChanged(__instance, forceSync: true);
+
+            // The oil branch drains the held oil bottle rather than destroying it (the candle
+            // branch's RequestCandle -> DestroyItem already broadcasts on its own).
+            if (__instance.usesOil && fuel != null)
+            {
+                Plugin.ItemSyncManager?.OnLocalItemHealthChanged(fuel, forceSync: true);
+            }
         }
 
         #endregion

@@ -14,6 +14,63 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.34 - 2026-07-21
+
+> **All players must update.** Built for the Sailwind **0.38.1** hotfix, and two existing
+> packets changed meaning (not shape): the steering-wheel lock is now an absolute state instead
+> of a "flip it" toggle, and live boat-spawned items (fish cutlets, catches) encode their
+> position in the same frame the receiver reads. Mixed versions were already refused by the
+> version handshake, so the whole crew is moved to this version together.
+>
+> Game compatibility: rebuilt against Sailwind 0.38.1. No behavior change was needed for the
+> update itself; everything below is fixes for issues players reported on 0.2.32.
+
+### Fixed
+
+- **Anchor rope stretched to the horizon (crewmate), and the boat tearing itself apart at the
+  windlass.** A crewmate would see the anchor rope run off endlessly, causing steering drift, and
+  raising or lowering the anchor could make the ship clip into itself, shake and sink. The anchor
+  is a physics object that lives outside the boat and was never moved when the boat was
+  repositioned over the network, and its "dropped" state was even saved into the crewmate's local
+  co-op save (which is why restarting never helped). Now the anchor is carried with the boat on
+  every reposition, neutralized when the co-op save loads, and the winch can no longer wrench the
+  hull even if the anchor is momentarily out of place. The old workaround (delete `coop.save` and
+  have the host hold the anchor while joining) is no longer needed.
+- **Sleeping a long time froze the crewmate and left the host stuck on the black sleep screen.**
+  A long co-op sleep could hard-freeze a crewmate (force-close only), and the host would then be
+  stuck on the sleep screen even after the crewmate quit or the lobby closed - and after
+  re-inviting, the host stayed permanently "asleep". The wake/teardown path is now self-sufficient
+  (it fully restores time, control and the screen even when the game's own wake routine can't run),
+  the sleep state is reset at the start of every session (fixing the permanent-sleep-after-reinvite
+  case), and a stale/rewound time packet can no longer re-fire a day's worth of world updates
+  mid-sleep (which was amplifying the freeze). Sleep diagnostics now also write to the main log, so
+  future reports arrive with usable detail even when nothing "errored".
+- **Rudder stuck for a crewmate; twisting the wheel did nothing, and re-grabbing snapped it hard
+  over.** The steering-wheel lock was synced as a blind toggle, so a single dropped packet could
+  permanently flip the lock out of agreement between host and crewmate, leaving the crewmate
+  "locked" (with all steering input silently ignored) while the host thought it was unlocked.
+  Clicking a locked wheel to unlock it also never told the host. The lock is now an absolute state,
+  clicking to unlock is synced, and locking a wheel a crewmate is holding now releases them from it
+  (as it does in single-player).
+- **Cart (cargo) service was unreliable for a crewmate:** crates could fly off or stay put and be
+  non-interactable until a save reload. A crewmate's withdraw is now honored without a second
+  round-trip that could be wrongly rejected (which had silently dropped the crate at a stale spot),
+  a missed cart update retries instead of diverging until reload, and withdrawing with full hands
+  is handled the way the game does.
+- **Fish cutlets (and other freshly-made items aboard a ship) were invisible to the crew until the
+  host touched one.** Live item spawns aboard a boat were sent in the wrong coordinate frame, so
+  they materialized displaced for everyone else. They now appear immediately at the right spot.
+- **Crates sometimes showed empty for the host or a crewmate** (usually correcting on the next
+  load). A guard meant to suppress redundant crate updates while boats stream in was too broad and
+  could eat a real crate change; it now only suppresses the mechanical re-adds it was meant for.
+- **Refilling a lantern with a candle didn't carry over.** A crewmate could refill and light a
+  lantern locally, but the host's copy stayed dead and needed a second candle. The lantern's fuel
+  is now synced with the refill.
+- **A returning crewmate's needs (hunger, thirst, sleep) were preserved on join, then snapped back
+  to full a few seconds later.** Only a first-ever join to a host now starts from a clean slate; a
+  returning crewmate keeps the needs and pocket items their co-op save restored, matching how
+  single-player persists them.
+
 ## v0.2.33 - 2026-07-21
 
 > Compatible with v0.2.32 - no network format change, so crew do not need to update in
