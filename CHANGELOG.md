@@ -14,6 +14,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.36 - 2026-07-22
+
+> Everyone must update (the version handshake refuses mixed crews as usual), but there is no
+> network-format change - this only touches how received co-op invites are shown.
+
+### Fixed
+
+- **Repeated co-op invite pop-ups from one old/stale invite.** Steam re-delivers a pending co-op
+  invite every time you launch the game (it fires the instant you reach the menu, for a lobby that
+  may be long dead), so a single old invite nagged you day after day. Invites are now de-duplicated
+  by lobby and remembered across launches (`~/.sailwind-coop/seen-invites.txt`), so each invite is
+  shown **once, ever** - a stale re-delivery of one you've already seen is suppressed silently, while
+  a genuinely new invite still shows.
+
+### Changed
+
+- **Simpler invite toast.** The received-invite pop-up now just reads `"<name> invited you to
+  co-op."` instead of the longer note about Steam prompts and friends lists. (The sender's SteamID
+  is still written to `LogOutput.log` so an unwanted invite can be traced to an exact account and
+  blocked in Steam.)
+
 ## v0.2.35 - 2026-07-22
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

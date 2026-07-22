@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Steamworks;
 using Steamworks.Data;
 using SailwindCoop.Debug;
@@ -26,6 +27,14 @@ namespace SailwindCoop.Networking
         private Lobby? _currentLobby;
         private bool _isInitialized;
         private float _lastInviteToastTime = -999f; // throttle the "invited you to co-op" toast
+        // (v0.2.36) De-dupe co-op invites by lobby id, PERSISTED across launches. Steam re-delivers the
+        // same pending invite on EVERY launch (it fires the instant the game starts, for a long-dead lobby),
+        // which spammed the toast day after day for one stale invite. We show each unique invite ONCE, ever:
+        // a lobby id already recorded here is a stale re-delivery and is suppressed silently. File lives next
+        // to the mod's other per-user data (~/.sailwind-coop/seen-invites.txt).
+        private readonly HashSet<ulong> _seenInviteLobbies = new HashSet<ulong>();
+        private bool _seenInvitesLoaded;
+        private string _seenInvitesPath;
         // Ids the HOST invited via the in-game menu this lobby; the admission gate in
         // HandleLobbyMemberJoined only admits these (unless AllowCrewInvites). Cleared per lobby.
         private readonly HashSet<SteamId> _hostSentInvites = new HashSet<SteamId>();
@@ -478,32 +487,81 @@ namespace SailwindCoop.Networking
         private void HandleLobbyInvite(Friend friend, Lobby lobby)
         {
             VerboseLogger.LobbyEvent($"Invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
-            // Mirror to the main BepInEx log with the sender's SteamID, so an unexpected or unwanted invite
-            // can be traced to an exact account (and blocked) even without the verbose log - persona names
-            // are user-changeable and can collide, so the name alone can't positively identify the account.
-            Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
 
-            // Do NOT auto-join. Auto-joining yanked the friend out of their own game with no consent (and
-            // risked their save). Let Steam show its own clickable invite; ACCEPTING it fires
-            // OnGameLobbyJoinRequested -> RouteJoin, which is the explicit opt-in. They can also use the
-            // in-game pause menu "Join Friend".
+            // Do NOT auto-join. Let Steam show its own clickable invite; ACCEPTING it fires
+            // OnGameLobbyJoinRequested -> RouteJoin, the explicit opt-in. (Also joinable via the pause menu.)
             if (IsInLobby)
             {
                 VerboseLogger.LobbyEvent($"Already in lobby, ignoring invite");
                 return;
             }
 
-            // Steam re-delivers the same invite repeatedly - throttle the toast so it can't spam.
+            // (v0.2.36) Only surface a LIVE invite, once. Steam replays the same pending invite on EVERY
+            // launch (fires the instant the game starts, for a stale/dead lobby), which nagged for days about
+            // one old invite. De-dupe by lobby id, persisted across launches: a lobby we've already recorded
+            // is a stale re-delivery -> suppress silently. Only a genuinely NEW invite (new lobby) reaches
+            // the toast + the traceable main-log line.
+            EnsureSeenInvitesLoaded();
+            if (!_seenInviteLobbies.Add(lobby.Id.Value))
+            {
+                VerboseLogger.LobbyEvent($"Invite to lobby {lobby.Id} already seen; suppressing stale re-delivery");
+                return;
+            }
+            PersistSeenInvite(lobby.Id.Value);
+
+            // Mirror to the main BepInEx log with the sender's SteamID (once per unique invite), so an
+            // unwanted invite can be traced to an exact account and blocked - persona names are changeable
+            // and can collide, so the name alone can't positively identify the account.
+            Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
+
+            // Belt-and-suspenders throttle (the de-dupe already caps one toast per lobby).
             float now = UnityEngine.Time.realtimeSinceStartup;
             if (now - _lastInviteToastTime < 15f) return;
             _lastInviteToastTime = now;
 
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
             string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
-            // Steam only surfaces its OWN invite popup for friends (and only with the overlay enabled), yet the
-            // LobbyInvite callback still reaches us either way - so don't promise a Steam prompt that may never
-            // appear. Say how to join if one shows, and what it means when it doesn't.
-            Plugin.Notify($"{name} invited you to co-op. Accept it in Steam to join - if no Steam invite appears, they are likely not on your Steam friends list.", 8f);
+            Plugin.Notify($"{name} invited you to co-op.", 6f);
+        }
+
+        /// <summary>
+        /// (v0.2.36) Lazily load the persisted set of already-seen invite lobby ids from
+        /// ~/.sailwind-coop/seen-invites.txt (one decimal lobby id per line). Non-fatal on any error.
+        /// </summary>
+        private void EnsureSeenInvitesLoaded()
+        {
+            if (_seenInvitesLoaded) return;
+            _seenInvitesLoaded = true;
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".sailwind-coop");
+                _seenInvitesPath = Path.Combine(dir, "seen-invites.txt");
+                if (File.Exists(_seenInvitesPath))
+                {
+                    foreach (var line in File.ReadAllLines(_seenInvitesPath))
+                        if (ulong.TryParse(line.Trim(), out var id)) _seenInviteLobbies.Add(id);
+                }
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"[LOBBY] could not load seen-invites list: {e.Message}");
+            }
+        }
+
+        /// <summary>Append a newly-seen invite lobby id to the persistence file (one line per unique lobby;
+        /// grows only on a genuinely new invite, so it stays tiny). Non-fatal on any error.</summary>
+        private void PersistSeenInvite(ulong lobbyId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_seenInvitesPath)) return;
+                Directory.CreateDirectory(Path.GetDirectoryName(_seenInvitesPath));
+                File.AppendAllText(_seenInvitesPath, lobbyId.ToString() + Environment.NewLine);
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"[LOBBY] could not persist seen-invite: {e.Message}");
+            }
         }
 
         private void HandleLobbyGameCreated(Lobby lobby, uint ip, ushort port, SteamId gameServerId)

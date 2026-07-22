@@ -34,7 +34,7 @@ namespace SailwindCoop
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
         // load. This is the v0.2.33 build (invite-log SteamID + toast reword); shows as 0.2.33.
-        public const string PluginVersion = "0.2.35";
+        public const string PluginVersion = "0.2.36";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
