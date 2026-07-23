@@ -31,6 +31,12 @@ namespace SailwindCoop.Patches
             private static bool _resting;
             private static float _preSleep, _preFood, _preWater, _preProtein, _preVitamins;
 
+            // (v0.2.37) WARP-CLIP REST TOP-UP: Time.realtimeSinceStartup at the previous frame's postfix
+            // while a co-op sleep warp is active on this GUEST. 0 when not in a warp (re-baselines on entry
+            // so the first frame credits nothing). realtimeSinceStartup, NOT unscaledDeltaTime: the latter is
+            // ALSO subject to the maximumDeltaTime clamp we are compensating for, so it cannot measure it.
+            private static float _lastWarpRealtime;
+
             [HarmonyPrefix]
             public static bool Prefix()
             {
@@ -61,6 +67,8 @@ namespace SailwindCoop.Patches
             [HarmonyPostfix]
             public static void Postfix()
             {
+                TopUpClampedWarpRest();
+
                 if (!_resting) return;
                 _resting = false;
 
@@ -76,6 +84,73 @@ namespace SailwindCoop.Patches
                 if (s < BedRestSleepCap)
                     s = UnityEngine.Mathf.Min(s + UnityEngine.Time.deltaTime * Sun.sun.timescale * BedRestRegenPerSec, BedRestSleepCap);
                 PlayerNeeds.sleep = s;
+            }
+
+            /// <summary>
+            /// (v0.2.37) WARP-CLIP REST TOP-UP (guest only). Credits back exactly the rest that Unity's
+            /// maximumDeltaTime clamp refused to grant a low-framerate crewmate during a co-op sleep warp.
+            ///
+            /// THE BUG (reported: "if you get the slideshow while sleeping as a client you won't recover
+            /// much... sleeping on dry land works perfectly"):
+            ///  - Rest and the nap clock are the SAME integral: vanilla PlayerNeeds fills
+            ///    `sleep += Time.deltaTime * 8 * Sun.timescale` while Sleep.Update accumulates
+            ///    `currentSleepDuration += Time.deltaTime * Sun.timescale`. Ratio exactly 8, so a vanilla
+            ///    4.5-game-hour boat nap is worth exactly 36 sleep points - and it is frame-rate INDEPENDENT
+            ///    for whoever owns the clock, because both sides of the ratio take the same clamp.
+            ///  - Unity computes Time.deltaTime as min(realFrameDelta, maximumDeltaTime) * timeScale, and
+            ///    Sailwind configures maximumDeltaTime = 0.1. So above 10fps the 16x sleep warp is a true
+            ///    16x, at 5fps it silently degrades to ~8x, at 2fps to ~3.2x.
+            ///  - The GUEST does not own the clock: its Sleep.Update is skipped for the whole SLEEPING state
+            ///    (SleepUpdateGuestPatch), so it has no currentSleepDuration and cannot end its own nap. It
+            ///    sleeps until the HOST's WakeUp packet. At sea (unmoored) the host's cap is unsuppressed -
+            ///    SleepPatches' waitingForCrew requires IsTimeskipEnabled, which is false there - so the host
+            ///    wakes the crew after 4.5 of ITS OWN game-hours. A guest running at half the host's
+            ///    effective rate has integrated half the rest by then, and nothing tops it up.
+            ///    Net: the guest banks 36 * min(1, fpsGuest/10) / min(1, fpsHost/10) points.
+            ///  - On land (tavern/moored) IsTimeskipEnabled is true, so the cap is suppressed until
+            ///    AllCrewRested - every peer reporting 99.99 on its OWN machine - and everyone fills fully
+            ///    regardless of frame rate. That single term is the whole "dry land works perfectly"
+            ///    asymmetry the crew observed.
+            ///
+            /// THE FIX: replay, per frame, only the integration the clamp discarded -
+            /// lost = max(0, realFrameDelta - maximumDeltaTime) * timeScale - through vanilla's own formula
+            /// including the sleepDebt x0.2 rule. Above 10fps `lost` is identically 0, so this is a no-op for
+            /// anyone whose framerate is fine. Deliberately GUEST-ONLY: the host's nap ends on the same
+            /// clipped clock that fills it, so it always banks the full vanilla 36 and topping it up would
+            /// over-credit it past vanilla. Also helps the moored/tavern case, where a slow guest could
+            /// otherwise be force-marked rested by the per-peer deadline without having actually rested.
+            /// No wire change. Needs-sync safe: this only ever RAISES the local player's own sleep/sleepDebt
+            /// through vanilla's formula, and each client already owns and persists its own needs.
+            /// </summary>
+            private static void TopUpClampedWarpRest()
+            {
+                if (!Plugin.IsMultiplayer || Plugin.IsHost || !GameState.sleeping ||
+                    !SleepSyncManager.IsCoopSleepWarpActive ||
+                    UnityEngine.Time.timeScale <= 1f || Sun.sun == null)
+                {
+                    _lastWarpRealtime = 0f; // re-baseline: the next warp frame credits nothing
+                    return;
+                }
+
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                float real = _lastWarpRealtime > 0f ? now - _lastWarpRealtime : 0f;
+                _lastWarpRealtime = now;
+                // real <= 0: first frame of this warp (or a clock hiccup). real >= 2: a load stall or
+                // alt-tab, which vanilla would not have credited either - do not hand out free hours.
+                if (real <= 0f || real >= 2f) return;
+
+                float lost = (real - UnityEngine.Time.maximumDeltaTime) * UnityEngine.Time.timeScale;
+                if (lost <= 0f) return; // frame was inside the clamp: vanilla already credited it in full
+
+                // Vanilla's own formula (PlayerNeeds.LateUpdate sleep branch), applied to the lost slice.
+                float num = lost * 8f * Sun.sun.timescale;
+                if (GameState.sleepingInTavern) num *= 4f;
+                if (PlayerNeeds.sleepDebt < 100f)
+                {
+                    PlayerNeeds.sleepDebt = UnityEngine.Mathf.Min(100f, PlayerNeeds.sleepDebt + num);
+                    num *= 0.2f;
+                }
+                PlayerNeeds.sleep = UnityEngine.Mathf.Min(100f, PlayerNeeds.sleep + num);
             }
         }
 

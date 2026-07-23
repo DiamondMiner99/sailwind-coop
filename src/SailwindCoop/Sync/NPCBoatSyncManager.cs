@@ -156,7 +156,12 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void SendNPCBoatStates()
         {
-            if (Time.time - _lastSyncTime < SyncInterval) return;
+            // (v0.2.37) SLEEP-WARP SCALE. Scaled Time.time runs 16x during a co-op sleep, so this 5Hz poll
+            // (and its FindObjectsOfType scan + per-boat hierarchy-path builds) fired at up to host frame
+            // rate in REAL time. NPCBoatState is on the unreliable coalesce whitelist, so the guest was
+            // protected from a backlog, but the host-side scan cost was real. Documented residual from the
+            // v0.2.35 scaling pass, now closed. Send frequency only - no wire change.
+            if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.HostSleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
             var npcBoats = FindObjectsOfType<NPCBoatController>();
@@ -237,7 +242,9 @@ namespace SailwindCoop.Sync
         private bool NPCStateChanged(NPCBoatStatePacket packet)
         {
             if (!_lastSentNPC.TryGetValue(packet.HierarchyPath, out var last)) return true;
-            if (Time.time - last.SentTime >= NPCKeepaliveInterval) return true;
+            // (v0.2.37) Same warp scale as the poll gate above, so the keepalive stays on its intended REAL
+            // interval during a co-op sleep instead of firing 16x too often.
+            if (Time.time - last.SentTime >= NPCKeepaliveInterval * SleepSyncManager.HostSleepSendIntervalScale) return true;
             if ((packet.Position - last.Position).sqrMagnitude > NPCPosThreshold * NPCPosThreshold) return true;
             if (Quaternion.Angle(packet.Rotation, last.Rotation) > NPCRotThreshold) return true;
             var a = packet.SailLengths; var b = last.SailLengths;

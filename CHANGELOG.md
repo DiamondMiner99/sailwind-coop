@@ -14,6 +14,48 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.37 - 2026-07-23
+
+> Everyone must update (the version handshake refuses mixed crews as usual), but there is no
+> network-format change - this is local timing, local audio and send-rate work only.
+
+### Fixed
+
+- **Crewmates barely recovered any sleep from a nap at sea.** Sleeping on dry land worked, sleeping
+  underway did not. Two things combined: an at-sea sleep runs the game at 16x, and Unity caps how much
+  simulated time one frame may carry (Sailwind's cap is 0.1s), so once your frame rate drops below
+  ~10fps the 16x warp silently degrades - at 5fps you are effectively resting at 8x, at 2fps at ~3x.
+  Meanwhile the nap ends when the **host's** clock says 4.5 hours have passed, so a crewmate on a
+  slower machine got dragged out of bed part-rested. The lost rest is now credited back on the
+  crewmate's side, using the game's own formula, so a nap is worth the same whatever your frame rate.
+  Nothing changes for anyone already running above ~10fps.
+- **Muffled "asleep" audio stuck on after waking at sea.** The game applies the muffled mix when its
+  sleep overlay appears and only un-muffles when that same overlay goes away - but the overlay is
+  taken down mid-sleep whenever your eyes are not yet fully closed or a menu is open, so a wake landing
+  in that window left the muffle on permanently, with no way back except sleeping again and getting
+  lucky. The mod now (a) closes the window on crewmates by marking eyes closed as soon as the sleep
+  starts instead of ~3 seconds later, and (b) re-asserts the normal mix itself on every wake, abort,
+  timeout and disconnect path.
+- **Crewmates being yanked out of a sleep at sea by a wave.** In that same ~3 second window the
+  guard that stops the game's physics-driven wake-ups (a wave slap or hull bump firing `WakeUp`) was
+  inactive on crewmates, and one crewmate waking broadcasts a wake to the whole crew. Now closed.
+
+### Changed
+
+- **Much less work per frame while the crew sleeps.** Cooking state was polled and broadcast on a
+  timer that reads *warped* time, so a "twice a second" full-galley snapshot actually went out once per
+  host frame during a sleep, and each one made the receiving crewmate run a full-scene search **per
+  food item**. The poll is now warp-corrected, and applying a snapshot does one search per item type
+  instead of one per item - together roughly two orders of magnitude less work on a sleeping crewmate.
+  Player-position and NPC-boat streaming had the same warp-inflated timers and are now corrected too
+  (these were the residuals left over from the v0.2.35 pass).
+- **New optional setting `Coop.GuestSleepPhysicsRelief` (default off).** The remaining "slideshow"
+  while sleeping at sea is the game itself running physics at 72 steps a second instead of 45 for the
+  duration of the warp. Turning this on halves that on **your** machine while you sleep as a crewmate.
+  It is off by default because the physics step is global - it also coarsens deck cargo, ropes and
+  your own body for those ~35 seconds. It does not affect how much rest you get, and it has no effect
+  on the host, on solo play, or on anyone else's game.
+
 ## v0.2.36 - 2026-07-22
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

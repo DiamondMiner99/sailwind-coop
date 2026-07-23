@@ -38,7 +38,15 @@ namespace SailwindCoop.Sync
             if (!Plugin.IsMultiplayer) return;
             if (!Plugin.IsHost) return;
 
-            if (Time.time - _lastSyncTime >= SyncInterval)
+            // (v0.2.37) SLEEP-WARP SCALE. This gate compares SCALED Time.time, which runs 16x during a
+            // co-op sleep warp - so the nominal 2Hz poll fires once per HOST FRAME (up to ~32Hz real), and
+            // each poll unconditionally SendToAllReliable a FULL cooking snapshot (reliable is deliberately
+            // not coalesced on receive). The guest then pays a full-scene lookup PER food in every one of
+            // those packets, which is a large part of the reported at-sea sleep slideshow. Cancel the warp
+            // exactly as the other high-frequency senders do (v0.2.35). Send frequency only - no wire change,
+            // and 1f everywhere except a sleeping host. Worst case a stove state settles up to 0.5s late at
+            // the very end of a warp, and nothing can be cooked while the whole crew is in bunks.
+            if (Time.time - _lastSyncTime >= SyncInterval * SleepSyncManager.HostSleepSendIntervalScale)
             {
                 _lastSyncTime = Time.time;
 
@@ -188,6 +196,12 @@ namespace SailwindCoop.Sync
             }
 
             IsApplyingRemoteState = true;
+            // (v0.2.37) Arm the per-pass lookup index (see the Lookups region). Without it this method costs
+            // one FindObjectsOfType FULL-SCENE SCAN PER FOOD, PER SOUP, PER KETTLE and PER food-on-a-stove -
+            // roughly 25-40 scans for a well-stocked galley, in EVERY CookingState packet. That was the
+            // single largest mod-side cost on a guest during an at-sea sleep warp, where the host was also
+            // sending these ~30x/s (see the Update gate). One scan per type per pass instead.
+            _lookupPassActive = true;
             try
             {
                 ApplyFoodStates(packet.Foods);
@@ -201,6 +215,11 @@ namespace SailwindCoop.Sync
             finally
             {
                 IsApplyingRemoteState = false;
+                _lookupPassActive = false;
+                _passCookables = null;
+                _passSoups = null;
+                _passKettles = null;
+                _passStoves = null;
             }
         }
 
@@ -316,8 +335,47 @@ namespace SailwindCoop.Sync
 
         #region Lookups
 
+        // (v0.2.37) PER-PASS LOOKUP INDEX. Armed only for the duration of one OnCookingStateReceived apply
+        // (see there for why), never held across frames, so there is NO stale-cache class of bug: each pass
+        // scans the scene exactly as often as it did before, just once per TYPE instead of once per ITEM.
+        // The request handlers below run outside a pass and keep the original direct-scan behaviour.
+        // EQUIVALENCE IS EXACT, not approximate: the only scene mutations an apply pass performs are
+        // CookableFood.TakeOutOfCooker / InsertIntoCookTrigger, and neither touches object lifetime -
+        // vanilla (decomp CookableFood.cs:68-88) only reassigns currentTrigger/currentFood and the
+        // ItemRigidbody attached/disableCol/inStove flags, then calls ForceRigidbodyToWalkCol, which is a
+        // pure transform move (ItemRigidbody.cs:564-578). No SetActive, no Destroy, no Instantiate - so the
+        // set of objects FindObjectsOfType would return cannot change mid-pass, and an index built at the
+        // top of the pass returns exactly what a fresh per-item scan would have.
+        private bool _lookupPassActive;
+        private Dictionary<int, CookableFood> _passCookables;
+        private Dictionary<int, ShipItemSoup> _passSoups;
+        private Dictionary<int, ShipItemKettle> _passKettles;
+        private Dictionary<int, ShipItemStove> _passStoves;
+
+        /// <summary>
+        /// One full-scene scan of T, indexed by SaveablePrefab.instanceId. First hit wins, matching the
+        /// original linear scans (which returned the first match).
+        /// </summary>
+        private static Dictionary<int, T> BuildInstanceIndex<T>() where T : Component
+        {
+            var map = new Dictionary<int, T>();
+            foreach (var c in Object.FindObjectsOfType<T>())
+            {
+                var prefab = c.GetComponent<SaveablePrefab>();
+                if (prefab != null && !map.ContainsKey(prefab.instanceId))
+                    map[prefab.instanceId] = c;
+            }
+            return map;
+        }
+
         private CookableFood FindCookableByInstanceId(int instanceId)
         {
+            if (_lookupPassActive)
+            {
+                if (_passCookables == null) _passCookables = BuildInstanceIndex<CookableFood>();
+                _passCookables.TryGetValue(instanceId, out var hit);
+                return hit;
+            }
             // Global search - supports land cooking
             foreach (var cookable in Object.FindObjectsOfType<CookableFood>())
             {
@@ -330,6 +388,12 @@ namespace SailwindCoop.Sync
 
         private ShipItemSoup FindSoupByInstanceId(int instanceId)
         {
+            if (_lookupPassActive)
+            {
+                if (_passSoups == null) _passSoups = BuildInstanceIndex<ShipItemSoup>();
+                _passSoups.TryGetValue(instanceId, out var hit);
+                return hit;
+            }
             // Global search - supports land cooking
             foreach (var soup in Object.FindObjectsOfType<ShipItemSoup>())
             {
@@ -342,6 +406,12 @@ namespace SailwindCoop.Sync
 
         private ShipItemKettle FindKettleByInstanceId(int instanceId)
         {
+            if (_lookupPassActive)
+            {
+                if (_passKettles == null) _passKettles = BuildInstanceIndex<ShipItemKettle>();
+                _passKettles.TryGetValue(instanceId, out var hit);
+                return hit;
+            }
             // Global search - supports land cooking
             foreach (var kettle in Object.FindObjectsOfType<ShipItemKettle>())
             {
@@ -901,6 +971,14 @@ namespace SailwindCoop.Sync
 
         private ShipItemStove FindStoveByInstanceId(int instanceId)
         {
+            // (v0.2.37) Per-pass index while applying a CookingState - this is called once per food that
+            // sits on a stove, i.e. the worst offender after the cookable lookup itself.
+            if (_lookupPassActive)
+            {
+                if (_passStoves == null) _passStoves = BuildInstanceIndex<ShipItemStove>();
+                _passStoves.TryGetValue(instanceId, out var hit);
+                return hit;
+            }
             // Global search - supports land cooking
             foreach (var stove in Object.FindObjectsOfType<ShipItemStove>())
             {

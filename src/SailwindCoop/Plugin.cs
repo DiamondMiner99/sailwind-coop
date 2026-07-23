@@ -33,8 +33,9 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.33 build (invite-log SteamID + toast reword); shows as 0.2.33.
-        public const string PluginVersion = "0.2.36";
+        // load. This is the v0.2.37 build (at-sea sleep: rest top-up, stuck-muffle fix, warp send-rate
+        // and cooking-apply cost); shows as 0.2.37.
+        public const string PluginVersion = "0.2.37";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -92,6 +93,11 @@ namespace SailwindCoop
         // BOTH the version gate and the mod gate was too blunt with six gated mods. Off by default.
         // Checked on BOTH sides, so both peers must enable it to actually play mismatched.
         public static ConfigEntry<bool> AllowModMismatchConfig { get; private set; }
+
+        // (v0.2.37) Guest-only physics relief during a co-op sleep warp. OPT-IN (default false), local and
+        // per-player. See the Bind description and SleepSyncManager.ApplySleepCycleState for the rationale
+        // and the risk (Time.fixedDeltaTime is global).
+        public static ConfigEntry<bool> GuestSleepPhysicsReliefConfig { get; private set; }
 
         public static SteamLobbyManager LobbyManager => SteamLobbyManager.Instance;
         public static P2PNetworkManager NetworkManager { get; private set; }
@@ -274,6 +280,9 @@ namespace SailwindCoop
 
             BedRestConfig = Config.Bind("Coop", "BedRest", true,
                 "Lying in a bed while AWAKE (e.g. waiting for the rest of the crew, or just going AFK) slowly restores sleep up to 60/100 and freezes hunger/thirst/protein/vitamin drain. Real crew sleep is still the only way to rest fully. Per-player and local-only - each machine applies its own value.");
+
+            GuestSleepPhysicsReliefConfig = Config.Bind("Coop", "GuestSleepPhysicsRelief", false,
+                "EXPERIMENTAL, crewmate-side only. During an at-sea (unmoored) sleep the game warps to 16x, which runs physics at 72 steps per real second instead of 45 - the main cause of the 'slideshow' while sleeping. Turn this on to halve the crewmate's physics rate for the duration of the warp (the screen is black and the host is authoritative for the boat, so it should not be visible). Local-only and per-player: no effect on the host, on solo play, or on anyone else's game, and it does NOT change how much rest you get. Left off by default because Unity's physics step is global - it also coarsens deck cargo, ropes and the player body for those ~35 seconds. Try it if sleeping at sea is still a slideshow for you.");
 
             AllowVersionMismatchConfig = Config.Bind("Coop", "AllowVersionMismatch", false,
                 "Let players on a DIFFERENT mod version join anyway (both sides get a warning instead of a refusal). The network format is not versioned - mixed builds can desync silently or corrupt a session, so leave this off unless you know the two builds are wire-compatible. Both the host and the mismatched guest must enable it. Gameplay-mod differences are gated separately by Coop.AllowModMismatch.");

@@ -51,6 +51,17 @@ namespace SailwindCoop.Sync
             Plugin.IsHost && IsCoopSleepWarpActive ? 16f : 1f;
 
         /// <summary>
+        /// (v0.2.37) Role-AGNOSTIC version of HostSleepSendIntervalScale, for senders that run on BOTH
+        /// peers rather than host-only. PlayerSyncManager.Update has no IsHost gate (every client streams
+        /// its own avatar), so its Time.time gate is warp-inflated on the GUEST too and the host-only
+        /// scale above would fix just half of it. Same 16f value and same rationale: cancel the 16x warp
+        /// so the REAL send rate during a co-op sleep equals the normal awake rate. Send frequency only -
+        /// no wire/packet change.
+        /// </summary>
+        public static float SleepSendIntervalScale =>
+            IsCoopSleepWarpActive ? 16f : 1f;
+
+        /// <summary>
         /// True when the CURRENT co-op sleep is a TAVERN sleep. Exposed read-only so SleepPatches can
         /// gate the keypress-wake blocks (vanilla tavern sleep is non-interruptible). Reliable on BOTH host and
         /// guest: the host sets it in OnLocalEnterBed, the guest in OnSleepApprovedReceived - unlike
@@ -1139,8 +1150,33 @@ namespace SailwindCoop.Sync
                 // Guest: immediately start fade to black to match host's 3s fade
                 // This runs before host's cycle state arrives (which comes after 3.1s)
                 GameState.sleeping = true;
+                // (v0.2.37) MUFFLED-AUDIO-ON-WAKE + fade-window physics wakes. Assert eyes-closed NOW
+                // instead of waiting ~3.1s for the host's first SleepCycleState (the only guest writer of
+                // this flag, ApplySleepCycleState). Two bugs live in that window:
+                //  (1) STUCK MUFFLE. Vanilla SleepUI.Update activates its UI on `sleeping` and muffles the
+                //      mix (gameSleepSnapshot.TransitionTo(1f)), but its ONLY restore is latched behind
+                //      `if (UI.activeInHierarchy)` on the not-sleeping branch - and SleepUI:43-46
+                //      DEACTIVATES that UI while still sleeping whenever `inCursorMenu || !eyesFullyClosed`.
+                //      So a wake resolving inside the fade window leaves gameSleepSnapshot applied with no
+                //      code path back: permanently muffled audio (and the cakeslice outline left off) until
+                //      a later sleep happens to end with the UI active. That is the reported "sleep again
+                //      and hope it fixed itself". Vanilla is immune only because Sleep.WakeUp refuses to run
+                //      while !eyesFullyClosed - a guard the mod deliberately defeats on every wake path.
+                //  (2) FADE-WINDOW PHYSICS WAKES. SleepWakeUpPatch's guest gate reads
+                //      `guestManual = !GameState.eyesFullyClosed || GuestManualWake`, so during the fade the
+                //      freeze-on-dunk suppression is wide open and a vanilla physics wake (BoatDamage /
+                //      BoatImpactSounds off a wave slap) tears the guest - and via its WakeUp broadcast the
+                //      whole crew - out of the sleep. Wave slaps only happen at sea, which is exactly where
+                //      this was reported and why moored/tavern sleeps look clean.
+                // The host asserts this same value ~3.1s later anyway (SleepPatches SendCycleStateAfterDelay),
+                // so this only moves the flag earlier on the guest. A guest click still wakes: SleepUpdateGuestPatch
+                // sets GuestManualWake before calling WakeUp, which satisfies the gate independently of eyes.
+                // Vanilla readers of the flag are benign here (OceanUpdaterCrest damps wave inertia 3s early;
+                // ShipItem's use is gated on GameState.recovering). NOT done on the host: its
+                // `isManualWake`/`wasManual` proxies key off eyes, so moving it there would corrupt the wake gate.
+                GameState.eyesFullyClosed = true;
                 StartCoroutine(Blackout.FadeTo(1f, 3f));
-                VerboseLogger.SleepApply("Guest starting fade to black");
+                VerboseLogger.SleepApply("Guest starting fade to black (eyes asserted closed; see comment)");
             }
         }
 
@@ -1153,6 +1189,10 @@ namespace SailwindCoop.Sync
         /// healthy wake (review BLOCKER 1). Only the abort/teardown paths (default false) force-clear.</param>
         private void TransitionToAwake(bool vanillaWakeFollows = false)
         {
+            // (v0.2.37) Capture BEFORE anything below clears it: did a vanilla sleep actually exist on this
+            // path? Gates the audio-mixer restore at the end of this method (see there for why).
+            bool wasVanillaSleeping = GameState.sleeping || GameState.eyesFullyClosed;
+
             // Arm the boat-bunk control-restore watchdog only after a REAL co-op wake (leaving the
             // SLEEPING state), so it never fires in solo or during the vanilla pre-sleep cooldown.
             if (CurrentState == SleepState.Sleeping) _wokeFromCoopSleepAt = Time.unscaledTime;
@@ -1211,6 +1251,34 @@ namespace SailwindCoop.Sync
             Time.timeScale = 1f;
             Time.fixedDeltaTime = 0.02222f;
             if (_vanillaMaxDeltaTime.HasValue) Time.maximumDeltaTime = _vanillaMaxDeltaTime.Value; // undo the 16x catch-up bound (GLOBAL - restore the game's own value on every wake path)
+
+            // (v0.2.37) STUCK MUFFLE, belt-and-braces. Vanilla SleepUI owns both halves of the sleep audio
+            // mix, but its restore is latched behind `if (UI.activeInHierarchy)` while SleepUI:43-46
+            // deactivates that UI mid-sleep on `inCursorMenu || !eyesFullyClosed` - so any wake resolving
+            // while the UI is down strands gameSleepSnapshot forever (permanently muffled audio). Asserting
+            // eyes-closed at the guest's fade start closes the common window, but NOT the cursor-menu one
+            // (ESC mid-sleep), and not the host's own 3s fade. TransitionToAwake is the single chokepoint
+            // every wake/abort/cancel/disconnect path funnels through, so re-assert the awake mix here.
+            // GATED on wasVanillaSleeping: this method is also reached with no sleep in progress (Reset,
+            // cancel-while-WAITING, WAITING timeout, OnPeerLeft), and the snapshots are mutually exclusive -
+            // an unconditional call would clobber indoorSnapshot/semiIndoorSnapshot for anyone standing in a
+            // tavern or swimming, trading one stuck mixer for another. Gated, it is exactly as aggressive as
+            // vanilla and no more. 10f is vanilla's own transition duration (SleepUI.SetOutlineAndSounds).
+            // Idempotent when SleepUI already restored it. Null-guarded: AudioMixers.instance is a scene
+            // singleton that does not exist on the title screen, and a disconnect can land us here.
+            if (wasVanillaSleeping)
+            {
+                try
+                {
+                    var mixers = AudioMixers.instance;
+                    if (mixers != null && mixers.gameActiveSnapshot != null)
+                        mixers.gameActiveSnapshot.TransitionTo(10f);
+                }
+                catch (System.Exception e)
+                {
+                    VerboseLogger.SleepEvent($"Audio mixer restore failed (benign): {e.Message}");
+                }
+            }
         }
 
         /// <summary>
@@ -1285,6 +1353,30 @@ namespace SailwindCoop.Sync
 
             Time.timeScale = packet.TimeScale;
             Time.fixedDeltaTime = packet.FixedDeltaTime;
+
+            // (v0.2.37) GUEST SLEEP PHYSICS RELIEF (opt-in, Coop.GuestSleepPhysicsRelief, default OFF).
+            // The at-sea sleep slideshow is overwhelmingly vanilla physics: the warp sets timeScale=16 with
+            // fixedDeltaTime=0.2222, i.e. 16/0.2222 = 72 FixedUpdates per REAL second against the awake
+            // 1/0.02222 = 45, and every one of them runs full Crest buoyancy, hull drag, rigging and rope
+            // solves. Doubling the step halves that back to 36/s. Safe in principle on a crewmate: the screen
+            // is black, controls are locked, and BoatSyncManager drives the hull straight off the host's
+            // stream (velocity/angular velocity assignment plus a snap past its threshold) for the whole
+            // warp, so local integration accuracy is not what places the boat.
+            // Kept OFF by default because Time.fixedDeltaTime is GLOBAL: it also coarsens deck cargo, the
+            // player body, mooring/anchor ropes and nearby NPC boats for those ~35 seconds, and this mod has
+            // a long history of item-physics regressions. 0.4444 (2x) is deliberate and should not be raised:
+            // at 0.8 a hull at 10 m/s advances 8m per step and would trip BoatSyncManager's 5m snap gate
+            // continuously, re-creating the SLEEP_SNAP spam that was part of the v0.2.35 guest-freeze chain;
+            // at 0.4444 and a typical 3-6 m/s it is 1.3-2.7m per step, comfortably inside.
+            // Does NOT affect rest: Time.deltaTime is independent of fixedDeltaTime. Restored on every
+            // un-warp path (TransitionToAwake, the timeScale<=1 branch below, vanilla Sleep.WakeUp).
+            if (packet.TimeScale > 1f && !Plugin.IsHost &&
+                Plugin.GuestSleepPhysicsReliefConfig != null && Plugin.GuestSleepPhysicsReliefConfig.Value)
+            {
+                Time.fixedDeltaTime = Mathf.Max(packet.FixedDeltaTime, 0.4444f);
+                VerboseLogger.SleepApply($"Guest sleep physics relief ON: fixedDeltaTime {packet.FixedDeltaTime} -> {Time.fixedDeltaTime}");
+            }
+
             // Bound how much scaled time one render frame may consume. At 16x a single slow frame
             // otherwise owes up to maximumDeltaTime/fixedDeltaTime physics steps, which snowballs into
             // ever-slower frames -> a guest HARD FREEZE on unmoored 16x sleeps.

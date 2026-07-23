@@ -81,8 +81,22 @@ namespace SailwindCoop.Sync
             // can't starve the probe.
             EmbarkSelfHealTick(charController);
 
-            // Rate limit to 20 Hz
-            if (Time.time - _lastSyncTime < SyncInterval) return;
+            // Rate limit to 20 Hz.
+            // (v0.2.37) SLEEP-WARP SCALE. Scaled Time.time runs 16x during a co-op sleep, so this gate fired
+            // at up to 320Hz of real time. Note the ROLE-AGNOSTIC scale: unlike the other senders this Update
+            // has no IsHost gate (every client streams its own avatar), so both peers are warped and
+            // HostSleepSendIntervalScale would only fix the host half. At 16f the real rate during a sleep is
+            // exactly the design 20Hz. Documented residual from the v0.2.35 scaling pass, now closed.
+            // Avatars updating at 20Hz behind a black screen is not observable. No wire change.
+            // WATCHDOG SAFETY (checked, because this is the ONLY channel that feeds it): PlayerPosition is
+            // the sole writer of RemoteAvatar.LastRemotePacketTime (RemotePlayerManager.UpdatePosition), which
+            // drives TryGetPeerSilence and hence SleepSyncManager's 12s unresponsive-crewmate abort. Worst-case
+            // gap after this change is ~0.8s real, not 12s: during the ~3.1s before the warp starts, scaled
+            // time == real time so the gate is 0.8s real (1.25Hz); once the warp is running, 0.8 scaled == 0.05
+            // real (the design 20Hz); and on a frame-starved client the clamp makes each frame advance 1.6
+            // scaled, which clears the 0.8 gate EVERY frame, so it degrades to the client's own frame rate, not
+            // to silence. Margin over the 12s threshold is ~15x in the worst case.
+            if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.SleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
             SendPlayerPosition(charController);

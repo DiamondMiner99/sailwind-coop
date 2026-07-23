@@ -380,7 +380,34 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(Sleep), "Update")]
         public static class SleepUpdatePatch
         {
+            // Edge detector for GameState.eyesFullyClosed. MUST be re-baselined on every frame this postfix
+            // does NOT own the flag (see ReleaseEdgeDetector) or it goes stale and fires a phantom edge.
             private static bool _lastEyesFullyClosed;
+
+            /// <summary>
+            /// (v0.2.37) Keep the eyes edge detector in sync on frames where this postfix is not the one
+            /// driving the sleep cycle. Without this, _lastEyesFullyClosed is a process-lifetime static that
+            /// only ever gets written on the edge branch below - and the eyes-true -> false edge is INVISIBLE
+            /// here on every automatic wake, because those wakes leave CurrentState == Awake before the
+            /// postfix runs (an unmoored nap ends inside vanilla Sleep.Update itself, decomp Sleep.cs:79-81,
+            /// and the all-rested / per-peer-deadline / backstop / OnPeerLeft wakes call WakeUp from outside
+            /// Sleep.Update entirely). So it stayed stuck at TRUE after the first such wake, for the rest of
+            /// the process.
+            /// The consequence landed on the NEXT sleep: there is always a >=3s window with
+            /// CurrentState == Sleeping and eyes still false (FallAsleep is gated here; vanilla only sets eyes
+            /// after WaitForSeconds(3f)), so the first frame of it read as a false edge and broadcast
+            /// SendSleepCycleState(eyesClosed: false, timeScale: 1, fade 0 over 5.05s) to the crew. On the
+            /// guest that cleared the eyes flag, undid the v0.2.37 eyes assertion in TransitionToSleeping -
+            /// reopening the fade-window physics-wake hole where a wave slap tears the whole crew out of the
+            /// sleep - and faded the black screen back toward clear mid-fall-asleep.
+            /// Re-baselining converges to the true value (awake => false) and cannot suppress the real
+            /// eyes-true edge at warp start, which is what carries the timeScale=16 cycle state.
+            /// </summary>
+            private static void ReleaseEdgeDetector()
+            {
+                _lastEyesFullyClosed = GameState.eyesFullyClosed;
+                PatchProfiler.End("Sleep.Update.Host");
+            }
 
             [HarmonyPostfix]
             public static void Postfix()
@@ -389,24 +416,24 @@ namespace SailwindCoop.Patches
 
                 if (!Plugin.HasConnectedGuest)
                 {
-                    PatchProfiler.End("Sleep.Update.Host");
+                    ReleaseEdgeDetector();
                     return;
                 }
                 if (!Plugin.IsHost)
                 {
-                    PatchProfiler.End("Sleep.Update.Host");
+                    ReleaseEdgeDetector();
                     return;
                 }
 
                 var syncManager = SleepSyncManager.Instance;
                 if (syncManager == null)
                 {
-                    PatchProfiler.End("Sleep.Update.Host");
+                    ReleaseEdgeDetector();
                     return;
                 }
                 if (syncManager.CurrentState != SleepSyncManager.SleepState.Sleeping)
                 {
-                    PatchProfiler.End("Sleep.Update.Host");
+                    ReleaseEdgeDetector();
                     return;
                 }
 
