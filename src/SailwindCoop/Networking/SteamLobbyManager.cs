@@ -35,6 +35,14 @@ namespace SailwindCoop.Networking
         private readonly HashSet<ulong> _seenInviteLobbies = new HashSet<ulong>();
         private bool _seenInvitesLoaded;
         private string _seenInvitesPath;
+
+        // (v0.2.38) Per-sender invite ignore list; union of the config entry and ignored-inviters.txt.
+        // The snapshot lets a mid-session config edit take effect without a restart.
+        private readonly HashSet<ulong> _ignoredInviters = new HashSet<ulong>();
+        private bool _ignoredInvitersLoaded;
+        private string _ignoredInvitersConfigSnapshot;
+        // One-shot so a retry after an IO fault does not re-spam the same parse warnings every invite.
+        private bool _ignoredInviterWarningsEmitted;
         // Ids the HOST invited via the in-game menu this lobby; the admission gate in
         // HandleLobbyMemberJoined only admits these (unless AllowCrewInvites). Cleared per lobby.
         private readonly HashSet<SteamId> _hostSentInvites = new HashSet<SteamId>();
@@ -496,6 +504,19 @@ namespace SailwindCoop.Networking
                 return;
             }
 
+            // (v0.2.38) Per-SENDER ignore list, checked BEFORE the lobby de-dupe below so an ignored account
+            // never even records a lobby id (otherwise the file would grow one line per unwanted invite).
+            // This exists because the v0.2.36 lobby-id de-dupe cannot stop a sender who keeps creating NEW
+            // lobbies - see the config comment in Plugin.cs.
+            if (IsInviterIgnored(friend.Id))
+            {
+                // Mirror to the MAIN log, not just VerboseLogger (which is F8/DebugMode-gated and writes to a
+                // separate file). Without this an ignored invite leaves no trace anywhere, so a mistyped id
+                // that silences the wrong account would be undiagnosable from the log the user actually has.
+                Plugin.Log.LogInfo($"Co-op invite from {friend.Name} ({friend.Id}) suppressed (Coop.IgnoredInviters).");
+                return;
+            }
+
             // (v0.2.36) Only surface a LIVE invite, once. Steam replays the same pending invite on EVERY
             // launch (fires the instant the game starts, for a stale/dead lobby), which nagged for days about
             // one old invite. De-dupe by lobby id, persisted across launches: a lobby we've already recorded
@@ -522,6 +543,103 @@ namespace SailwindCoop.Networking
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
             string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
             Plugin.Notify($"{name} invited you to co-op.", 6f);
+        }
+
+        /// <summary>
+        /// (v0.2.38) Parse one ignore-list entry. Tolerant on purpose, because the person typing it has just
+        /// been pestered by a stranger and the only handle they may have is what Steam gave them:
+        ///  - text after '#' is a comment, so an opaque 17-digit number can be labelled with a name;
+        ///  - a pasted profile URL works, not just a bare id. A PRIVATE Steam profile does not appear in
+        ///    Steam search, so ".../profiles/&lt;id&gt;" is frequently the ONLY form the user can obtain.
+        /// Parsing is NumberStyles.None + InvariantCulture: no signs, no whitespace, no digit grouping, and
+        /// no dependence on the machine's locale.
+        /// </summary>
+        private static bool TryParseInviterId(string raw, out ulong id)
+        {
+            id = 0;
+            if (string.IsNullOrEmpty(raw)) return false;
+
+            var s = raw.Split('#')[0].Trim().TrimEnd('/');
+            if (s.Length == 0) return false;
+
+            int slash = s.LastIndexOf('/');
+            if (slash >= 0) s = s.Substring(slash + 1).Trim();
+
+            return ulong.TryParse(s, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out id);
+        }
+
+        /// <summary>
+        /// (v0.2.38) True when invites from this Steam ID should be dropped silently. Sources are UNIONED so
+        /// neither can silently disable the other: the BepInEx config entry (Coop.IgnoredInviters, easy to
+        /// edit, lost if the config is regenerated) and ~/.sailwind-coop/ignored-inviters.txt (survives that,
+        /// and sits beside the other per-user mod data).
+        ///
+        /// Read ONCE, on the first invite of the session. The `configured != snapshot` arm cannot actually
+        /// fire under stock BepInEx 5.4.23: it has no config-file watcher, the mod never calls
+        /// ConfigFile.Reload(), so .Value is frozen for the process. Edits to EITHER source take effect on
+        /// the next launch, which suits the real workflow - Steam re-delivers pending invites at launch, so
+        /// the loop is edit, restart, gone. The arm is kept because a ConfigurationManager-style plugin can
+        /// write .Value live.
+        ///
+        /// Unparseable entries are skipped WITH A WARNING rather than voiding the whole list: one typo must
+        /// never silently un-ignore someone, because that failure is invisible to the user.
+        /// </summary>
+        private bool IsInviterIgnored(SteamId sender)
+        {
+            string configured = Plugin.IgnoredInvitersConfig?.Value ?? "";
+            if (!_ignoredInvitersLoaded || configured != _ignoredInvitersConfigSnapshot)
+            {
+                // Build into a LOCAL set and swap in only on success. Assigning as we go would mean a
+                // mid-read IO fault left a half-built list latched as authoritative for the whole session.
+                var loaded = new HashSet<ulong>();
+                bool fileOk = true;
+
+                foreach (var raw in configured.Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (TryParseInviterId(raw, out var id)) loaded.Add(id);
+                    else if (!_ignoredInviterWarningsEmitted)
+                        Plugin.Log.LogWarning($"[LOBBY] ignoring unparseable IgnoredInviters entry '{raw.Trim()}'");
+                }
+
+                try
+                {
+                    string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".sailwind-coop");
+                    string path = Path.Combine(dir, "ignored-inviters.txt");
+                    if (File.Exists(path))
+                    {
+                        foreach (var line in File.ReadAllLines(path))
+                        {
+                            var trimmed = line.Trim();
+                            if (trimmed.Length == 0 || trimmed[0] == '#') continue;
+                            if (TryParseInviterId(trimmed, out var id)) loaded.Add(id);
+                            else if (!_ignoredInviterWarningsEmitted)
+                                Plugin.Log.LogWarning($"[LOBBY] ignoring unparseable ignored-inviters.txt line '{trimmed}'");
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    // Config entries still apply; only the file's contribution is missing. Leaving
+                    // _ignoredInvitersLoaded false lets the NEXT invite retry instead of degrading for the
+                    // rest of the session behind a warning the user will not connect to the symptom.
+                    fileOk = false;
+                    Plugin.Log.LogWarning($"[LOBBY] could not load ignored-inviters list, using config entries only: {e.Message}");
+                }
+
+                _ignoredInviterWarningsEmitted = true;
+                _ignoredInviters.Clear();
+                foreach (var id in loaded) _ignoredInviters.Add(id);
+
+                if (fileOk)
+                {
+                    _ignoredInvitersLoaded = true;
+                    _ignoredInvitersConfigSnapshot = configured;
+                    Plugin.Log.LogInfo($"[LOBBY] ignoring co-op invites from {_ignoredInviters.Count} Steam ID(s)");
+                }
+            }
+
+            return _ignoredInviters.Contains(sender.Value);
         }
 
         /// <summary>

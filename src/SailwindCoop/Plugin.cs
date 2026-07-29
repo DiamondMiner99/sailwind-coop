@@ -33,9 +33,9 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.37 build (at-sea sleep: rest top-up, stuck-muffle fix, warp send-rate
-        // and cooking-apply cost); shows as 0.2.37.
-        public const string PluginVersion = "0.2.37";
+        // load. This is the v0.2.38 build (mission-cargo outline clear, cargo-withdraw physics flash,
+        // fishing NRE, per-sender invite ignore list); shows as 0.2.38.
+        public const string PluginVersion = "0.2.38";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -44,6 +44,7 @@ namespace SailwindCoop
         // SteamLobbyManager.MaxPlayers, which feeds Steam's lobby max-members argument.
         public static ConfigEntry<int> MaxPlayersConfig { get; private set; }
         public static ConfigEntry<bool> AllowCrewInvitesConfig { get; private set; }
+        public static ConfigEntry<string> IgnoredInvitersConfig { get; private set; }
         public static ConfigEntry<bool> BedRestConfig { get; private set; }
         // Crew spending feed (UI.TradeFeed): receiver-side gates - turning them down/off changes only
         // THIS machine's feed lines and quiet coin cue, never what the host broadcasts.
@@ -201,6 +202,24 @@ namespace SailwindCoop
                 false,
                 "When true, people invited by ANY crew member may join. When false (default), only players the HOST invited are admitted to the session.");
             Log.LogInfo($"AllowCrewInvites: {AllowCrewInvitesConfig.Value}");
+
+            // (v0.2.38) Per-SENDER invite suppression. v0.2.36 de-duped invites by LOBBY id on the theory that
+            // Steam replays ONE stale invite forever. That was WRONG: the reporting user's seen-invites.txt
+            // accumulated SIX DISTINCT lobby ids from the same account, so a lobby-keyed de-dupe can never
+            // suppress a sender who keeps creating fresh lobbies - by that fix's own logic a new lobby is a
+            // genuinely new invite. Blocking on Steam is the other remedy, but it is awkward when the sender
+            // has a PRIVATE profile: those do not appear in Steam search, so only the direct SteamID URL
+            // reaches them. An ID-keyed ignore list works regardless of lobby churn or profile privacy.
+            IgnoredInvitersConfig = Config.Bind(
+                "Coop",
+                "IgnoredInviters",
+                "",
+                "Comma-separated 64-bit Steam IDs whose co-op invites are ignored silently. A NEW invite logs " +
+                "its sender's ID to BepInEx/LogOutput.log, so you can copy it straight from there; a pasted " +
+                "steamcommunity.com/profiles/<id> URL works too. Also read from " +
+                "~/.sailwind-coop/ignored-inviters.txt (one ID per line, '#' starts a comment), which survives " +
+                "config resets. Both are read on the first invite after launch, so edits apply next launch.");
+            Log.LogInfo($"IgnoredInviters: [{IgnoredInvitersConfig.Value}]");
 
             // Crew spending feed: bottom-right killfeed line (+ quiet coin cue for OTHER crew members'
             // trades) whenever anyone in the crew buys or sells against the shared wallet.

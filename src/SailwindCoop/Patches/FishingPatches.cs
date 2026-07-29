@@ -265,6 +265,69 @@ namespace SailwindCoop.Patches
         }
 
         /// <summary>
+        /// (v0.2.38) Stop co-op throwing one NullReferenceException per catch, out of VANILLA code.
+        ///
+        /// Vanilla ShipItemFishingRod.OnAltActivate (decomp :400-412) starts the ShipItemFishingRod.CollectFish
+        /// COROUTINE, which does `ShipItem collectedFish = fish.CollectFish();`, waits two frames, then
+        /// dereferences `collectedFish.itemRigidbodyC` (decomp :415-421). OnCollectFishPrefix below returns
+        /// false with `__result = null` on BOTH roles (correct - see B9 there), so that deref NREs every time
+        /// anyone reels a fish in. It is thrown from vanilla, so it looks like a game bug in every log we ask
+        /// reporters for.
+        ///
+        /// The coroutine's ONLY remaining work after the deref is resetting the collected fish's
+        /// PickupableItemCollisionChecker.collisions counter - which the NRE already prevents today. So
+        /// skipping the coroutine entirely is behaviour-neutral and purely removes the exception.
+        ///
+        /// Intercepts ONLY the collect branch; every other path falls through to vanilla. If any private
+        /// field cannot be resolved we also fall through, i.e. back to today's behaviour rather than a
+        /// swallowed catch.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItemFishingRod), nameof(ShipItemFishingRod.OnAltActivate))]
+        [HarmonyPrefix]
+        public static bool OnRodAltActivatePrefix(ShipItemFishingRod __instance)
+        {
+            if (!Plugin.IsMultiplayer) return true;
+            if (FishingSyncManager.Instance?.IsApplyingRemoteState == true) return true;
+            if (!__instance.sold) return true; // vanilla's shop-item branch
+
+            // Latch: falling through to vanilla is only safe for a throw from the RESOLUTION code below. Once
+            // CollectFish has been entered the catch must NOT return true - vanilla's own gate would still
+            // pass (ProcessFishCollection nulls currentFish only AFTER it spawns the item) and it would run
+            // the collect a second time: two fish for one catch on the host, or a duplicate FishCollectRequest
+            // on a guest. Before this patch such a throw simply propagated once.
+            bool collectEntered = false;
+            try
+            {
+                var t = Traverse.Create(__instance);
+                var fish = t.Field("fish").GetValue<FishingRodFish>();
+                var bobberJoint = t.Field("bobberJoint").GetValue<ConfigurableJoint>();
+                if (fish == null || bobberJoint == null) return true;
+                if (fish.currentFish == null) return true;
+
+                float minLength = t.Field("minLength").GetValue<float>();
+                if (bobberJoint.linearLimit.limit > minLength + 0.1f) return true;
+
+                // The exact branch vanilla would run, minus the coroutine. OnCollectFishPrefix does the
+                // host-routing and the guest-side visual clear.
+                collectEntered = true;
+                fish.CollectFish();
+                return false;
+            }
+            catch (System.Exception e)
+            {
+                // Log the FULL exception (not just Message) when the collect had already started: that branch
+                // swallows a genuine host-side spawn / item-sync failure which used to surface as a full-stack
+                // NRE. This mod is diagnosed entirely from user-submitted logs, so a frame-less one-liner on
+                // exactly the failures worth seeing would be a step backwards. Resolution failures stay terse.
+                if (collectEntered)
+                    Plugin.Log.LogError($"[FISHING] collect already started, NOT retrying (would double-spawn): {e}");
+                else
+                    Plugin.Log.LogWarning($"[FISHING] rod alt-activate prefix falling through to vanilla: {e.Message}");
+                return !collectEntered;
+            }
+        }
+
+        /// <summary>
         /// Patch FishingRodFish.CollectFish to route through host.
         /// </summary>
         [HarmonyPatch(typeof(FishingRodFish), "CollectFish")]

@@ -14,6 +14,44 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.38 - 2026-07-28
+
+> Everyone must update (the version handshake refuses mixed crews as usual), but there is no
+> network-format change - this is presentation, physics-timing and invite-handling work only.
+
+### Fixed
+
+- **Mission cargo stayed lit up for everyone except the person who picked it up.** The game turns the
+  highlight on when cargo is registered to a mission and turns it off in exactly one place: the pickup
+  handler, which only ever runs on the machine of whoever grabbed the crate. Every other crewmate kept
+  the glow forever, and the host kept it even on crates the host picked up itself. The highlight is
+  now cleared on every machine when the crate is picked up, and restored when it is dropped. One case
+  is still open: a crewmate who joins mid-voyage sees loose mission crates on the dock outlined until
+  someone handles them.
+- **Withdrawing cargo from a hold made the crate visibly flash and shove nearby items around, on every
+  screen except the taker's.** The game's own withdraw takes the item into your hands *before* it
+  leaves the storage slot; the co-op version of that step skipped the hand-off, so for one round trip
+  to the host the item existed as a loose, solid, physics-driven object sitting inside whatever else
+  was on deck. It is now held still until the pickup lands, with a five second safety release so an
+  item can never be left frozen if a message goes missing. The item may still be briefly visible in
+  place; it no longer has physics while it is.
+- **Every fish you caught wrote an error into the log.** The co-op fishing patch left the game's own
+  collect routine holding nothing, and two frames later that routine tripped over it. Harmless in
+  play, but it buried the useful lines in `LogOutput.log`. That routine is no longer started in this
+  branch, which matches what actually happened once the error fired.
+
+### Added
+
+- **You can now ignore co-op invites from a specific Steam account.** The v0.2.36 de-dupe only
+  suppressed repeat invites carrying the same lobby, which does nothing against someone who keeps
+  making new ones. Add their 64-bit Steam ID to `Coop.IgnoredInviters` in the config, or to
+  `~/.sailwind-coop/ignored-inviters.txt` (one per line, `#` starts a comment, and that file survives
+  a config reset), and their invites are dropped silently. A pasted
+  `steamcommunity.com/profiles/<id>` URL works too, which matters because a private profile gives you
+  nothing else to go on. Any new invite logs its sender's ID, so you can copy it straight out of
+  `BepInEx/LogOutput.log`. The list is read on the first invite after launch, so edits apply next
+  launch.
+
 ## v0.2.37 - 2026-07-23
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

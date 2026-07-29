@@ -1236,6 +1236,40 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void Reset()
         {
+            // (v0.2.38) Withdraw freezes MUST be released first, BEFORE the held-item maps below are
+            // cleared - the re-arm guard reads them, and a cleared map makes every frozen item look unheld.
+            //
+            // Re-arming here is required, not tidiness. Reset is the one freeze exit that neither hands the
+            // item to another owner nor fails open, and OnLobbyLeft calls it while the host STAYS in the
+            // loaded world ("back to solo"). A host who closes the lobby within the freeze window would
+            // otherwise be left with a crate hanging in mid-air that it can never look at, grab or bump
+            // again: fake item.held, ItemRigidbody disabled, every collider off, and layer 2 (IgnoreRaycast)
+            // courtesy of ExitInventorySlot. That is exactly the stranded-ghost outcome the watchdog exists
+            // to prevent, and it would survive until a save/reload.
+            // Per-entry try/catch is deliberate insurance, not defensive noise: before this block Reset was
+            // ~20 unconditional Clear() calls with ZERO throw surface, and it now opens with a Unity call
+            // graph over arbitrary ShipItems. One throw here would skip every Clear below it and leak stale
+            // state into the next session - including _syncedItemIds, which must never survive (see below).
+            // The Plugin.OnDestroy / hot-reload path runs this against a component on a GameObject that is
+            // already tearing down, which is the least predictable context for StopCoroutine/SetActive.
+            foreach (var entry in _pendingHoldFreezes)
+            {
+                try
+                {
+                    if (entry.Value.Key != null) StopCoroutine(entry.Value.Key);
+                    var frozen = entry.Value.Value;
+                    if (frozen == null) continue;
+                    if (_remoteHeldItems.ContainsKey(entry.Key) || IsHeldByLocalPlayer(frozen, entry.Key)) continue;
+                    RearmRemoteHeldItemPhysics(frozen, entry.Key);
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] freeze re-arm failed for {entry.Key}: {e}");
+                }
+            }
+            _pendingHoldFreezes.Clear();
+            _inCargoRetryApply = false;
+
             _heldItems.Clear();
             _remoteHeldItems.Clear();
             _guestInventoryItems.Clear();
@@ -1937,6 +1971,14 @@ namespace SailwindCoop.Sync
             // Any stashed skipped drop predates this pickup, so it must never be replayed.
             _skippedDropsWhileHeld.Remove(packet.ItemInstanceId);
 
+            // (v0.2.38) Mirror vanilla ShipItem.OnPickup's outline clear. OUTSIDE the remote-holder gate
+            // below on purpose: this also runs on the peer that IS the holder, which reaches here via its
+            // own echo, and clearing twice is free.
+            ClearMissionOutline(item);
+
+            // (v0.2.38) The pickup this item was frozen for has arrived; its own physics handling takes over.
+            ReleaseHoldFreeze(packet.ItemInstanceId);
+
             // If it's the remote player holding it, track for visual following
             if (packet.PlayerSteamId != SteamClient.SteamId.Value)
             {
@@ -2178,6 +2220,18 @@ namespace SailwindCoop.Sync
                 Plugin.Log.LogWarning($"OnRemoteItemDropped: item {packet.ItemInstanceId} not found");
                 return;
             }
+
+            // (v0.2.38) Backstop for the outline clear. "Every drop is preceded by a pickup we saw" is
+            // FALSE for a peer that first learns of the crate via a spawn/backfill while it is ALREADY
+            // held - that peer never runs a pickup apply, so the drop is its first chance to clear.
+            // Placed before the skip branches below: the two local-hold skips already had vanilla OnPickup
+            // clear this, and the stove-fuel skip does not hold the item at all but clearing an outline on
+            // fuel is free either way.
+            ClearMissionOutline(item);
+
+            // (v0.2.38) A drop supersedes any pending withdraw freeze: the drop path below does its own
+            // re-arm, so cancel the watchdog rather than let it fight that.
+            ReleaseHoldFreeze(packet.ItemInstanceId);
 
             // Skip repositioning for fuel items already inserted into stove
             // FuelInsertRequest arrives before ItemDropped, so insertion already happened
@@ -2689,6 +2743,15 @@ namespace SailwindCoop.Sync
             // (Host doesn't receive its own broadcast, so must track here)
             _remoteHeldItems[packet.ItemInstanceId] = item;
 
+            // (v0.2.38) The host never receives its own ItemPickedUp broadcast, so the outline clear that
+            // OnRemoteItemPickedUp does for guests has to be repeated here or the HOST keeps the outline
+            // on every mission crate a guest picks up. This is the exact reported symptom.
+            ClearMissionOutline(item);
+
+            // (v0.2.38) Same reason: this IS the host's arrival of the requester's pickup after a cargo
+            // withdraw, so release the freeze here or only the watchdog would ever clear it.
+            ReleaseHoldFreeze(packet.ItemInstanceId);
+
             // BUG FIX: Hangable items - disconnect from hook when picked up by guest
             // Without this, 'attached' remains true and item floats when dropped
             var hangable = item.GetComponent<HangableItem>();
@@ -2901,6 +2964,135 @@ namespace SailwindCoop.Sync
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        // (v0.2.38) Vanilla marks fresh mission cargo with a PERMANENT outline: ShipItem.RegisterMissionGood
+        // (decomp ShipItem.cs:615-621) sets the protected GoPointerButton.overrideEnableOutline (decl :23),
+        // and vanilla clears it in exactly ONE place - ShipItem.OnPickup (decomp ShipItem.cs:362). A
+        // whole-decompile grep finds no other writer.
+        //
+        // In co-op only the HOLDER's client runs vanilla OnPickup. Every other peer applies the pickup
+        // through OnRemoteItemPickedUp / ApprovePickupRequest, which never touch the field, so a mission
+        // crate a guest loads aboard stays outlined on the HOST forever (the reported symptom) and the
+        // reverse holds when the host picks up. GoPointerButton.UpdateColor (:171) recomputes the outline
+        // from the field every frame off LateUpdate, so clearing the field is sufficient - there is no
+        // refresh call to make.
+        //
+        // Resolved LAZILY on first use, deliberately NOT in a static initializer: a throw there would take
+        // out ItemSyncManager's type initializer and with it ALL item sync, to fix a cosmetic outline.
+        private static HarmonyLib.AccessTools.FieldRef<GoPointerButton, bool> _overrideEnableOutlineRef;
+        private static bool _overrideEnableOutlineResolveAttempted;
+
+        /// <summary>
+        /// Clear vanilla's mission-cargo outline on a peer that did not run ShipItem.OnPickup itself.
+        /// Cheap no-op for ordinary items (the field is already false) and degrades to a no-op if the
+        /// field cannot be resolved.
+        /// </summary>
+        private static void ClearMissionOutline(ShipItem item)
+        {
+            if (item == null) return;
+
+            if (!_overrideEnableOutlineResolveAttempted)
+            {
+                _overrideEnableOutlineResolveAttempted = true;
+                try
+                {
+                    _overrideEnableOutlineRef =
+                        HarmonyLib.AccessTools.FieldRefAccess<GoPointerButton, bool>("overrideEnableOutline");
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] mission-outline field unavailable; outlines will not clear on remote pickups: {e.Message}");
+                }
+            }
+            if (_overrideEnableOutlineRef == null) return;
+
+            try
+            {
+                if (!_overrideEnableOutlineRef(item)) return; // not outlined - keeps this free for ordinary items
+                _overrideEnableOutlineRef(item) = false;
+                VerboseLogger.ItemApply($"Cleared mission-cargo outline on {item.name}");
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[ITEM] could not clear mission outline on {item.name}: {e.Message}");
+            }
+        }
+
+        // (v0.2.38) Withdraw freeze. Vanilla CargoCarrier.WithdrawItem (decomp CargoCarrier.cs:97-104)
+        // picks the item up BEFORE it calls ExitInventorySlot, so the rigidbody never goes live. The mod's
+        // ApplyCargoWithdrawLocal mirror deliberately omits the pickup (only the requester picks up), so on
+        // every OTHER peer - including the HOST when a guest requested it - ExitInventorySlot nulls
+        // currentInventorySlot, and ItemRigidbody's next tick (decomp ItemRigidbody.cs:476-531) flips the
+        // item from kinematic+isTrigger to a solid dynamic body. Result: a full-scale physics object
+        // materialises 10m in front of the cart with nothing holding it, for a whole network round trip,
+        // and shoves whatever it lands in. That is Jav1k's "catapults other items around".
+        //
+        // Fix: hold the item inert on those peers until the real pickup lands. FAILS OPEN by design - if no
+        // pickup ever arrives (requester's hands were full, they disconnected, the packet was lost) the
+        // watchdog hands the item back to vanilla physics rather than leaving a frozen non-interactable
+        // ghost. A stranded item is a far worse bug than the flash this exists to suppress.
+        //
+        // NOTE: this suppresses the PHYSICS half only. The item is still briefly VISIBLE at the cart. Hiding
+        // it would need SetActive(false) or a scale-zero, and FindItemByInstanceId cannot see inactive
+        // objects while nothing would guarantee a scale restore on every exit - both risk the far worse
+        // invisible-item failure. Documented residual, not an oversight.
+        // The ShipItem is stored alongside the coroutine because Reset() has to be able to RE-ARM a still-
+        // frozen item, and a bare Coroutine handle cannot reach it. (KeyValuePair matches the existing
+        // _recentCargoWithdrawGrace idiom.)
+        private readonly Dictionary<int, KeyValuePair<Coroutine, ShipItem>> _pendingHoldFreezes =
+            new Dictionary<int, KeyValuePair<Coroutine, ShipItem>>();
+        private const float PendingHoldFreezeTimeout = 5f;
+        private bool _inCargoRetryApply;
+
+        private void FreezeItemPendingHold(ShipItem item, int instanceId)
+        {
+            if (item == null || instanceId == 0) return;
+
+            DisarmRemoteHeldItemPhysics(item, instanceId);
+
+            if (_pendingHoldFreezes.TryGetValue(instanceId, out var running) && running.Key != null)
+                StopCoroutine(running.Key);
+            _pendingHoldFreezes[instanceId] = new KeyValuePair<Coroutine, ShipItem>(
+                StartCoroutine(ReleaseHoldFreezeIfAbandoned(item, instanceId)), item);
+            VerboseLogger.ItemApply($"Froze item {instanceId} pending hold (withdraw)");
+        }
+
+        /// <summary>
+        /// A real hold (or drop) landed for this item, so its own path owns the physics from here. Cancels
+        /// the fail-open watchdog WITHOUT re-arming - the caller re-disarms (pickup) or re-arms (drop).
+        /// </summary>
+        private void ReleaseHoldFreeze(int instanceId)
+        {
+            if (!_pendingHoldFreezes.TryGetValue(instanceId, out var entry)) return;
+            if (entry.Key != null) StopCoroutine(entry.Key);
+            _pendingHoldFreezes.Remove(instanceId);
+        }
+
+        private System.Collections.IEnumerator ReleaseHoldFreezeIfAbandoned(ShipItem item, int instanceId)
+        {
+            float deadline = Time.unscaledTime + PendingHoldFreezeTimeout;
+            while (Time.unscaledTime < deadline)
+            {
+                yield return null;
+                if (item == null) { _pendingHoldFreezes.Remove(instanceId); yield break; }
+            }
+            _pendingHoldFreezes.Remove(instanceId);
+            if (item == null) yield break;
+
+            // HOLDER GUARD - do not rely on ReleaseHoldFreeze having been called. If anyone is holding this
+            // item by now, re-arming would clear item.held and rip it out of their hands. Belt and braces
+            // over the explicit release calls: any path that forgets one degrades to "freeze lingers",
+            // never to "item torn from a hand".
+            if (_remoteHeldItems.ContainsKey(instanceId) || IsHeldByLocalPlayer(item, instanceId))
+            {
+                VerboseLogger.ItemApply($"Withdraw freeze for {instanceId} expired but the item is held; leaving physics to the holder");
+                yield break;
+            }
+
+            // Nobody ever claimed it. Give it back to vanilla physics where it stands.
+            Plugin.Log.LogWarning($"[ITEM] withdraw freeze for {instanceId} ({item.name}) timed out with no pickup; releasing to physics");
+            RearmRemoteHeldItemPhysics(item, instanceId);
         }
 
         /// <summary>
@@ -4441,7 +4633,8 @@ namespace SailwindCoop.Sync
             }
 
             var item = carrier.cargo[index];
-            ApplyCargoWithdrawLocal(carrier, item);
+            // The host is applying a GUEST's withdraw: no local pickup follows here, so freeze it.
+            ApplyCargoWithdrawLocal(carrier, item, withdrawerIsLocal: false);
             // (v0.2.34) Arm the pickup grace BEFORE broadcasting: the requester's follow-up
             // ItemPickupRequest races the broadcast on the same reliable channel, and the grace must
             // already be on the ledger when it lands (see OnRemoteItemPickupRequest).
@@ -4522,11 +4715,16 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // A LATE retry apply (RetryCargoApply, up to 15s after the fact) must never freeze: the
+            // requester's pickup came and went long ago, so nothing would release it and the item would sit
+            // inert until the watchdog timed out.
+            bool localWithdrawer = packet.RequesterSteamId == (ulong)SteamClient.SteamId || _inCargoRetryApply;
+
             IsApplyingRemoteState = true;
             try
             {
                 if (carrier.cargo != null && carrier.cargo.Contains(item))
-                    ApplyCargoWithdrawLocal(carrier, item);
+                    ApplyCargoWithdrawLocal(carrier, item, localWithdrawer);
             }
             finally
             {
@@ -4585,7 +4783,14 @@ namespace SailwindCoop.Sync
                     VerboseLogger.ItemApply($"Cargo retry succeeded on attempt {attempt + 1} for item {itemId}");
                     _pendingCargoRetryOps.Remove(itemId); // consume BEFORE re-entry (handler may re-schedule on a fresh miss)
                     if (op.Key.HasValue) OnRemoteCargoInserted(op.Key.Value);
-                    else OnRemoteCargoWithdrawn(op.Value.Value);
+                    else
+                    {
+                        // (v0.2.38) Suppress the withdraw freeze for this re-entry: this apply is seconds to
+                        // minutes late, so the requester's pickup can no longer arrive to release it.
+                        _inCargoRetryApply = true;
+                        try { OnRemoteCargoWithdrawn(op.Value.Value); }
+                        finally { _inCargoRetryApply = false; }
+                    }
                     yield break;
                 }
                 Plugin.Log.LogWarning($"Cargo retry gave up after 15s for item {itemId} (carrier or item never appeared)");
@@ -4597,15 +4802,25 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>Vanilla WithdrawItem minus the pointer pickup (usable for a remote requester).</summary>
-        private static void ApplyCargoWithdrawLocal(CargoCarrier carrier, ShipItem item)
+        /// <param name="withdrawerIsLocal">True when THIS machine's player is the one taking the item out,
+        /// i.e. a local pickup follows in the same frame and vanilla's ordering is preserved. False on every
+        /// other peer, where the item would otherwise go live with nobody holding it - see
+        /// FreezeItemPendingHold.</param>
+        private void ApplyCargoWithdrawLocal(CargoCarrier carrier, ShipItem item, bool withdrawerIsLocal)
         {
             item.daysInStorage = 0;
             item.WithdrawFromCarrier();
+            // The 10m translate is kept on ALL peers: skipping it on non-withdrawers would diverge their pose
+            // from the host's authoritative one for a full RTT, and any snapshot taken in that window persists
+            // the wrong position.
             item.transform.Translate(carrier.transform.forward * 10f, Space.World);
             item.GetItemRigidbody().transform.Translate(carrier.transform.forward * 10f, Space.World);
             item.GetItemRigidbody().ExitInventorySlot();
             item.transform.localScale = Vector3.one;
             carrier.cargo.Remove(item);
+
+            if (!withdrawerIsLocal)
+                FreezeItemPendingHold(item, item.GetComponent<SaveablePrefab>()?.instanceId ?? 0);
         }
 
         /// <summary>Host -> one joiner: replay carrier inventories (the join snapshot ships carrier
