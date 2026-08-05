@@ -509,6 +509,60 @@ namespace SailwindCoop.Patches
 
         // === MOORING PATCHES ===
 
+        /// <summary>
+        /// (v0.2.39) Broadcast "I picked up a mooring rope" so crewmates can see who is carrying it.
+        /// OnPickup is the vanilla hook, and it also unmoors a moored rope - which the existing Unmoor
+        /// patch already broadcasts, so the two compose rather than duplicate.
+        /// </summary>
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "OnPickup")]
+        public static class MooringRopePickupPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(PickupableBoatMooringRope __instance)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                // Same phantom-load gate as the moor patch below: a joining guest's own save restores rope
+                // state during the load, and none of that is a player action worth broadcasting.
+                if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                    || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+                Sync.MooringRopeHoldSync.OnLocalHoldChanged(__instance, true);
+            }
+        }
+
+        /// <summary>(v0.2.39) The other half: released, so crewmates stop carrying it on their screens.</summary>
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "OnDrop")]
+        public static class MooringRopeDropPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(PickupableBoatMooringRope __instance)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                    || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+                Sync.MooringRopeHoldSync.OnLocalHoldChanged(__instance, false);
+            }
+        }
+
+        /// <summary>
+        /// (v0.2.39) SAFETY, and the reason carrying a rope on a receiver is not simply "move the transform".
+        ///
+        /// Vanilla's OnTriggerEnter moors a rope to any dock cleat it touches while `!held`. On a RECEIVING
+        /// machine `held` is always null - the local player is not carrying anything - so a rope pinned to a
+        /// crewmate's avatar would moor ITSELF to the first cleat that crewmate walked past. MoorTo is
+        /// patched to broadcast, so that phantom moor would then propagate to the entire crew as though a
+        /// player had tied it up. Suppress the trigger entirely while a rope is being carried by someone
+        /// else; the real carrier's own machine still moors it for real, and that broadcast is authoritative.
+        /// </summary>
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "OnTriggerEnter")]
+        public static class MooringRopeTriggerPatch
+        {
+            [HarmonyPrefix]
+            public static bool Prefix(PickupableBoatMooringRope __instance)
+            {
+                return !Sync.MooringRopeHoldSync.IsRemotelyHeld(__instance);
+            }
+        }
+
         [HarmonyPatch(typeof(PickupableBoatMooringRope), "MoorTo")]
         public static class MooringAttachPatch
         {

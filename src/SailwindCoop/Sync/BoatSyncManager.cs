@@ -50,6 +50,10 @@ namespace SailwindCoop.Sync
             // inter-packet gap and cause false snaps.
             public bool SnapOnNextApply;
             public float LastPacketUnscaledTime;
+            // (v0.2.39) Unscaled time at which the CURRENT sustained divergence began, or 0 when converged.
+            // See the persistence escalation in the correction branch: without it the corrector can lose
+            // forever without ever qualifying for the teleport that would end it.
+            public float DivergenceStartUnscaledTime;
             // False until the first real target (packet or world-state) lands. A pre-armed entry created
             // by ForceSnapOnNextApply has no target yet - applying it would teleport the boat to a
             // zero-initialized position.
@@ -113,17 +117,47 @@ namespace SailwindCoop.Sync
         private const float VelocityCorrectionStrength = 2f;  // How aggressively to match host velocity
         private const float TeleportThreshold = 50f;          // Direct teleport if error exceeds this (meters)
 
-        // Vertical (Y) correction is SOFTENED so LOCAL buoyancy owns the boat's height on the wave
-        // surface. Hard-matching the host's exact Y every frame fights the local buoyancy solve and can
-        // push the hull under the locally rendered surface in chop. The wave spectrum is seeded
-        // deterministically on every client (WeatherPatches.OceanSpectrumSeedPatch), so the boat naturally
-        // floats at the same height as the host; we only need a GENTLE Y pull to stop slow vertical drift
-        // in extreme swell - not a hard snap. XZ correction is unchanged (host stays authoritative for
-        // horizontal position).
+        // Vertical (Y) correction is SOFTENED so LOCAL buoyancy owns the boat's height on the wave surface.
+        // Hard-matching the host's exact Y every frame fights the local buoyancy solve and can push the hull
+        // under the locally rendered surface in chop. XZ correction is unchanged (the host stays
+        // authoritative for horizontal position).
+        //
+        // (v0.2.39) CORRECTION TO A CLAIM THAT STOOD HERE FOR SIX VERSIONS. This comment used to justify the
+        // softening by saying "the wave spectrum is seeded deterministically on every client
+        // (WeatherPatches.OceanSpectrumSeedPatch), so the boat naturally floats at the same height as the
+        // host". That patch was added in v0.2.16 and DELETED in v0.2.19 when ocean sync was retargeted at
+        // Crest; it has not existed since. And the premise is not merely unsupported now, it is false: wave
+        // AMPLITUDE is computed per machine from GameState.distanceToLand and eyesFullyClosed, neither of
+        // which is replicated, and the distanceToLand term alone spans 6.7x between "beside an island" and
+        // "deep ocean". LoadGame also resets distanceToLand to 999999 and reconverges it slowly, so straight
+        // after a join a guest can be rendering open-ocean swell under a hull the host has moored in the lee
+        // of an island.
+        //
+        // The softening is therefore doing more work than it was credited with: not smoothing a small
+        // residual against a shared wave field, but absorbing a genuinely different one. It stays because it
+        // demonstrably beats a hard snap, not because the heights agree. Whoever revisits this should treat
+        // the wave field itself as the unfixed part.
         private const float VerticalCorrectionFactor = 0.35f; // 0=Y free (buoyancy only), 1=old hard Y match
         // If the boat diverges vertically by more than this, fall back to full Y correction (catches the
         // boat before it can clip badly through the deck/water; normal float jitter stays well under this).
         private const float VerticalHardCorrectThreshold = 3f; // meters
+
+        // (v0.2.39) Sustained-divergence escalation. The gentle corrector's own clamps keep the error well
+        // under TeleportThreshold, so without a TIME-based escape it can lose forever. 4m/4s is chosen to sit
+        // clearly outside normal play: ordinary correction settles in well under a second, and the observed
+        // live failure held 5-8m for 5.5s. Unscaled seconds.
+        // 6m, NOT 4m: the teleport branch this feeds also requires errorMagnitude > 5f, so a lower arm
+        // threshold would set SnapOnNextApply in a 4-5m band where the teleport can never fire - the flag
+        // would sit latched and the escalation would log without ever acting.
+        private const float SustainedDivergenceMeters = 6f;
+        private const float SustainedDivergenceSeconds = 4f;
+        // Window after a join during which the POSITION_ERROR diagnostic drops its 5m gate. The gate hid the
+        // ramp that precedes an excursion and made a gradual divergence read as a sudden step change.
+        private const float PostJoinVerboseSeconds = 60f;
+        private static float _lastJoinCompleteUnscaledTime = -999f;
+
+        /// <summary>(v0.2.39) Opens the post-join verbose window. Called at the end of the join coroutine.</summary>
+        public static void NoteJoinComplete() => _lastJoinCompleteUnscaledTime = Time.unscaledTime;
 
         /// <summary>
         /// Set to true during join/recovery to prevent physics sync from running.
@@ -483,6 +517,7 @@ namespace SailwindCoop.Sync
                 // VerticalHardCorrectThreshold, in which case we fully correct Y to catch a real desync
                 // before the hull clips through the deck/water. Solo is never multiplayer so never reaches
                 // here; this only runs guest-side.
+                float rawErrorY = positionError.y;   // (v0.2.39) kept for diagnostics, before softening
                 float verticalFactor = (Mathf.Abs(positionError.y) > VerticalHardCorrectThreshold)
                     ? 1f
                     : VerticalCorrectionFactor;
@@ -507,12 +542,14 @@ namespace SailwindCoop.Sync
                 // Clamp the commanded correction so a large-but-sub-teleport error (e.g. after a receive
                 // stall) is chased gently instead of violently. No-op at normal errors (<5m -> <~35 m/s^2).
                 Vector3 correction = Vector3.ClampMagnitude(positionCorrection + velocityCorrection, 30f);
+                Vector3 velBeforeCorrection = rb.velocity; // (v0.2.39) diagnostics: the real hull speed
                 rb.velocity += correction * dt;
 
                 // Hard speed ceiling relative to the host's authoritative speed - catches any residual
                 // runaway regardless of source. No-op in normal play.
                 float maxSpeed = state.TargetVelocity.magnitude + 8f;
-                if (rb.velocity.magnitude > maxSpeed)
+                bool clampFired = rb.velocity.magnitude > maxSpeed;
+                if (clampFired)
                     rb.velocity = rb.velocity.normalized * maxSpeed;
 
                 // Rotation correction: apply angular velocity toward target rotation
@@ -531,12 +568,76 @@ namespace SailwindCoop.Sync
                     rb.angularVelocity += (rotationCorrection + angularVelocityCorrection) * dt;
                 }
 
-                // Debug: Log significant position errors (but below teleport threshold)
-                if (errorMagnitude > 5f)
+                // (v0.2.39) PERSISTENCE ESCALATION. Without this the corrector can lose indefinitely.
+                // Its two modes are gentle PD (error < TeleportThreshold) and teleport (error >= it), but its
+                // OWN clamps - ClampMagnitude(...,30f) above and the maxSpeed ceiling - hold the error inside
+                // a roughly 0-10m band, so a 50m threshold is mathematically unreachable from here. The one
+                // mechanism that can beat a sustained external force (a joint, a contact, a bad buoyancy
+                // equilibrium) was therefore permanently starved, and a guest could sit metres off the host's
+                // position for as long as the cause persisted. Observed live: a hull 5-8m out for 5.5s while
+                // the commanded correction ramped to 41 and never won.
+                //
+                // Escalate on TIME rather than magnitude: if the error stays large continuously, the gentle
+                // path has demonstrably failed and a snap is the honest answer. Reuses the existing
+                // SnapOnNextApply escape hatch (which pairs with the >5m test at the teleport branch), so
+                // there is no new teleport path to get wrong. UNSCALED clock, so a sleep warp cannot make
+                // this fire early.
+                // MOORED BOATS ARE EXCLUDED, and this is the load-bearing part of the escalation.
+                //
+                // The condition it triggers on SELECTS FOR a hard constraint: with PositionCorrectionStrength
+                // 5 and the 30 m/s^2 clamp, a sustained 4-6m error requires ~20-30 m/s^2 of sustained external
+                // acceleration. Wind, drag and latency cannot do that. A mooring SpringJoint can. So the
+                // boats most likely to qualify are precisely the ones it is most dangerous to teleport - and
+                // the teleport branch carries the ANCHOR across (CarryAnchorWithBoatTeleport) but does nothing
+                // about mooring joints. This file already documents the consequence on the join gate: "avoids
+                // physics explosion when boat is teleported with mooring springs attached".
+                //
+                // Per-rope IsMoored rather than AnyRopeMoored: the latter also reports true for a set anchor,
+                // and the anchor case IS handled by the teleport, so gating on it would needlessly disable the
+                // escalation for every anchored boat.
+                bool ropeMoored = false;
+                var mooringRopes = boatSaveable.GetComponent<BoatMooringRopes>();
+                if (mooringRopes?.ropes != null)
                 {
-                    VerboseLogger.TeleportDebug($"POSITION_ERROR: {errorMagnitude:F1}m, " +
+                    for (int i = 0; i < mooringRopes.ropes.Length; i++)
+                        if (mooringRopes.ropes[i] != null && mooringRopes.ropes[i].IsMoored()) { ropeMoored = true; break; }
+                }
+
+                if (!ropeMoored && errorMagnitude > SustainedDivergenceMeters)
+                {
+                    if (state.DivergenceStartUnscaledTime <= 0f)
+                        state.DivergenceStartUnscaledTime = Time.unscaledTime;
+                    else if (Time.unscaledTime - state.DivergenceStartUnscaledTime > SustainedDivergenceSeconds)
+                    {
+                        VerboseLogger.TeleportDebug($"SUSTAINED_DIVERGENCE: boat={boat.name}, {errorMagnitude:F1}m " +
+                            $"for {Time.unscaledTime - state.DivergenceStartUnscaledTime:F1}s - escalating to snap");
+                        state.SnapOnNextApply = true;
+                        state.DivergenceStartUnscaledTime = 0f;
+                    }
+                }
+                else state.DivergenceStartUnscaledTime = 0f;
+
+                // (v0.2.39) DIAGNOSTICS. The old line printed three quantities that were misleading:
+                //  - "velocity" was read AFTER the maxSpeed clamp two statements above, so on any frame the
+                //    clamp fired it printed the ceiling (TargetVelocity + 8) rather than the hull's speed.
+                //    In a live capture it read 8.1-8.5 on 100% of 214 frames while the host streamed
+                //    0.05-0.5 - it looked like data and was an echo. That cost real diagnosis time.
+                //  - the vertical error, which is what actually matters here, was folded invisibly into
+                //    errorMagnitude, and verticalFactor (0.35 vs 1.0) was not shown at all, so a soft-Y
+                //    drift and a hard-Y chase were indistinguishable in the log.
+                // Print the pre-write velocity, whether the clamp fired, Y separately, and the factor.
+                //
+                // The >5m gate is ALSO lifted for a window after join: it hid the ramp that precedes every
+                // excursion and made a gradual divergence look like a sudden step change.
+                bool verbose = errorMagnitude > 5f
+                    || (Time.unscaledTime - _lastJoinCompleteUnscaledTime < PostJoinVerboseSeconds && errorMagnitude > 1f);
+                if (verbose)
+                {
+                    VerboseLogger.TeleportDebug($"POSITION_ERROR: {errorMagnitude:F1}m (y={rawErrorY:F2}, vFactor={verticalFactor:F2}), " +
                         $"current={boat.position}, target={targetLocalPosition}, " +
-                        $"velocity={rb.velocity.magnitude:F1}m/s, correction={positionCorrection.magnitude:F1}");
+                        $"velPre={velBeforeCorrection.magnitude:F2}m/s, velPost={rb.velocity.magnitude:F2}m/s, " +
+                        $"clamped={clampFired}, correction={positionCorrection.magnitude:F1}");
+                    LogHullState(boat, rb);
                 }
             }
 
@@ -544,6 +645,60 @@ namespace SailwindCoop.Sync
             state.PrevBoatPosition = boat.position;
             state.PrevOffset = offset;
             state.HasPrevValues = true;
+        }
+
+        // Throttle the hull dump: the error line can fire every frame during an excursion, and one line per
+        // boat per second is plenty to characterize a multi-second event without burying it.
+        private static readonly System.Collections.Generic.Dictionary<int, float> _lastHullLog =
+            new System.Collections.Generic.Dictionary<int, float>();
+
+        /// <summary>
+        /// (v0.2.39) Why the hull is where it is, rather than only that it is in the wrong place.
+        ///
+        /// The position diagnostic alongside this one reports the boat's transform and the mod's own
+        /// commanded numbers, and that turned out to be the wrong half of the story: a hull sitting too high
+        /// because its buoyancy is stale, a hull whose center of mass has been dragged off the keel, and a
+        /// hull floating correctly on a wave field that simply differs from the host's all produce the same
+        /// position error and were indistinguishable in the log. Each of the values below separates one of
+        /// those from the others:
+        ///   forceMult/waterLevel/drag - a guest whose buoyancy has not tracked the host's flooding
+        ///   com vs keel            - a center of mass wrenched off the keel by a bad lever arm
+        ///   rotErr                 - a hull that is heeling or librating rather than translating
+        ///   distToLand             - the unreplicated term that sets local wave amplitude
+        /// Every read is null-guarded and the whole thing is best-effort: a diagnostic must never be the
+        /// reason a frame throws.
+        /// </summary>
+        private static void LogHullState(Transform boat, Rigidbody rb)
+        {
+            try
+            {
+                int id = boat.GetInstanceID();
+                float now = Time.unscaledTime;
+                float last;
+                if (_lastHullLog.TryGetValue(id, out last) && now - last < 1f) return;
+                _lastHullLog[id] = now;
+
+                var damage = boat.GetComponent<BoatDamage>();
+                var probes = boat.GetComponent<Crest.BoatProbes>();
+                string buoy = probes != null ? probes._forceMultiplier.ToString("F3") : "n/a";
+                string water = damage != null ? damage.waterLevel.ToString("F3") : "n/a";
+                string sunk = damage != null ? damage.sunk.ToString() : "n/a";
+
+                string com = "n/a";
+                if (rb != null)
+                {
+                    var keel = boat.GetComponent<BoatKeel>();
+                    com = keel != null
+                        ? (rb.centerOfMass - keel.centerOfMass).magnitude.ToString("F2") + "m off keel"
+                        : rb.centerOfMass.ToString();
+                }
+
+                VerboseLogger.TeleportDebug($"HULL_STATE '{boat.name}': forceMult={buoy}, waterLevel={water}, " +
+                    $"sunk={sunk}, drag={(rb != null ? rb.drag.ToString("F2") : "n/a")}, " +
+                    $"mass={(rb != null ? rb.mass.ToString("F0") : "n/a")}, com={com}, " +
+                    $"distToLand={GameState.distanceToLand:F0}");
+            }
+            catch { /* diagnostics must never be the reason a frame fails */ }
         }
 
         /// <summary>
@@ -766,6 +921,7 @@ namespace SailwindCoop.Sync
             _targetBoatName = null;
             _boatStates.Clear();
             IsJoinInProgress = false;
+            _lastJoinCompleteUnscaledTime = -999f; // (v0.2.39) close the post-join verbose window
             HasReceivedWorldState = false; // (v0.2.25) re-arm the guest join-state watchdog for the next session
 
             // Clear cache

@@ -96,8 +96,22 @@ namespace SailwindCoop.Compat
         /// - climbSpeed: local movement speed.
         /// - cleanSave / cleanLoad / convertSave / starterSetFix: save-repair switches.
         ///
-        /// Both are "(requires a restart)" in SE's own config description, so reading them ONCE in Init is
-        /// correct - they cannot change under us mid-session.
+        /// Both are labelled "(requires a restart)" in SE's own config description, but that label is only
+        /// literally true for ONE of them, and the difference matters if this token is ever widened into a
+        /// reconcile (v0.2.39 audit):
+        ///   addSails      GENUINELY restart-only. Its single read site is a Postfix on PrefabsDirectory.Start
+        ///                 that constructs sail prefabs into PrefabsDirectory.sails[156..158]. A plain Unity
+        ///                 Start on a MonoBehaviour, so it cannot re-run for that instance. A peer that
+        ///                 booted with it OFF has those slots null forever, and Mast.LoadSail's Instantiate
+        ///                 of them is unguarded - adopting the host's `true` would convert a clean join
+        ///                 refusal into a mid-session NullReferenceException. NEVER reconcile this one.
+        ///   topsailPatch  Actually read LIVE, per call, in a Postfix on Mast.TopsailCheckAndAttach, which
+        ///                 runs on every sail install/removal/rig rebuild. The effect is torn down and
+        ///                 re-derived each call, so a runtime flip works in both directions. The "restart"
+        ///                 label reflects that SE never re-reads it, not that the value is inert.
+        /// Reading them ONCE in Init is therefore a BOOT-TIME SNAPSHOT, not an invariant: nothing stops a
+        /// user or another mod flipping topsailPatch mid-session, which would silently desync this token
+        /// from actual behavior. Acceptable today because nothing flips it, but do not treat it as proven.
         /// </summary>
         private static readonly string[] RigContractConfigs = { "topsailPatch", "addSails" };
         private static string _rigContractToken = "";
@@ -134,13 +148,143 @@ namespace SailwindCoop.Compat
             {
                 if (!IsInstalled) return "";
                 if (!_reflectionOk) return "SE=" + Version + "/noSync";
-                return "SE=" + Version + (SkipSailData ? "/noSailData" : "") + _rigContractToken;
+                // (v0.2.39) Advertise BUNDLE HEALTH, not just the version. A guest whose SE asset bundles
+                // failed to load ("ShipyardExpansion: Asset bundle missing!" / "Unable to open archive
+                // file: shipyard_expansion.assets") still reports the same version as a healthy host, so
+                // the gate passed them - and then the join wrecked every boat they owned. Vanilla's
+                // customization LoadData strips the sails BEFORE indexing the host's larger part list, so
+                // the mismatch left them with sailless, winchless, unusable hulls and no clue why. Two
+                // installs of the same SE version are NOT equivalent if one of them cannot load its parts;
+                // refusing that join with a named reason beats silently ruining the session.
+                return "SE=" + Version + (SkipSailData ? "/noSailData" : "")
+                    + (BundlesLoaded ? "" : "/noBundles") + _rigContractToken;
             }
         }
+
+        /// <summary>(v0.2.39) Whether SE's asset bundles loaded. Defaults TRUE and is only cleared on
+        /// positive evidence of failure - see the read in Init for why this fails open.</summary>
+        public static bool BundlesLoaded { get; private set; } = true;
 
         private static MethodInfo _saveSailConfig; // SailDataManager.SaveSailConfig(BoatRefs)
         private static MethodInfo _loadSailConfig; // SailDataManager.LoadSailConfig(BoatRefs)
         private static bool _reflectionOk;
+
+        /// <summary>The player's own rig-contract token, captured before the first adopt. Null = nothing adopted.</summary>
+        private static string _originalRigContract;
+
+        /// <summary>
+        /// (v0.2.39) Adopt a peer's SE rig contract for this session. ONLY `topsailPatch` is adoptable, and
+        /// the asymmetry is load-bearing:
+        ///
+        ///   topsailPatch  ADOPTABLE. Read live, per call, in a Postfix on Mast.TopsailCheckAndAttach, which
+        ///                 runs on every sail install/removal/rig rebuild, and the effect is torn down and
+        ///                 re-derived each call so a flip works in both directions. Timing works out for
+        ///                 free: we reconcile at lobby-join, and the join's own customization apply
+        ///                 (LoadData -> Mast.LoadSail -> UpdateControllerAttachments) drives that very
+        ///                 rebuild afterwards, so the adopted value is what builds the guest's rig.
+        ///   addSails      NEVER ADOPT. Its only read site is a Postfix on PrefabsDirectory.Start that
+        ///                 constructs sail prefabs into PrefabsDirectory.sails[156..158]. A plain Unity
+        ///                 Start, so it cannot re-run. A peer that BOOTED with it off has those slots null
+        ///                 permanently, and Mast.LoadSail's Instantiate of them is unguarded - adopting the
+        ///                 host's `true` would convert a clean join refusal into a mid-session
+        ///                 NullReferenceException out of the customization apply.
+        ///
+        /// Everything else in the SE token (version, /noSync, /noSailData) is structural and refuses.
+        /// </summary>
+        public static bool TryAdoptRigContract(string desired)
+        {
+            if (!IsInstalled || !_reflectionOk) return false;
+            if (string.IsNullOrEmpty(desired) || !desired.StartsWith("SE=")) return false;
+            if (desired.Contains("/noSync") || desired.Contains("?")) return false;
+            // /noSailData is SE's own debug flag; a mismatch there is not something we can or should flip.
+            if (desired.Contains("/noSailData") != SkipSailData) return false;
+
+            int firstSlash = desired.IndexOf('/');
+            string desiredVersion = firstSlash < 0 ? desired.Substring(3) : desired.Substring(3, firstSlash - 3);
+            if (desiredVersion != Version) return false;
+
+            var wanted = ConfigAdoption.ParseNamedFlags(desired);
+            var ours = ConfigAdoption.ParseNamedFlags(_rigContractToken);
+
+            // addSails must ALREADY agree - we cannot make it agree. Refuse honestly instead.
+            if (!wanted.TryGetValue("addSails", out bool wantAdd) ||
+                !ours.TryGetValue("addSails", out bool haveAdd) || wantAdd != haveAdd)
+                return false;
+            if (!wanted.TryGetValue("topsailPatch", out bool wantTop)) return false;
+
+            try
+            {
+                var entry = ResolveRigContractEntry("topsailPatch");
+                if (entry == null) return false;
+
+                if (_originalRigContract == null) _originalRigContract = _rigContractToken;
+
+                if (entry.Value != wantTop)
+                {
+                    ConfigAdoption.SetWithoutSaving(entry, wantTop);
+                    Plugin.Log.LogInfo($"[SECompat] Adopted the host's Shipyard Expansion 'Link topmasts' " +
+                        $"setting for this session: {(wantTop ? "on" : "off")}.");
+                }
+
+                RebuildRigContractToken();
+                return ModSignature == desired;
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("[SECompat] Could not adopt the host's SE rig contract: " + e.Message);
+                return false;
+            }
+        }
+
+        /// <summary>Put the player's own SE rig contract back after a co-op session.</summary>
+        public static void RestoreLocalRigContract()
+        {
+            if (_originalRigContract == null) return;
+            string original = _originalRigContract;
+            _originalRigContract = null; // clear FIRST so a throw cannot strand a permanent restore attempt
+
+            try
+            {
+                var wanted = ConfigAdoption.ParseNamedFlags(original);
+                var entry = ResolveRigContractEntry("topsailPatch");
+                if (entry != null && wanted.TryGetValue("topsailPatch", out bool want) && entry.Value != want)
+                    ConfigAdoption.SetWithoutSaving(entry, want);
+                RebuildRigContractToken();
+                Plugin.Log.LogInfo($"[SECompat] Restored your own Shipyard Expansion rig settings ({original}).");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("[SECompat] Could not restore your SE rig settings; restart to be sure. " + e.Message);
+            }
+        }
+
+        private static BepInEx.Configuration.ConfigEntry<bool> ResolveRigContractEntry(string name)
+        {
+            BepInEx.Bootstrap.Chainloader.PluginInfos.TryGetValue(SEGuid, out var info);
+            var asm = info?.Instance != null ? info.Instance.GetType().Assembly : null;
+            asm = asm ?? AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == SEAssemblyName);
+            var t = asm?.GetType("ShipyardExpansion.Plugin");
+            var f = t?.GetField(name, BindingFlags.NonPublic | BindingFlags.Static);
+            return f?.GetValue(null) as BepInEx.Configuration.ConfigEntry<bool>;
+        }
+
+        /// <summary>
+        /// Re-derive _rigContractToken after an adopt/restore. Deliberately does NOT touch _reflectionOk:
+        /// Init already established it, and an unbound entry here means something changed under us, which
+        /// should surface as a token mismatch (refusal), not as a silent SE-sync disable mid-session.
+        /// </summary>
+        private static void RebuildRigContractToken()
+        {
+            var token = new System.Text.StringBuilder();
+            foreach (var name in RigContractConfigs)
+            {
+                var e = ResolveRigContractEntry(name);
+                if (e == null) token.Append('/').Append(name).Append('?');
+                else token.Append('/').Append(name).Append(e.Value ? '1' : '0');
+            }
+            _rigContractToken = token.ToString();
+        }
 
         // Warn-once latch, keyed by boat name. GetRigBlob runs on ShipyardSyncManager's 5 Hz poll,
         // so a persistent failure (e.g. an SE part whose sail has no SailScaler) would otherwise
@@ -159,6 +303,7 @@ namespace SailwindCoop.Compat
         {
             IsInstalled = false;
             Version = "";
+            BundlesLoaded = true;   // re-derived below; never carry a stale failure across a re-init
             SkipSailData = false;
             _rigContractToken = "";
             _reflectionOk = false;
@@ -197,6 +342,38 @@ namespace SailwindCoop.Compat
                 _saveSailConfig = sdm != null ? sdm.GetMethod("SaveSailConfig", BindingFlags.Public | BindingFlags.Static) : null;
                 _loadSailConfig = sdm != null ? sdm.GetMethod("LoadSailConfig", BindingFlags.Public | BindingFlags.Static) : null;
                 _reflectionOk = _saveSailConfig != null && _loadSailConfig != null;
+
+                // (v0.2.39) Are SE's asset bundles actually loaded? An install whose .assets files are
+                // missing still reports its version normally, so the gate saw two identical SE versions and
+                // let the join through - after which the guest's smaller part list made vanilla's
+                // customization LoadData throw mid-way, leaving every boat stripped of sails and winches.
+                // FAIL OPEN: if the fields cannot be read at all we assume healthy, because refusing joins
+                // on a reflection miss would be a far worse failure than the one being prevented.
+                try
+                {
+                    var tools = asm.GetType("ShipyardExpansion.AssetTools");
+                    if (tools != null)
+                    {
+                        var b1 = tools.GetField("bundle", BindingFlags.Public | BindingFlags.Static);
+                        var b2 = tools.GetField("bundle2", BindingFlags.Public | BindingFlags.Static);
+                        if (b1 != null || b2 != null)
+                        {
+                            bool ok1 = b1 == null || b1.GetValue(null) != null;
+                            bool ok2 = b2 == null || b2.GetValue(null) != null;
+                            BundlesLoaded = ok1 && ok2;
+                            if (!BundlesLoaded)
+                                Plugin.Log.LogWarning("[SECompat] Shipyard Expansion is installed but its ASSET BUNDLES " +
+                                    "are not loaded - its custom boat parts are unavailable on this machine. Co-op joins " +
+                                    "with peers whose bundles DID load will be refused, because mixing the two strips " +
+                                    "sails and winches off every shared boat. Reinstall Shipyard Expansion including its " +
+                                    ".assets files.");
+                        }
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogInfo("[SECompat] Could not determine SE asset-bundle health (assuming healthy): " + e.Message);
+                }
 
                 // Best-effort read of SE's private "zDebug / skip sail data" ConfigEntry<bool>. A
                 // failure here must never throw out of Init nor flip IsInstalled back off - it only

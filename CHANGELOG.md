@@ -14,6 +14,118 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.2.39 - 2026-08-05
+
+> **All players must update.** The network format changed: two new message types carry your
+> character's appearance and who is carrying a mooring rope. A crew on mixed versions is refused
+> at the handshake as usual.
+
+This is the big one. Co-op stops being something you can only be invited into, everyone stops
+looking like the same shopkeeper, and a stack of things that quietly did not work now do.
+
+### Added
+
+- **A character screen.** Open the pause menu and pick "Character". Every part of your sailor is
+  yours: build, head, hair, eyebrows, facial hair, torso, hips, legs and a hat, drawn from the same
+  parts library the game dresses its own shopkeepers from. A live model stands beside the controls
+  and turns, so you can judge a hat from behind. Your crew sees your choices, and so does every
+  future session, because the look is saved. Randomize is there for the undecided.
+- **Friends playing now, and asking to come aboard.** Until now co-op could only ever start with the
+  host thinking of you first. If you knew your friend was out sailing there was nothing in the game
+  to click, and you had to go ask them somewhere else. The pause menu now opens a list of your Steam
+  friends who are in Sailwind right now, with their avatars, who is captaining what, and how full
+  each crew is. If they are sailing and have room, you can ask to come aboard; the captain gets a
+  prompt and decides. Sessions stay invite-only and nobody can let themselves in.
+- **Inviting works with the Steam overlay switched off.** The old Invite button opened the Steam
+  overlay, which does exactly nothing when the overlay is disabled, silently. Inviting from the
+  friends list goes straight through Steam's lobby invite instead, so it works either way.
+- **An Accept Invite button.** When someone invites you, the pause menu offers to take it. The
+  previous version announced the invite and then left you to find it in Steam's own interface, which
+  shows nothing at all when the sender is not on your friends list or your overlay is off. Players
+  were being told they had been invited with no way whatsoever to say yes.
+- **You can see when a crewmate is carrying a mooring rope.** The rope appears in their hands on
+  everyone's screen instead of lying on the dock while they walk away holding nothing.
+- **A readable panel for the things that stop a join.** Version and mod mismatches used to scroll
+  past in the corner notification ticker, clipped, in the seconds before the game closed. They now
+  get a panel that waits for you and says which mod differs.
+
+### Fixed
+
+- **A ship could sit at two different heights for two different people.** A guest never ran the game's
+  own hull-physics step, on the reasoning that the captain should own how flooded a boat is. That step
+  turns out to be two jobs in one: it tracks the water coming in, and it works out what that water does
+  to the hull. Skipping both froze the guest's copy of every boat at whatever buoyancy it happened to
+  have, permanently. Take on water in a storm and the boat grew heavy and sluggish for the captain while
+  staying light for everyone else, so it floated at one height on one screen and another height on the
+  next, and no amount of correction could settle it. The version that survived a restart was worse: if
+  your hidden co-op save ever held a sunk boat, that hull loaded with zero buoyancy and nothing would
+  ever give it back. Not rejoining, not a new session. Deleting the save was the only cure anyone found.
+  Crew now work out hull physics from the captain's water level instead of not at all, so a boat that
+  loads wrong rights itself on the next frame. This one only runs on a crew member's machine, so it
+  cannot be tested without a full crew and you are the first people to sail it. If boats start
+  behaving worse than they did before, `Coop.GuestHullPhysics` in the config turns it off and restores
+  exactly the old behavior, without waiting for a new build. Please tell me if you need it.
+- **Standing on the dock dragged your ship's balance toward the island.** The game adds your weight to
+  the boat you are on, at a distance measured from the deck. That distance is only meaningful while you
+  are actually aboard, which in the unmodified game is guaranteed. Co-op broke the guarantee: a
+  crewmate ashore still counted as aboard, and their "distance from the deck" became the whole way to
+  where they were standing. In one recorded session that was 379 metres of leverage on a boat expecting
+  a couple. The hull rocked and would not settle.
+- **A crewmate who fell out of the world had no way back.** The game's own out-of-bounds rescue is
+  switched off for crew, and crew are separately not allowed to recover the ship, since that is the
+  captain's call. Each decision is right on its own; together they meant that if you ended up under the
+  seabed, the only way out was closing the game. Two players hit exactly this on their first evening.
+  You are now returned to the ship after a few seconds of being nowhere. It moves you, not the ship.
+- **Joining could drop you in open sea with the ship nowhere in sight.** If the captain's boat was not
+  present in your world, the join said nothing and carried on, placing you against whatever boat your
+  own save happened to have left selected, or, failing that, at coordinates that meant nothing. You are
+  now told, by name, which ship could not be found.
+- **Co-op did not work when installed through a mod manager.** One native Steam file has to sit next to
+  the game's executable, and a mod manager package physically cannot put a file there. Everything else
+  loaded fine, so the failure surfaced as "Steam did not start" and the workaround people found was
+  launching the game a different way, which quietly fell back to a separate copy of the mod. The file is
+  now loaded from beside the mod itself. A copy next to the game still takes priority, so ordinary
+  installs are unchanged.
+- **Refusals named settings that do not exist.** The mod-matching check reads each mod's settings by
+  their internal names, and those are not what your config file calls them. It would tell you
+  `topsailPatch` differed; the line in the file says "Link topmasts". One crew searched their configs
+  for a word that was not in them, reasonably concluded whole files were the thing to match, and spent
+  an evening copying files at each other. Refusals now name the setting as the file names it, say which
+  section it is under, say whether a restart is needed, and keep that separate from "update the mod" and
+  from "this mod is broken on one of your machines", which are different jobs.
+- **A mod that crashes on startup was invisible.** When a mod fails to start, the loader drops it from
+  the list of installed mods, so the crew mod-comparison could not see it. That is how Anchor
+  Improvements came to be reported as a co-op problem: it is broken on Sailwind 0.38 whether or not
+  co-op is installed, because it patches two methods the game renamed, but it half-applies before dying
+  and leaves the game subtly changed. Any mod in that state is now reported by name at startup.
+- **Your sailor floated a few inches above the deck.** Two separate causes stacked: the body was
+  planted using a hardcoded height instead of the one the mod already measures, and both ends fitted
+  the model to the bottom of its render bounds, which hangs below the soles. Feet are on the floor
+  now, on deck and on land.
+- **Crouching was a kneel, not a squat.** The thighs swung to a right angle and the sailor sank into
+  a seiza. The hips now travel backward as they drop, by an amount solved at runtime from the actual
+  bone lengths of your model, so the pose reads correctly across different builds.
+- **Crouching made the whole model flicker.** Introduced while fixing the above: the setback was
+  being solved at the live crouch depth, which is discontinuous partway down.
+- **Your name tag stayed where your head used to be when you crouched.**
+- **The join-refusal panel had never once drawn a frame.** Leaving the lobby fires its own handler
+  immediately, and that handler hid the panel inside the same call that had just shown it. So the
+  one player who most needed to be told why they could not join was the only one getting nothing.
+- **One unloadable boat could wreck an entire join.** A guest whose Shipyard Expansion install was
+  broken would fail partway through rebuilding a boat, after its sails had already been removed,
+  leaving a sailless winchless wreck and taking the rest of the join down with it. Boats are applied
+  independently now, and a bad one is reported instead of being fatal.
+- **A refused join reported success, and could close your game.** Steam's answer to "did we get in"
+  was being discarded, so a stale invite, a closed session and a full crew all looked like a
+  successful join. The mod then read an empty lobby, concluded your mods differed from the host's,
+  and on the title-screen path quit the game. Steam re-sends pending invites on every launch, so a
+  stale invite is the common case rather than an edge one. Joins now say what actually happened: the
+  session no longer exists, the crew is full, or the invite is no longer valid.
+- **The character screen failed on every single click,** on a null reference inside the game's own
+  part-swapping routine that two headwear entries with no model in them walked straight into.
+- **Guests no longer get a "Leave Lobby" button.** For a guest it was a lie: it ended in the same
+  place Quit Game does, and only one of the two said so.
+
 ## v0.2.38 - 2026-07-28
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

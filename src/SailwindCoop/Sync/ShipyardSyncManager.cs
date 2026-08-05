@@ -465,9 +465,48 @@ namespace SailwindCoop.Sync
             // exit would be cached-then-missed, so re-invalidate on the way out, and (host only) re-seed
             // every current rope length so crew whose sails were rebuilt to defaults by LoadData converge
             // immediately instead of waiting for the next host winch movement.
-            var boat = BoatUtility.GetCurrentBoat();
-            if (boat != null) BoatUtility.InvalidateRopeCache(boat);
-            if (Plugin.IsHost) ControlSyncManager.Instance?.ResendRopeForCurrentBoat();
+            //
+            // (v0.2.39) Use `edited`, NOT GetCurrentBoat(). This block asked for the boat the same way the SE
+            // block above deliberately does not: DischargeShip nulls GameState.currentBoat in the very call
+            // that ends shipyard mode - the reason `edited` was memorised at entry in the first place - so
+            // GetCurrentBoat() here was ALWAYS null and both the invalidate and the re-seed were dead code.
+            // Andriy's host log confirms it: no "re-seeded N rope lengths" line for either shipyard visit.
+            //
+            // Deferred one frame, mirroring RestoreRopeTrimNextFrame: if the player left in the same frame as
+            // a final edit, the old RopeControllers are Destroy()-marked but not yet null, so re-seeding NOW
+            // would ship the doomed controllers' pre-rebuild lengths to the whole crew as RELIABLE terminals -
+            // nothing would ever correct them. One frame later the destruction has landed.
+            if (edited != null) StartCoroutine(ReseedRopesAfterShipyardExit(edited));
+        }
+
+        /// <summary>
+        /// (v0.2.39) Post-shipyard rope re-seed, one frame after the exit so the sail rebuild has settled.
+        /// Invalidates on every machine (the editor's own rope array is the one a rebuild strands); only the
+        /// host broadcasts, since only the host's trim is authoritative.
+        /// </summary>
+        private System.Collections.IEnumerator ReseedRopesAfterShipyardExit(SaveableObject boat)
+        {
+            yield return null;
+
+            // The boat can be destroyed across the wait (stream-out, disconnect, leaving the lobby).
+            if (boat == null) yield break;
+
+            // Read the name BEFORE the try: touching .gameObject on a boat destroyed mid-body would throw
+            // from inside the catch itself.
+            string boatName = boat.gameObject.name;
+
+            try
+            {
+                BoatUtility.InvalidateRopeCache(boat);
+                ControlSyncManager.Instance?.ResendRopeForBoat(boat); // host-only internally
+            }
+            catch (System.Exception e)
+            {
+                // Cosmetic-only: the rope cache is self-healing on read now, so the worst case is that crew
+                // sails sit at the rebuilt defaults until the next winch movement. Never throw out of a coroutine.
+                Plugin.Log.LogWarning($"[Shipyard] Post-exit rope re-seed failed for '{boatName}': " +
+                    $"{e.GetType().Name}: {e.Message}");
+            }
         }
 
         private void PollForChanges()

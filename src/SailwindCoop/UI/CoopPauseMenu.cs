@@ -26,6 +26,7 @@ namespace SailwindCoop.UI
         public const string Resume    = "coop_pause_resume";
         public const string Host      = "coop_pause_host";
         public const string Secondary = "coop_pause_secondary"; // Invite Friend (host) / Join Friend (not in lobby)
+        public const string Appearance = "coop_pause_appearance"; // opens the character screen
         public const string Settings  = "coop_pause_settings";
         public const string Recover   = "coop_pause_recover";
         public const string Quit      = "coop_pause_quit";
@@ -39,7 +40,11 @@ namespace SailwindCoop.UI
         const float ColTopY = 1.02f; // low enough that the top (Resume) button clears the top scroll roll
         const float ColStep = 0.245f; // step sized so all 6 buttons fit the parchment (nothing spills off the
                                       // bottom). Still > button height, so no overlap.
-        static readonly string[] ColOrder = { Resume, Host, Secondary, Settings, Recover, Quit };
+        // Vertical extent the column is allowed to occupy, in the same local units as ColStep. Derived from
+        // the original six-button layout so that case is pixel-identical; LayoutButtons shrinks the step to
+        // stay inside this when there are more buttons.
+        const float ColSpan = ColStep * 5f;
+        static readonly string[] ColOrder = { Resume, Host, Secondary, Appearance, Settings, Recover, Quit };
         static Vector3 Slot(int i) => new Vector3(ColX, ColTopY - ColStep * i, ColZ);
         // The crew roster lives on its OWN small parchment scroll (_crewScroll) to the right of the main
         // menu, instead of as chips floating in space. The chips are CHILDREN of _crewScroll, so they move and
@@ -106,12 +111,14 @@ namespace SailwindCoop.UI
                 CoopMenu.EnsureButton(_panel.transform, template, Resume, Slot(0));
                 CoopMenu.EnsureButton(_panel.transform, template, Host, Slot(1));
                 CoopMenu.EnsureButton(_panel.transform, template, Secondary, Slot(2));
-                CoopMenu.EnsureButton(_panel.transform, template, Settings, Slot(3));
-                CoopMenu.EnsureButton(_panel.transform, template, Recover, Slot(4));
-                CoopMenu.EnsureButton(_panel.transform, template, Quit, Slot(5));
+                CoopMenu.EnsureButton(_panel.transform, template, Appearance, Slot(3));
+                CoopMenu.EnsureButton(_panel.transform, template, Settings, Slot(4));
+                CoopMenu.EnsureButton(_panel.transform, template, Recover, Slot(5));
+                CoopMenu.EnsureButton(_panel.transform, template, Quit, Slot(6));
 
                 // Static labels (Host/Secondary are set dynamically in Refresh).
                 SetLabel(Resume, "Resume");
+                SetLabel(Appearance, "Character");
                 SetLabel(Settings, "Settings");
                 SetLabel(Recover, "Recover Boat");
                 SetLabel(Quit, "Quit Game");
@@ -164,6 +171,14 @@ namespace SailwindCoop.UI
             catch (System.Exception e) { Plugin.Log.LogError($"[CoopPause] open failed: {e}"); }
         }
 
+        /// <summary>(v0.2.39) Re-show the pause parchment after one of our own sub-screens closes. Without
+        /// this, closing the character screen would leave the player paused in a cursor menu with nothing
+        /// on screen at all - our panel hidden, and vanilla's settings panel already suppressed by us.</summary>
+        public static void Reopen()
+        {
+            if (_panel != null && _startMenu != null) OnPauseOpened(_startMenu);
+        }
+
         public static void Hide()
         {
             if (_panel != null && _panel.activeSelf) _panel.SetActive(false);
@@ -213,7 +228,18 @@ namespace SailwindCoop.UI
             // The crew scroll only makes sense in a lobby (it holds the roster) - hide it solo.
             if (_crewScroll != null) _crewScroll.SetActive(inLobby);
 
-            SetLabel(Host, !inLobby ? "Host Co-op" : (isHost ? "Close Lobby" : "Leave Lobby"));
+            // (v0.2.39) A GUEST no longer gets this button at all, because for a guest it was a lie: the
+            // leave path ends in EndGuestSessionAndQuit, so "Leave Lobby" and "Quit Game" both closed the
+            // game and only one of them said so. That is not a bug to fix by renaming - a guest is inside
+            // the HOST's world on a phantom save, and with no return-to-menu in this game there is nowhere
+            // to put them, so quitting really is the only honest exit. Offering it twice, once under a
+            // label that implies otherwise, just invites a player to lose their session to the wrong click.
+            // Hosts keep it: "Close Lobby" genuinely ends the session and leaves them sailing their own
+            // world. Dropping a button for guests also gives the column back some breathing room.
+            var hostBtn = CoopMenu.FindChild(_panel.transform, Host);
+            bool showHostButton = !inLobby || isHost;
+            if (hostBtn != null) SetActive(hostBtn, showHostButton);
+            if (showHostButton) SetLabel(Host, !inLobby ? "Host Co-op" : "Close Lobby");
 
             // Secondary: Join when solo, Invite while the HOST has room for more crew, hidden otherwise.
             // N-player: the host can keep inviting until the lobby hits the crew cap (was: single-guest
@@ -222,17 +248,41 @@ namespace SailwindCoop.UI
             var sec = CoopMenu.FindChild(_panel.transform, Secondary);
             if (sec != null)
             {
-                if (!inLobby) { SetActive(sec, true); CoopMenu.SetLabel(sec, "Join Friend"); }
+                // (v0.2.39) Solo, this slot is now ACCEPT INVITE rather than "Join Friend". The old button
+                // called SteamFriends.OpenOverlay("friends"), which just dumped the player into their
+                // friends list to hunt for someone - and the lobby is invite-only anyway, so browsing to a
+                // friend was never going to let anyone in. What players actually need is a way to say yes
+                // to an invite they were already sent, which until now had no in-game answer at all.
+                // No invite pending means no button, rather than a button that goes nowhere useful.
+                //
+                // (v0.2.39, second pass) When there is NO invite to accept, this slot opens the friends
+                // screen instead of disappearing. That screen is where "ask to join" lives, which is the
+                // answer to the other half of the problem: an invite-only lobby meant co-op could only ever
+                // begin with the host thinking of you first, and a player who knew their friend was sailing
+                // had nothing to click. The slot is reused rather than adding an eighth button - the column
+                // is already tight enough that seven made the buttons shrink.
+                if (!inLobby)
+                {
+                    var invite = Plugin.LobbyManager?.CurrentInvite;
+                    SetActive(sec, true);
+                    CoopMenu.SetLabel(sec, invite != null ? $"Join {invite.SenderName}" : "Friends");
+                }
                 else if (isHost)
                 {
                     int members = Plugin.LobbyManager.GetMemberCount();
                     bool hasRoom = members < SailwindCoop.Networking.SteamLobbyManager.MaxPlayers;
+                    int asking = SailwindCoop.Networking.CoopPresence.RequestCount;
                     SetActive(sec, true);
-                    // Relabel to "Crew full" at capacity; the click itself is gated in HandleClick so a
-                    // full-lobby click is a harmless no-op (no need to strip/re-add the button collider).
-                    CoopMenu.SetLabel(sec, hasRoom ? "Invite Friend" : "Crew full");
+                    // Someone waiting to be let aboard is the one thing here worth interrupting for, so it
+                    // takes the label. Otherwise: invite, or say plainly that there is no berth left. The
+                    // click itself is gated in HandleClick, so a full-lobby click is a harmless no-op.
+                    CoopMenu.SetLabel(sec, asking > 0
+                        ? (asking == 1 ? "1 wants aboard" : $"{asking} want aboard")
+                        : (hasRoom ? "Invite Friend" : "Crew full"));
                 }
-                else SetActive(sec, false);
+                // A guest can neither invite nor go asking elsewhere mid-voyage, but seeing who else is out
+                // there costs nothing and is half the appeal of a friends list.
+                else { SetActive(sec, true); CoopMenu.SetLabel(sec, "Friends"); }
             }
 
             // Gate the rebuild on a roster SIGNATURE (ids+names+host), not just member count: a late-arriving
@@ -262,6 +312,12 @@ namespace SailwindCoop.UI
                 case Resume:
                     InvokeStartMenu("SettingsToGame"); // unpause (its postfix hides our panel)
                     return true;
+                case Appearance:
+                    // Opening HIDES this parchment: a screen-space IMGUI panel drawn over live world-space
+                    // buttons would let a click fall through to whatever sits beneath it, and one of those
+                    // is Quit Game. CharacterScreen.Open does the hiding itself so the two cannot desync.
+                    CharacterScreen.Open();
+                    return true;
                 case Host:
                     if (!Plugin.IsMultiplayer) { if (Plugin.EnsureCoopReady()) Plugin.LobbyManager.CreateLobby(); }
                     // MENU-FLY-AWAY fix: Close/Leave Lobby must UNPAUSE first, not keep the panel open.
@@ -274,11 +330,14 @@ namespace SailwindCoop.UI
                     return true;
                 case Secondary:
                     if (!Plugin.EnsureCoopReady()) return true; // surface the reason instead of a dead button
-                    if (!Plugin.IsMultiplayer) SteamFriends.OpenOverlay("friends"); // Join: pick a friend to join
-                    // Host invite: only open the overlay while there is room ("Crew full" click is a no-op).
-                    else if (Plugin.IsHost &&
-                             Plugin.LobbyManager.GetMemberCount() < SailwindCoop.Networking.SteamLobbyManager.MaxPlayers)
-                        SteamFriends.OpenGameInviteOverlay(Plugin.LobbyManager.LobbyId);
+                    // Solo WITH an invite waiting: take it, in one click. RouteJoin is the exact path Steam's
+                    // own "Join Game" drives, so joining from the title menu still loads a save first rather
+                    // than dropping a world-less guest into the host's session. Everything else opens the
+                    // friends screen, which is where inviting, asking and declining all live now.
+                    if (!Plugin.IsMultiplayer && Plugin.LobbyManager?.CurrentInvite != null)
+                        Plugin.LobbyManager.AcceptPendingInvite();
+                    else
+                        FriendsScreen.Open();
                     return true;
                 case Settings:
                     Hide();
@@ -447,12 +506,35 @@ namespace SailwindCoop.UI
         static void LayoutButtons()
         {
             if (_panel == null) return;
+            // (v0.2.39) Count the visible buttons FIRST so the step can shrink to fit them. The step used
+            // to be a fixed constant chosen so exactly six buttons filled the parchment, which meant adding
+            // a seventh (Appearance) would have pushed the bottom one off the bottom of the scroll. Fitting
+            // to a fixed SPAN instead keeps the column inside the parchment at any count, and leaves the
+            // common cases visually identical (fewer than six still lays out at the original spacing).
+            int visible = 0;
+            foreach (var name in ColOrder)
+            {
+                var b = CoopMenu.FindChild(_panel.transform, name);
+                if (b != null && b.gameObject.activeSelf) visible++;
+            }
+            float step = visible > 1 ? Mathf.Min(ColStep, ColSpan / (visible - 1)) : ColStep;
+
+            // (v0.2.39) Scale the buttons down as the column fills up. The span is fixed, so each extra
+            // button shrinks the step - seven buttons sit ~17% closer together than the six the spacing was
+            // originally tuned for, which reads as crowded. Shrinking the buttons is the only lever that
+            // changes the GAP-TO-BUTTON ratio: stretching the parchment vertically would squash these
+            // children (they inherit its scale), and scaling it uniformly magnifies the crowding along
+            // with everything else. Applied per button, uniformly, so nothing distorts.
+            float scale = Mathf.Clamp(Plugin.CoopMenuButtonScaleConfig != null
+                ? Plugin.CoopMenuButtonScaleConfig.Value : 0.9f, 0.5f, 1f);
+
             int i = 0;
             foreach (var name in ColOrder)
             {
                 var b = CoopMenu.FindChild(_panel.transform, name);
                 if (b == null || !b.gameObject.activeSelf) continue;
-                b.localPosition = Slot(i);
+                b.localPosition = new Vector3(ColX, ColTopY - step * i, ColZ);
+                b.localScale = Vector3.one * scale;
                 i++;
             }
         }

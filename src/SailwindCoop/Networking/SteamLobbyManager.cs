@@ -95,22 +95,18 @@ namespace SailwindCoop.Networking
 
         /// Message from the last FAILED Steam init (null if the last attempt succeeded). Drives the
         /// in-game failure notice and the debug-overlay status line.
-        public string LastInitError { get; private set; }
+        ///
+        /// (v0.2.39) The value now LIVES in SteamInitDiagnostics, which carries no Facepunch types and can
+        /// therefore still be read when this class cannot load at all. Kept here as a forwarder for callers
+        /// that already hold a live manager - see that class for why the distinction is load-bearing.
+        public string LastInitError { get { return SteamInitDiagnostics.LastError; } }
 
-        /// A player-facing explanation of why co-op can't start, tailored to the failure (a missing
-        /// Facepunch.Steamworks library vs a Steam/runtime error). Shown instead of a silent dead button.
+        /// A player-facing explanation of why co-op can't start. The logic lives in SteamInitDiagnostics,
+        /// which has no Facepunch-typed members and so survives the exact failure this message describes;
+        /// this forwarder is for the call sites inside this class, which by definition already loaded.
         public string InitFailureHint()
         {
-            string reason = string.IsNullOrEmpty(LastInitError) ? "Steam not initialized" : LastInitError;
-            bool missingLib = reason.IndexOf("Facepunch", StringComparison.OrdinalIgnoreCase) >= 0
-                           || reason.IndexOf("could not load", StringComparison.OrdinalIgnoreCase) >= 0
-                           || reason.IndexOf("file or assembly", StringComparison.OrdinalIgnoreCase) >= 0
-                           || reason.IndexOf("unable to load", StringComparison.OrdinalIgnoreCase) >= 0   // native steam_api64.dll (DllNotFoundException)
-                           || reason.IndexOf("steam_api", StringComparison.OrdinalIgnoreCase) >= 0;
-            string hint = missingLib
-                ? "Re-extract the FULL mod zip - Facepunch.Steamworks.Win64.dll must sit next to SailwindCoop.dll."
-                : "Check Steam is running and you launched Sailwind through Steam, then re-extract the full mod zip and relaunch.";
-            return $"Co-op can't start - Steam init failed ({reason}). {hint}";
+            return SteamInitDiagnostics.Describe();
         }
 
         public IEnumerable<Friend> LobbyMembers
@@ -141,6 +137,10 @@ namespace SailwindCoop.Networking
 
             try
             {
+                // (v0.2.39) Make sure the NATIVE Steam library can be found before anything tries to call
+                // into it - see PreloadNativeSteamApi for why a mod manager install could not.
+                PreloadNativeSteamApi();
+
                 // If Facepunch's Steam client is already up - because a PRIOR mod init threw AFTER Facepunch
                 // set its internal `initialized` flag (e.g. an interface-version mismatch or partial native
                 // load), or another component brought it up - adopt it instead of calling Init again.
@@ -151,7 +151,7 @@ namespace SailwindCoop.Networking
                     SteamClient.Init(SteamAppId, false);
 
                 _isInitialized = true;
-                LastInitError = null;
+                SteamInitDiagnostics.RecordSuccess();
 
                 RegisterCallbacks();
 
@@ -160,11 +160,109 @@ namespace SailwindCoop.Networking
             }
             catch (Exception ex)
             {
-                LastInitError = ex.Message;
+                SteamInitDiagnostics.RecordFailure(ex);
                 Plugin.Log.LogError($"Failed to initialize Steam: {ex.GetType().Name}: {ex.Message}");
                 if (ex.InnerException != null) Plugin.Log.LogError($"  inner: {ex.InnerException.Message}");
                 return false;
             }
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+        private static extern System.IntPtr LoadLibraryW(string lpFileName);
+
+        private static bool _nativePreloadAttempted;
+
+        /// <summary>
+        /// (v0.2.39) Load steam_api64.dll by full path, so co-op works from a mod manager install.
+        ///
+        /// THE ASYMMETRY THAT BROKE THUNDERSTORE. Facepunch.Steamworks is a MANAGED assembly, and BepInEx
+        /// resolves those out of any subfolder of the plugin path - so it loads fine wherever the mod is
+        /// installed. Every one of its 928 P/Invokes then targets a NATIVE library, steam_api64.dll, and
+        /// Windows resolves that one itself: the executable's own folder, System32, the working directory,
+        /// PATH. The plugins folder is on none of those lists, and neither is a mod manager profile.
+        ///
+        /// That is the whole bug behind "it only works if I launch through Steam". A Thunderstore package
+        /// physically cannot place a file next to Sailwind.exe - the manager flattens a package into
+        /// BepInEx/plugins/&lt;Author&gt;-&lt;Package&gt;/ and only the BepInEx pack itself is allowed at the
+        /// profile root. So the native library never reached the one folder Windows would look in, and the
+        /// first Steam call died with a DllNotFoundException that the mod reported as a generic Steam
+        /// failure. Whoever "fixed it by launching through Steam" was really running a separate game-root
+        /// install that happened to have the file.
+        ///
+        /// Loading it here by absolute path fixes that: Windows caches a loaded module under its base name,
+        /// so once steam_api64 is in the process, every later P/Invoke binds to it without searching. This
+        /// deliberately does NOT touch the process-wide search path (SetDllDirectory takes only one
+        /// directory and would displace whatever else set it; SetDefaultDllDirectories changes resolution
+        /// for every other mod in the process). One library, by name, loaded once.
+        ///
+        /// A game-root copy WINS. If the file is already next to the exe, this does nothing at all, so a
+        /// normal install keeps resolving exactly as it always has and there is no chance of loading a
+        /// different build of the library than the one the player installed.
+        /// </summary>
+        private static void PreloadNativeSteamApi()
+        {
+            if (_nativePreloadAttempted) return;
+            _nativePreloadAttempted = true;
+
+            const string NativeName = "steam_api64.dll";
+            try
+            {
+                // The ordinary install puts it beside the executable, where Windows finds it unaided.
+                string exeDir = System.AppDomain.CurrentDomain.BaseDirectory;
+                if (!string.IsNullOrEmpty(exeDir) && File.Exists(Path.Combine(exeDir, NativeName)))
+                    return;
+
+                foreach (var dir in NativeSearchDirs())
+                {
+                    if (string.IsNullOrEmpty(dir)) continue;
+                    string candidate = Path.Combine(dir, NativeName);
+                    if (!File.Exists(candidate)) continue;
+
+                    var handle = LoadLibraryW(candidate);
+                    if (handle != System.IntPtr.Zero)
+                    {
+                        Plugin.Log.LogInfo($"Loaded the native Steam library from {candidate}");
+                        return;
+                    }
+
+                    int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    Plugin.Log.LogWarning($"Found {candidate} but Windows would not load it (error {err}).");
+                }
+
+                // Not fatal here - Steam init will fail next and report it properly, with the hint that now
+                // names the right file. Logged so the log shows we looked.
+                Plugin.Log.LogWarning($"{NativeName} is not next to Sailwind.exe and was not found beside the " +
+                    "mod either. Co-op cannot start without it.");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"Could not pre-load {NativeName}: {e.Message}");
+            }
+        }
+
+        /// <summary>Places the native library may sit when the game root is not an option: beside our own
+        /// assembly (the mod-manager case), and the plugin root above it.</summary>
+        private static IEnumerable<string> NativeSearchDirs()
+        {
+            string here = null;
+            try
+            {
+                var loc = typeof(SteamLobbyManager).Assembly.Location;
+                if (!string.IsNullOrEmpty(loc)) here = Path.GetDirectoryName(loc);
+            }
+            catch { }
+
+            if (here != null)
+            {
+                yield return here;
+                string parent = null;
+                try { parent = Path.GetDirectoryName(here); } catch { }
+                if (parent != null) yield return parent;
+            }
+
+            string pluginPath = null;
+            try { pluginPath = BepInEx.Paths.PluginPath; } catch { }
+            if (pluginPath != null) yield return pluginPath;
         }
 
         public void Shutdown()
@@ -255,6 +353,16 @@ namespace SailwindCoop.Networking
                 // bundle hash + Towable Boats + HMS Leopard). Guests pre-check this BEFORE opening
                 // P2P, exactly like the version stamp above. Opaque - compare for equality only.
                 lobby.SetData("mods", SailwindCoop.Compat.CompatRegistry.ModSignature);
+                // (v0.2.39) REPORT-ONLY plugin manifest, published here as well as over P2P so a guest
+                // refused at the LOBBY PRE-CHECK can still be told what differs. That refusal happens before
+                // any P2P session exists, so the handshake copy never reaches the one player who most needs
+                // it - they were the only person getting no information at all.
+                //
+                // CLAMPED, and that is not defensive padding: Lobby.SetData THROWS above 8192 chars, and this
+                // whole block sits inside a try/catch whose handler only logs. An oversized manifest would
+                // therefore abort lobby creation BEFORE SetJoinable(true) below and leave a silently broken
+                // host. Never consulted by the gate - see ModManifest's class doc.
+                lobby.SetData("manifest", SailwindCoop.Compat.ModManifest.ForLobbyData());
                 lobby.SetJoinable(true);
 
                 _hostSentInvites.Clear();
@@ -289,15 +397,30 @@ namespace SailwindCoop.Networking
 
             try
             {
-                var lobby = await SteamMatchmaking.JoinLobbyAsync(lobbyId);
-
-                if (!lobby.HasValue)
+                // (v0.2.39) Use Lobby.Join(), NOT SteamMatchmaking.JoinLobbyAsync.
+                //
+                // JoinLobbyAsync DISCARDS Steam's EChatRoomEnterResponse and hands back a non-null Lobby
+                // even when the join was REFUSED - a closed lobby, a full one, a lobby that never existed.
+                // The mod then latched _currentLobby and believed it was in a session that does not exist.
+                // Downstream that is not a quiet no-op: the guest path reads lobby data, gets "" for the
+                // host's mod token while our own is always non-empty, concludes the mod sets differ, and
+                // shows a FABRICATED "your mods differ from the host's" refusal - which on the title-join
+                // path ends in Application.Quit(). So clicking a stale invite could close the player's
+                // game and blame their mods for it. Steam re-delivers pending invites on every launch, so
+                // stale is the COMMON case, not an edge one.
+                //
+                // Lobby.Join() returns the RoomEnter enum, which is the difference between "we are in" and
+                // "Steam said no".
+                var target = new Steamworks.Data.Lobby(lobbyId);
+                var result = await target.Join();
+                if (result != Steamworks.RoomEnter.Success)
                 {
-                    Plugin.Log.LogError($"Failed to join lobby {lobbyId}");
-                    Plugin.Notify("Co-op: couldn't join the host's lobby (no response). Make sure you're both on the same mod build, then try again.", 6f);
+                    Plugin.Log.LogError($"Failed to join lobby {lobbyId}: {result}");
+                    Plugin.Notify(DescribeJoinFailure(result), 7f);
                     return;
                 }
 
+                var lobby = (Steamworks.Data.Lobby?)target;
                 _currentLobby = lobby.Value;
                 InvalidateRoleCache();
                 Plugin.Log.LogInfo($"Joined lobby: {lobby.Value.Id}");
@@ -305,6 +428,29 @@ namespace SailwindCoop.Networking
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"Exception joining lobby: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Say WHY a join failed, in the player's terms. The old message blamed mismatched mod builds for
+        /// every failure, which was usually wrong and sent people off copying config files at each other -
+        /// a stale invite to a lobby the host closed hours ago is by far the most common cause.
+        /// </summary>
+        private static string DescribeJoinFailure(Steamworks.RoomEnter result)
+        {
+            switch (result)
+            {
+                case Steamworks.RoomEnter.DoesntExist:
+                    return "Co-op: that session no longer exists - the host has closed it. Ask them to invite you again.";
+                case Steamworks.RoomEnter.Full:
+                    return "Co-op: that crew is full.";
+                case Steamworks.RoomEnter.NotAllowed:
+                case Steamworks.RoomEnter.Banned:
+                    return "Co-op: the host's session is invite-only and this invite is no longer valid. Ask them to invite you again.";
+                case Steamworks.RoomEnter.Error:
+                    return "Co-op: Steam refused the join. Check that Steam is online, then try again.";
+                default:
+                    return $"Co-op: couldn't join that session ({result}). Ask the host to invite you again.";
             }
         }
 
@@ -517,32 +663,59 @@ namespace SailwindCoop.Networking
                 return;
             }
 
+            // (v0.2.39) An invite that ANSWERS OUR OWN REQUEST is never a stale re-delivery, by definition -
+            // we asked minutes ago and this is the yes. It must therefore skip the de-dupe below, which is
+            // otherwise permanent: ask, get declined, ask the same captain again later, and the second
+            // acceptance would be swallowed as "already seen" with no way to ever undo that. This is also
+            // the only invite we can describe accurately, so it gets its own wording.
+            bool answersOurRequest = CoopPresence.AnswersOurRecentAsk(lobby.Id.Value);
+
             // (v0.2.36) Only surface a LIVE invite, once. Steam replays the same pending invite on EVERY
             // launch (fires the instant the game starts, for a stale/dead lobby), which nagged for days about
             // one old invite. De-dupe by lobby id, persisted across launches: a lobby we've already recorded
             // is a stale re-delivery -> suppress silently. Only a genuinely NEW invite (new lobby) reaches
             // the toast + the traceable main-log line.
             EnsureSeenInvitesLoaded();
-            if (!_seenInviteLobbies.Add(lobby.Id.Value))
+            bool alreadySeen = !_seenInviteLobbies.Add(lobby.Id.Value);
+            if (alreadySeen && !answersOurRequest)
             {
                 VerboseLogger.LobbyEvent($"Invite to lobby {lobby.Id} already seen; suppressing stale re-delivery");
                 return;
             }
-            PersistSeenInvite(lobby.Id.Value);
+            if (!alreadySeen) PersistSeenInvite(lobby.Id.Value);
 
             // Mirror to the main BepInEx log with the sender's SteamID (once per unique invite), so an
             // unwanted invite can be traced to an exact account and blocked - persona names are changeable
             // and can collide, so the name alone can't positively identify the account.
             Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
 
-            // Belt-and-suspenders throttle (the de-dupe already caps one toast per lobby).
+            // Belt-and-suspenders throttle (the de-dupe already caps one toast per lobby). An answer to our
+            // own request is exempt: it is the one invite the player is actively waiting for, and silently
+            // eating it because an unrelated invite arrived 14 seconds ago would be indefensible.
             float now = UnityEngine.Time.realtimeSinceStartup;
-            if (now - _lastInviteToastTime < 15f) return;
+            if (!answersOurRequest && now - _lastInviteToastTime < 15f) return;
             _lastInviteToastTime = now;
 
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
             string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
-            Plugin.Notify($"{name} invited you to co-op.", 6f);
+            // (v0.2.39) Say where to act. The old toast announced the invite and left the player to accept
+            // it through Steam's own UI - which shows nothing at all when the sender is not a Steam friend
+            // or the overlay is off, so the message was frequently a dead end.
+            if (answersOurRequest)
+                Plugin.NotifyWithHint($"{name} says come aboard.", "Open the menu to join", 8f);
+            else
+                Plugin.NotifyWithHint($"{name} invited you to co-op.", "Open the menu to join", 6f);
+
+            // (v0.2.39) KEEP the invite instead of discarding it, so the pause menu can offer it. A single
+            // slot rather than a list: the toast is throttled to one per 15s anyway, and a queue of stale
+            // invitations is a worse thing to present than the newest one. The most recent invite wins.
+            _pendingInvite = new PendingInvite
+            {
+                LobbyId = lobby.Id,
+                SenderId = friend.Id,
+                SenderName = name,
+                ReceivedRealtime = now,
+            };
         }
 
         /// <summary>
@@ -685,6 +858,51 @@ namespace SailwindCoop.Networking
         private void HandleLobbyGameCreated(Lobby lobby, uint ip, ushort port, SteamId gameServerId)
         {
             VerboseLogger.LobbyEvent($"Game server created, lobby={lobby.Id}, {ip}:{port}");
+        }
+
+        /// <summary>
+        /// (v0.2.39) The most recent invite we could still act on, or null.
+        ///
+        /// Invites used to be announced and then thrown away: HandleLobbyInvite logged one, toasted it, and
+        /// dropped the lobby handle, leaving Steam's own invite UI as the only way to accept. That UI shows
+        /// NOTHING when the sender is not a Steam friend, or when the overlay is off - so a player could be
+        /// told they had been invited and have no way whatsoever to say yes.
+        /// </summary>
+        public sealed class PendingInvite
+        {
+            public SteamId LobbyId;
+            public SteamId SenderId;
+            public string SenderName;
+            public float ReceivedRealtime;
+        }
+
+        private PendingInvite _pendingInvite;
+
+        /// <summary>The invite offered by the pause menu, or null. Cleared once we are in a lobby.</summary>
+        public PendingInvite CurrentInvite
+        {
+            get { return IsInLobby ? null : _pendingInvite; }
+        }
+
+        /// <summary>Take up the pending invite. Same path Steam's own "Join Game" drives, so joining from
+        /// the title menu still loads a save first (TitleJoinManager) rather than joining world-less.</summary>
+        public void AcceptPendingInvite()
+        {
+            var inv = CurrentInvite;
+            if (inv == null) return;
+            _pendingInvite = null;
+            Plugin.Log.LogInfo($"Accepting co-op invite from {inv.SenderName} ({inv.SenderId}), lobby={inv.LobbyId}");
+            RouteJoin(inv.LobbyId, inv.SenderId);
+        }
+
+        /// <summary>Dismiss the pending invite without joining. Does NOT add the sender to the ignore list -
+        /// declining once is not the same as never wanting to hear from someone again, and that list is a
+        /// blunt, persistent instrument best left to a deliberate config edit.</summary>
+        public void DeclinePendingInvite()
+        {
+            if (_pendingInvite == null) return;
+            Plugin.Log.LogInfo($"Declined co-op invite from {_pendingInvite.SenderName} ({_pendingInvite.SenderId}).");
+            _pendingInvite = null;
         }
 
         private void HandleGameLobbyJoinRequested(Lobby lobby, SteamId friendId)

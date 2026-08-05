@@ -50,14 +50,22 @@ namespace SailwindCoop.Sync
                 // dead for the session (a permanent desync softlock, worse than the yank BS2 removed). Drop it
                 // here (recovery-scoped). The continuous BoatTransform sync the comment relies on is exactly what
                 // this gate disables, so the self-heal is impossible without this clear.
-                BoatSyncManager.IsJoinInProgress = false;
-                GameState.recovering = false; // defensive: never strand the guest in instant-FOM mode
+                // (v0.2.39) Only take ownership of these flags when nothing else holds them. A join apply
+                // that is still in flight owns both, and its own finally clears them on every non-abort exit;
+                // clearing them from here mid-teleport would re-enable boat sync during the join's own
+                // repositioning. Its STEP 6 snap also makes the SnapBoatToLiveTarget below redundant in that
+                // case. The permanent-latch this block exists to prevent only arises when no coroutine runs.
+                if (_applyCoroutine == null)
+                {
+                    BoatSyncManager.IsJoinInProgress = false;
+                    GameState.recovering = false; // defensive: never strand the guest in instant-FOM mode
+                }
                 Plugin.Log.LogInfo($"[RECOVERY] Guest not on recovered boat '{packet.CurrentBoatName}'; skipping teleport, cleared join gate (boat state self-heals via periodic sync)");
                 // While the gate was up, ApplyBoatTransform was dead but OnBoatTransformReceived kept the live
                 // target fresh - the boat here can be many metres stale. Snap it to the host's live transform
                 // NOW so the first post-clear correction sees ~0 error instead of velocity-dragging the boat.
                 // No-op if no BoatTransform has been received yet.
-                if (BoatSyncManager.Instance?.SnapBoatToLiveTarget() == true)
+                if (_applyCoroutine == null && BoatSyncManager.Instance?.SnapBoatToLiveTarget() == true)
                     Plugin.Log.LogInfo("[RECOVERY] snapped ashore-guest boat to live host transform");
                 return;
             }
@@ -78,6 +86,14 @@ namespace SailwindCoop.Sync
                 GameState.recovering = false;
                 GameState.loadingBoatLocalItems = false;
                 ItemSyncManager.Instance?.SetApplyingRemoteState(false);
+                // (v0.2.39) The perch banner is written before the first yield, so an abort here leaves
+                // "Joining the crew..." on screen for the session. Self-guarded (only clears text it wrote)
+                // and never throws, so calling it unconditionally cannot wipe the recovery or quit notices.
+                ClearJoinBanner();
+                // Controls too: the aborted coroutine disabled them before its first yield and its finally
+                // never runs on a StopCoroutine, so without this the guest is frozen with no gravity.
+                try { Refs.SetPlayerControl(true); MouseLook.ToggleMouseLook(true); }
+                catch (System.Exception e) { Plugin.Log.LogWarning($"[JOIN] D3 control restore failed: {e.Message}"); }
             }
             _applyCoroutine = Plugin.Instance.StartCoroutine(ApplyWorldStateWithRecovery(packet));
         }
@@ -86,6 +102,29 @@ namespace SailwindCoop.Sync
         /// World state application with direct teleportation for guest joining host.
         /// Replaces old Recovery-based approach that required a port.
         /// </summary>
+        /// <summary>
+        /// (v0.2.39) True while the world-state apply coroutine is running. Read by the recovery-gate
+        /// watchdog so it never clears a join gate that this coroutine still owns.
+        /// </summary>
+        public static bool IsApplyInFlight => _applyCoroutine != null;
+
+        /// <summary>
+        /// (v0.2.39) Clear the join perch banner, but ONLY if it still says what we wrote. That TextMesh is
+        /// shared with the host-recovery notice and the join watchdog, so an unconditional clear would wipe a
+        /// message another system is still relying on. Never throws - this runs from a finally.
+        /// </summary>
+        private static void ClearJoinBanner()
+        {
+            try
+            {
+                if (Sleep.instance == null || Sleep.instance.recoveryText == null) return;
+                var t = Sleep.instance.recoveryText.text;
+                if (t != null && t.StartsWith("Joining the crew"))
+                    Sleep.instance.recoveryText.text = "";
+            }
+            catch (System.Exception e) { Plugin.Log.LogWarning($"[JOIN] banner clear failed: {e.Message}"); }
+        }
+
         private static IEnumerator ApplyWorldStateWithRecovery(BoatWorldStatePacket packet)
         {
             // D1: the whole coroutine body is wrapped in try/finally so the join gates (IsJoinInProgress,
@@ -132,6 +171,34 @@ namespace SailwindCoop.Sync
 
             // === STEP 2: Direct teleport to trigger terrain loading ===
             GameState.recovering = true;  // Enable instant FloatingOriginManager shifts
+
+            // (v0.2.39) FREEZE THE PLAYER FOR THE PERCH. The teleport below parks the guest 50m ABOVE the
+            // host's boat so the terrain around it streams in before we place them precisely, and they then
+            // sit there through a 2s wait plus a scene-load wait (up to 30s). Nothing was disabling the
+            // controller for that window, so gravity and WASD stayed live and the guest FELL the whole 50m in
+            // full view - the reported "players fall from the sky instead of just joining". STEP 7 already
+            // calls SetPlayerControl(true) and the outer finally repeats it on a throwing exit, so until now
+            // the join re-enabled a control it never disabled.
+            //
+            // Deliberately NOT a blackout: Blackout.FadeTo lerps on SCALED Time.deltaTime, so at timeScale 0
+            // (a paused or sleeping host) the fade would never complete and the guest would be left staring at
+            // a permanently black screen - strictly worse than the fall it would be hiding.
+            Refs.SetPlayerControl(false);
+            Plugin.Log.LogInfo("[JOIN] Player control disabled for the terrain-load perch");
+
+            // (v0.2.39) Tell the player WHY they cannot move. The freeze above lasts a 2s wait plus a
+            // scene-load wait (up to 30s) plus settles - bounded, but several seconds of a dead controller
+            // immediately after clicking Join reads as "the game hung". The only other feedback is the
+            // lobby-entry toast, which fires when Steam reports the lobby and is normally long expired by
+            // the time control is actually cut.
+            //
+            // Reuses the persistent banner this repo already drives twice (host-recovery notice, join
+            // watchdog). The !IsRecovery gate is REQUIRED, not tidiness: a recovery reseat runs this same
+            // coroutine, and the recovery handler has already written "Host is recovering the boat..." into
+            // this same TextMesh. Overwriting it would also defuse that handler's cleanup, which only clears
+            // the text when it still matches what it wrote.
+            if (!packet.IsRecovery && Sleep.instance != null && Sleep.instance.recoveryText != null)
+                Sleep.instance.recoveryText.text = "Joining the crew...\n\nloading the host's world.";
 
             // FOM FIX: Reparent player to _shifting world BEFORE teleporting.
             // This prevents FOM infinite loop when player is unparented to root at far position.
@@ -289,14 +356,20 @@ namespace SailwindCoop.Sync
                     // aborted the whole join coroutine - the guest was left with an empty, purchasable,
                     // reefed ship and GuestJoinComplete never fired. A failed boat logs and is skipped;
                     // the rest of the world still applies and the post-join resyncs can heal the gap.
+                    // Commit the boat to the Phase B list BEFORE anything that can throw. This list drives
+                    // BOTH Phase B and the physics re-enable loop further down, so a boat that never
+                    // reaches it is left KINEMATIC for the whole session - a dead, unmovable hull.
+                    //
+                    // (v0.2.39) Moved ABOVE Phase A, not merely above the SE apply. The old placement
+                    // protected the boat from a third-party rig apply but not from Phase A itself, and
+                    // Phase A is where the throw actually observed in the wild happens: vanilla's
+                    // customization LoadData indexes host-sized arrays against guest-sized ones. A boat
+                    // that fails to dress itself should still float and still receive its rope lengths.
+                    boatDataPairs.Add((boat, hostBoat));
+
                     try
                     {
                         ApplyBoatStatePhaseA(boat, hostBoat);
-                        // Commit the boat to the Phase B list BEFORE the SE apply below. This list drives BOTH
-                        // Phase B and the physics re-enable loop further down, so a boat that never reaches it
-                        // is left KINEMATIC for the rest of the session. An optional third-party mod's rig
-                        // apply must never be able to cause that, hence: vanilla state first, extras second.
-                        boatDataPairs.Add((boat, hostBoat));
 
                         // (v0.2.31) Shipyard Expansion sail extras. MUST land HERE - inside Phase A, not in
                         // Phase B. AFTER Phase A's LoadData, because SECompat.ApplyRigBlob applies the host's
@@ -387,6 +460,7 @@ namespace SailwindCoop.Sync
                 // === STEP 5: Set current boat ===
                 Plugin.Log.LogInfo($"[JOIN] Looking for boat '{packet.CurrentBoatName}', IsHostOnBoat={packet.IsHostOnBoat}");
 
+                bool seatedOnHostBoat = false;
                 if (!string.IsNullOrEmpty(packet.CurrentBoatName) &&
                     guestBoats.TryGetValue(packet.CurrentBoatName, out var currentBoat))
                 {
@@ -397,7 +471,29 @@ namespace SailwindCoop.Sync
                         GameState.lastBoat = currentBoat.transform;
                         SleepSyncManager.Instance?.SetSharedBoat(packet.CurrentBoatName);
                         Plugin.Log.LogInfo($"[JOIN] Set current boat to {packet.CurrentBoatName}");
+                        seatedOnHostBoat = true;
                     }
+                }
+
+                // (v0.2.39) This had no else branch, and the silence was expensive. If the host's boat is not
+                // in the guest's world, or has no usable model, STEP 6 still places the player - against
+                // whatever stale boat their OWN save happened to leave in GameState.currentBoat, or failing
+                // that by taking a boat-LOCAL offset of a few metres and using it as a WORLD position. That
+                // puts a joining player near the world origin, in open water, nowhere near the crew, with the
+                // host's ship not in sight. It is the exact shape of a player report: fell through the deck,
+                // ended up in the sky or in the void, and could not see the host's ship at all.
+                //
+                // Clearing the stale seat is the important half. An unrelated boat is a worse frame to be
+                // placed against than no boat, because no boat at least reaches a branch that knows it is
+                // guessing and clamps accordingly.
+                if (!seatedOnHostBoat && !string.IsNullOrEmpty(packet.CurrentBoatName))
+                {
+                    GameState.currentBoat = null;
+                    GameState.lastBoat = null;
+                    Plugin.Log.LogError($"[JOIN] The captain's boat '{packet.CurrentBoatName}' is not present in " +
+                        "your world (or has no model). You will not be placed on it.");
+                    Plugin.Notify($"Could not find the captain's ship ('{packet.CurrentBoatName}') in your world. " +
+                        "You may arrive somewhere unexpected - ask them to invite you again.", 12f);
                 }
 
                 // Sync wind and weather
@@ -426,6 +522,26 @@ namespace SailwindCoop.Sync
                 Refs.SetPlayerControl(true);
                 MouseLook.ToggleMouseLook(true);
                 Plugin.Log.LogInfo("[JOIN] Re-enabled player controls");
+
+                // (v0.2.39) Clear the perch banner. Same !IsRecovery gate as the write, so a recovery reseat
+                // cannot wipe the recovery handler's own message out from under it.
+                if (!packet.IsRecovery) ClearJoinBanner();
+
+                // (v0.2.39) THE REAL "you have arrived" TOAST, emitted here because THIS is the first moment
+                // it is true: the world state has been applied and TeleportPlayer above has just placed (and,
+                // when on a boat, embarked) the player. The lobby-join handler used to claim this the instant
+                // Steam reported another lobby member, which was up to a minute early and could be wrong in
+                // both directions - see the note at that call site.
+                //
+                // Wording branches on where the host actually is: claiming a ship when the crew is stood on a
+                // dock is the same class of lie we just removed. Recovery reseats are silent - the player
+                // never left, so "you joined" would be nonsense.
+                if (!packet.IsRecovery)
+                {
+                    Plugin.Notify(packet.IsHostOnBoat
+                        ? "Aboard the host's ship!"
+                        : "Joined the host ashore.", 5f);
+                }
 
                 // POCKET-INHERIT FIX: deterministic clean slate for a fresh JOIN of the local guest.
                 // Full survival bars + an emptied personal inventory so the joiner never starts a session
@@ -468,6 +584,10 @@ namespace SailwindCoop.Sync
             // Re-enable physics sync now that join is complete
             Debug.VerboseLogger.RecoveryApply("Recovery resync complete; guest re-boarded on recovered boat, join phase ended");
             BoatSyncManager.IsJoinInProgress = false;
+            // (v0.2.39) Opens the post-join diagnostic window: for the next minute the boat-position error is
+            // logged from 1m instead of 5m, so a gradual divergence shows as the ramp it is rather than
+            // appearing as a sudden step change once it crosses 5m.
+            BoatSyncManager.NoteJoinComplete();
             Plugin.Log.LogInfo($"[JOIN] Join complete!");
 
             // Tell the host the join coroutine is fully finished (every snapshot spawn applied or safely
@@ -487,6 +607,10 @@ namespace SailwindCoop.Sync
                 // run this finally (Unity semantics) - that path is handled at the StopCoroutine call site (D3).
                 GameState.recovering = false;
                 BoatSyncManager.IsJoinInProgress = false;
+                // (v0.2.39) Open the post-join diagnostic window on EVERY exit, not just the happy path: an
+                // aborted or throwing join is exactly when the extra boat-position detail is most wanted.
+                // Idempotent, so the STEP 7 call on the success path is harmless.
+                BoatSyncManager.NoteJoinComplete();
                 _applyCoroutine = null;
                 // Defense-in-depth: if the coroutine threw before STEP 7, the player is left with controls
                 // DISABLED -> no gravity, frozen wherever the teleport parked them (the floating-guest bug).
@@ -494,6 +618,9 @@ namespace SailwindCoop.Sync
                 // with the STEP 7 enable (SetPlayerControl just sets a flag).
                 try { Refs.SetPlayerControl(true); MouseLook.ToggleMouseLook(true); }
                 catch (System.Exception e) { Plugin.Log.LogWarning($"[JOIN] control restore in finally failed: {e.Message}"); }
+                // Same defence for the perch banner: an abort before STEP 7 would otherwise leave "Joining
+                // the crew..." on screen for the rest of the session.
+                if (!packet.IsRecovery) ClearJoinBanner();
             }
         }
 
@@ -534,6 +661,23 @@ namespace SailwindCoop.Sync
                     Plugin.Log.LogDebug($"Unmoored dock ropes from {data.Name}");
                 }
 
+                // 0b. OWNERSHIP FIRST. (v0.2.39) This used to be step 8, and being late is what turned a
+                // single throw in the customization step into the whole reported failure: "his boat still
+                // has a purchased for 75 gold sign, I can't get water from his barrel, I can't see the
+                // sails, I can't see the winches, can't interact with the mooring line".
+                //
+                // Ownership is the widest-reaching flag on a boat and the cheapest to apply. While
+                // extraSetting is false, vanilla puts the mooring ropes on the Ignore Raycast layer every
+                // frame (BoatMooringRopes.Update), refuses winch operation (GPButtonRopeWinch), gates the
+                // anchor, and keeps the FOR SALE sign up. Every one of those re-reads the live field, so
+                // applying it EARLY costs nothing and applying it LATE risks losing all of it to an
+                // unrelated exception several steps beforehand.
+                //
+                // It also cannot itself throw in a way that matters, so nothing is gained by ordering it
+                // after the risky work. Step 8 still calls it - idempotent, and it keeps the ordering
+                // honest if this early call is ever removed.
+                ApplyOwnership(boat, data.IsOwned);
+
                 var rb = boat.GetComponent<Rigidbody>();
 
                 // 1. Make kinematic for safe modification
@@ -564,7 +708,26 @@ namespace SailwindCoop.Sync
 
                 // 3. Apply customization (this destroys old sails/ropes and creates new ones)
                 // NOTE: Destroy() is deferred until end of frame, so old ropes still exist here
-                ApplyCustomization(boat, data);
+                //
+                // (v0.2.39) ISOLATED. Vanilla's SaveableBoatCustomization.LoadData calls RemoveAllSails()
+                // FIRST and then indexes into availableParts - so if that index is out of range the boat is
+                // left permanently stripped, sails gone and never rebuilt. That is exactly what happens
+                // when the two machines disagree about how many parts a boat has, which a broken or
+                // mismatched Shipyard Expansion install produces (a guest whose SE asset bundles failed to
+                // load reports "Asset bundle missing!" and then has fewer parts than the host).
+                // Previously that exception escaped to the per-boat catch and skipped items, mooring,
+                // ownership and dirt as well. Now it costs the rig only.
+                try
+                {
+                    ApplyCustomization(boat, data);
+                }
+                catch (System.Exception ex)
+                {
+                    Plugin.Log.LogError($"[JOIN] Customization failed for boat '{data.Name}' - its rig may be " +
+                        $"wrong, but the rest of its state is still being applied. This usually means the two " +
+                        $"machines disagree about the boat's parts (check for a broken or mismatched Shipyard " +
+                        $"Expansion install). {ex}");
+                }
 
                 // 4. Clear existing items and spawn host's items
                 ClearBoatItems(boat);
@@ -679,11 +842,62 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // (v0.2.39) CLAMP TO WHAT THIS MACHINE ACTUALLY HAS, before handing anything to vanilla.
+            //
+            // SaveableBoatCustomization.LoadData is unguarded in two places, and both are reachable purely
+            // by the two peers disagreeing about a boat:
+            //     parts.availableParts[j].activeOption = data.partActiveOptions[j];   // j = HOST's count
+            //     refs.masts[sail.mastIndex].LoadSail(sail);                          // no bounds check
+            // It also calls RemoveAllSails() BEFORE either of them. So an out-of-range index does not just
+            // fail - it leaves the boat permanently stripped, sails removed and never rebuilt, which is
+            // precisely the "I can't see the sails, I can't see the winches" report.
+            //
+            // The realistic cause is not corruption but a broken mod install: a guest whose Shipyard
+            // Expansion asset bundles failed to load ("ShipyardExpansion: Asset bundle missing!") ends up
+            // with fewer parts than a host whose bundles loaded fine, while both advertise the same SE
+            // version. Dropping what we cannot represent costs that boat some cosmetic parts; letting it
+            // throw costs the guest the entire boat.
+            int localParts = -1, localMasts = -1;
+            try
+            {
+                var partsComp = HarmonyLib.Traverse.Create(customization).Field("parts").GetValue<BoatCustomParts>();
+                if (partsComp != null && partsComp.availableParts != null) localParts = partsComp.availableParts.Count;
+                var refsComp = HarmonyLib.Traverse.Create(customization).Field("refs").GetValue<BoatRefs>();
+                if (refsComp != null && refsComp.masts != null) localMasts = refsComp.masts.Length;
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.Log.LogWarning($"[JOIN] Could not read local part/mast counts on {boat.gameObject.name}; " +
+                    "applying customization unclamped. " + ex.Message);
+            }
+
+            var partOptions = data.PartActiveOptions?.ToList() ?? new List<int>();
+            if (localParts >= 0 && partOptions.Count > localParts)
+            {
+                Plugin.Log.LogWarning($"[JOIN] Boat '{data.Name}': host sent {partOptions.Count} part options but this " +
+                    $"machine has {localParts}. Dropping the extras - the boat will look slightly different here. " +
+                    "This usually means a mod that adds boat parts (e.g. Shipyard Expansion) is broken or missing " +
+                    "its asset bundles on one side.");
+                partOptions = partOptions.GetRange(0, localParts);
+            }
+
+            var sailList = data.Sails != null
+                ? data.Sails.ToList()
+                : new System.Collections.Generic.List<NetworkSailData>();
+            if (localMasts >= 0)
+            {
+                int before = sailList.Count;
+                sailList = sailList.Where(s => s.MastIndex >= 0 && s.MastIndex < localMasts).ToList();
+                if (sailList.Count != before)
+                    Plugin.Log.LogWarning($"[JOIN] Boat '{data.Name}': dropped {before - sailList.Count} sail(s) on " +
+                        $"mast indices this machine does not have (local masts={localMasts}).");
+            }
+
             // Build SaveBoatCustomizationData from network data
             var saveData = new SaveBoatCustomizationData
             {
                 masts = data.MastsEnabled ?? new bool[30],
-                sails = data.Sails?.Select(s => new SaveSailData
+                sails = sailList.Select(s => new SaveSailData
                 {
                     prefabIndex = s.PrefabIndex,
                     mastIndex = s.MastIndex,
@@ -694,8 +908,8 @@ namespace SailwindCoop.Sync
                     sailColor = s.Color,
                     scaleY = s.ScaleY,  // BS1: restore custom sail scale (Mast.LoadSail calls LoadScale when scaleY!=0)
                     scaleZ = s.ScaleZ
-                }).ToList() ?? new List<SaveSailData>(),
-                partActiveOptions = data.PartActiveOptions?.ToList() ?? new List<int>()
+                }).ToList(),
+                partActiveOptions = partOptions
             };
 
             customization.LoadData(saveData);
@@ -1436,7 +1650,27 @@ namespace SailwindCoop.Sync
                     // boat-LOCAL coord, so do NOT add the FOM offset (the old `position + offset` treated it as world
                     // and could fling the guest by the whole cross-region offset). Use it directly with a small drop.
                     worldPosition = position + new Vector3(0, 0.5f, 0);
-                    Plugin.Log.LogWarning("[PLAYER:TELEPORT] No boat frame; using boat-local position directly (no FOM offset)");
+
+                    // (v0.2.39) But a boat-local offset used as a world position lands within a few metres of
+                    // the world origin - open sea, and quite possibly under it. This branch is already the
+                    // "we do not know where you should be" branch, so at minimum do not put the player
+                    // somewhere they cannot survive: find a surface if there is one, and never place them
+                    // below the waterline. Someone bobbing at sea can be rescued or re-invited; someone
+                    // dropped under the seabed just falls, which is how this ends in a report about the game
+                    // freezing.
+                    if (Physics.Raycast(worldPosition + Vector3.up * 25f, Vector3.down, out var degenerateHit, 85f,
+                            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)
+                        && degenerateHit.point.y > 0.5f)
+                    {
+                        worldPosition.y = degenerateHit.point.y + 1.5f;
+                    }
+                    else
+                    {
+                        worldPosition.y = Mathf.Max(worldPosition.y, 1f);
+                    }
+
+                    Plugin.Log.LogError("[PLAYER:TELEPORT] No boat frame; the captain's ship could not be " +
+                        $"resolved, so this is a guess: boat-local {position} placed at {worldPosition}.");
                 }
             }
             else

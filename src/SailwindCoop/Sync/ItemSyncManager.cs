@@ -771,13 +771,39 @@ namespace SailwindCoop.Sync
 
             Plugin.Profiler?.StartMeasure();
 
-            // Update visual position of items held by remote player
-            UpdateRemoteHeldItemVisuals();
-
             // Send a one-shot reliable terminal for locally dropped items once they come to rest,
             // so every machine converges on the dropper's resting pose.
             SweepDropSettleTerminals();
 
+            Plugin.Profiler?.EndMeasure("Items");
+        }
+
+        /// <summary>
+        /// (v0.2.39) Remote held-item visuals moved OUT of Update and into LateUpdate.
+        ///
+        /// UpdateRemoteHeldItemVisuals poses a held item with `boatModel.TransformPoint(state.RelativePos)`,
+        /// i.e. against the hull's CURRENT transform, so it should run after anything that can rewrite that
+        /// transform this frame. RemotePlayerManager already sits in LateUpdate for the same reason and says
+        /// so twice ("Run in LateUpdate to ensure boat position is updated first (BoatSyncManager uses
+        /// Update)"). Every LateUpdate runs after every Update, so the ordering is now guaranteed rather than
+        /// incidental, and the capsule-fallback path lines up with the avatar posed in
+        /// RemotePlayerManager.LateUpdate.
+        ///
+        /// SCOPE, corrected after review - do not overstate this: on the NORMAL underway path BoatSyncManager
+        /// does NOT write the hull transform in Update. It only nudges velocity/angularVelocity and lets
+        /// PhysX advance the hull, so ordinary sailing was never mis-posed by this. The frames that actually
+        /// mattered are the ones where something DOES rewrite the hull outright: the co-op-sleep snap (gated
+        /// on >5m error), the >50m teleport threshold, and BoatStateApplicator repositioning during a join.
+        /// An earlier version of this comment claimed a general "hull-relative wobble underway"; that was
+        /// wrong, and if such a wobble is ever reported it needs its own diagnosis rather than being assumed
+        /// fixed here.
+        /// </summary>
+        private void LateUpdate()
+        {
+            if (!Plugin.IsMultiplayer) return;
+
+            Plugin.Profiler?.StartMeasure();
+            UpdateRemoteHeldItemVisuals();
             Plugin.Profiler?.EndMeasure("Items");
         }
 
@@ -786,18 +812,74 @@ namespace SailwindCoop.Sync
         // AUTHOR (the SteamId of whoever is carrying the item). Each carrier's item renders/positions
         // against THAT carrier's avatar, so two crew carrying items simultaneously don't fight over one
         // slot. At N=1 there is exactly one carrier entry.
-        // Positions are stored boat-relative and converted to world each frame.
+        // Poses are stored boat-local (on a boat) or REAL (on land) and converted to world each frame, with
+        // the floating-origin offset applied at render time on the land path.
         private class HeldItemState
         {
             public int ItemId;
-            public Vector3 RelativePos;   // boat-relative if on boat, world if on land
+            // boat-local when on a boat; REAL (origin-independent) when on land - the floating-origin offset
+            // is added per frame at render, never baked in at receive time. (v0.2.39: it used to be baked in,
+            // which tore the item away from its carrier across an origin shift.)
+            public Vector3 RelativePos;
             public Quaternion RelativeRot;
             public bool IsOnBoat;
             // Authoritative boat ROOT name from the carrier's position packet, so the visuals
             // loop resolves the CARRIER's hull by name instead of "nearest embark collider to MY camera"
             // (which picks the wrong hull with multiple boats / distant observers).
             public string BoatName;
+
+            // (v0.2.39) SMOOTHED pose, in the SAME space as RelativePos/RelativeRot. The raw target is a
+            // 20Hz unreliable sample and used to be hard-snapped to every frame, which stair-steps: vanilla
+            // holds an item ~1.15m in front of the camera, so an ordinary mouse-look moves it ~7-18cm per
+            // packet. Worse, the avatar BODY is SmoothDamp'ed at 1/15s in LateUpdate while the item was
+            // snapped, so the item and the hand holding it were never at the same point in time and the item
+            // visibly swam. Smoothing the item with the SAME time constant puts them back in phase - both
+            // then lag reality by ~67ms, which is imperceptible on someone else's avatar, and the item sits
+            // in the hand.
+            public Vector3 SmoothPos;
+            public Quaternion SmoothRot;
+            public Vector3 SmoothVel;      // SmoothDamp scratch
+            // False until the first frame has been smoothed. Also forced back to false on every
+            // DISCONTINUITY (see the discontinuity block in the held-item receive path), because
+            // interpolating ACROSS one would slide the item
+            // across the deck or the world instead of stepping it - which reads as far more broken than the
+            // stutter this replaces.
+            public bool HasSmoothed;
         }
+        /// <summary>
+        /// (v0.2.39) Ease a held item's stored pose toward its latest streamed target.
+        ///
+        /// SmoothTime is deliberately the SAME 1/15s the remote avatar body uses. That is the entire point:
+        /// matching the constant puts item and hand in phase with each other, so the item stops swimming
+        /// relative to the hand that holds it. The pair then trails reality by ~67ms, which nobody perceives
+        /// on another player's avatar.
+        ///
+        /// Snaps rather than eases on the first frame and after any discontinuity (HasSmoothed=false), since
+        /// interpolating across a space change would slide the item instead of stepping it.
+        /// Caller MUST pass a target in the same space the state stores (boat-local, or world-REAL on land).
+        /// </summary>
+        private const float HeldItemSmoothTime = 1f / 15f;
+
+        private static void SmoothTowardTarget(HeldItemState state, Vector3 targetPos, Quaternion targetRot)
+        {
+            if (!state.HasSmoothed)
+            {
+                state.SmoothPos = targetPos;
+                state.SmoothRot = targetRot;
+                state.SmoothVel = Vector3.zero;
+                state.HasSmoothed = true;
+                return;
+            }
+
+            state.SmoothPos = Vector3.SmoothDamp(state.SmoothPos, targetPos, ref state.SmoothVel,
+                HeldItemSmoothTime, Mathf.Infinity, Time.deltaTime);
+            // Rotation has no SmoothDamp equivalent that shares the scratch state; an exponential approach
+            // with the same time constant matches closely enough and is frame-rate independent (unlike a
+            // bare Slerp with a fixed t, which would move faster at higher FPS).
+            float k = 1f - Mathf.Exp(-Time.deltaTime / Mathf.Max(HeldItemSmoothTime, 1e-4f));
+            state.SmoothRot = Quaternion.Slerp(state.SmoothRot, targetRot, k);
+        }
+
         // carrier SteamId -> their currently-synced held item
         private readonly Dictionary<SteamId, HeldItemState> _syncedHeldItems = new Dictionary<SteamId, HeldItemState>();
         // reverse index itemId -> carrier, so the visuals loop (which enumerates items by id) can find the
@@ -826,6 +908,18 @@ namespace SailwindCoop.Sync
                     _heldItemCarrier.Remove(state.ItemId);
             }
 
+            // (v0.2.39) DISCONTINUITY DETECTION, before the fields are overwritten. Smoothing may only ever
+            // run between two poses in the SAME continuous space. Three of the four discontinuity cases are
+            // right here (the fourth, a floating-origin shift, cannot desync the smoother because both the
+            // stored value and the smoothed value are origin-independent - see the land branch below):
+            //   - a DIFFERENT item id: a new object entirely, nothing to interpolate from
+            //   - IsOnBoat flipped: the stored pose changes meaning (boat-local <-> world-real)
+            //   - BoatName changed: boat-local coordinates now refer to a different hull
+            // Interpolating across any of these slides the item across the deck or the world instead of
+            // stepping it, which looks far worse than the stutter the smoothing exists to remove.
+            if (state.ItemId != itemId || state.IsOnBoat != isOnBoat || state.BoatName != boatName)
+                state.HasSmoothed = false;
+
             state.ItemId = itemId;
             state.IsOnBoat = isOnBoat;
             state.BoatName = boatName;
@@ -840,10 +934,17 @@ namespace SailwindCoop.Sync
             }
             else
             {
-                // On land - convert to world now (world doesn't move relative to itself)
-                // Sender subtracted their FOM offset, we add ours back
-                var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
-                state.RelativePos = relativePos + offset;
+                // On land: store the REAL (origin-independent) position and add the CURRENT floating-origin
+                // offset per frame in UpdateRemoteHeldItemVisuals.
+                //
+                // (v0.2.39) This used to bake the offset in HERE, at receive time, and then reuse that world
+                // value unchanged every frame until the next packet. A floating-origin shift landing between
+                // two 20Hz packets therefore displaced the remote-held item by the whole shift delta for up to
+                // a packet interval, while its CARRIER re-added the current offset every frame
+                // (RemotePlayerManager does `_targetRealPosition + offset` per frame) and so moved correctly.
+                // The item visibly tore away from the hand across the shift. Storing real and adding late
+                // makes the item obey exactly the same rule as the avatar holding it.
+                state.RelativePos = relativePos;
                 state.RelativeRot = rotation;
             }
         }
@@ -967,8 +1068,9 @@ namespace SailwindCoop.Sync
                         }
                         if (boatModel != null)
                         {
-                            worldPos = boatModel.TransformPoint(state.RelativePos);
-                            worldRot = boatModel.rotation * state.RelativeRot;
+                            SmoothTowardTarget(state, state.RelativePos, state.RelativeRot);
+                            worldPos = boatModel.TransformPoint(state.SmoothPos);
+                            worldRot = boatModel.rotation * state.SmoothRot;
                         }
                         else
                         {
@@ -978,9 +1080,16 @@ namespace SailwindCoop.Sync
                     }
                     else
                     {
-                        // On land - already in world coords
-                        worldPos = state.RelativePos;
-                        worldRot = state.RelativeRot;
+                        // On land: RelativePos is the REAL, origin-independent position (see the receive
+                        // path). Add the CURRENT floating-origin offset every frame, exactly as
+                        // RemotePlayerManager does for the avatar carrying it, so an origin shift between
+                        // packets moves the item and the hand together instead of tearing them apart.
+                        // Smooth in REAL space, then add the offset - so an origin shift moves the smoothed
+                        // value and its target together and cannot be mistaken for motion. That is why a
+                        // floating-origin shift needs no discontinuity snap on this path.
+                        SmoothTowardTarget(state, state.RelativePos, state.RelativeRot);
+                        worldPos = state.SmoothPos + (FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero);
+                        worldRot = state.SmoothRot;
                     }
 
                     item.transform.position = worldPos;

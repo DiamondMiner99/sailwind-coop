@@ -274,5 +274,22 @@ namespace SailwindCoop.Networking.Packets
         // bell's own AudioSource directly (never OnActivate - no echo possible). Empty body except
         // the author id; host relays.
         BellRing = 219,                  // Ringer -> all (host relays): play the Leopard's bell
+
+        // Avatar appearance (220, v0.2.39): which Synty modular parts each player wears. ADDITIVE and
+        // purely cosmetic - a peer that never sends one is shown a deterministic look derived from their
+        // SteamId, so an older build degrades to "wrong outfit", never to a broken session.
+        // Body: authorId (u64), slotCount (byte), then slotCount variant bytes.
+        // Indices are NEVER trusted to index anything: the receiver clamps each against its OWN live
+        // part-list count at apply time (CoopAppearance.Apply), so a corrupt or hostile value can only
+        // ever yield that slot's default variant. The HOST additionally drops any packet whose authorId
+        // does not match the sender, and relays the SANITIZED struct rather than the raw bytes.
+        PlayerAppearance = 220,          // Any peer -> all (host relays) / host -> joiner (roster replay)
+
+        // Mooring rope carried (221, v0.2.39): who is holding a boat's mooring rope, so a docking manoeuvre
+        // is visible to the rest of the crew instead of a rope silently appearing on a cleat. Addressed as
+        // (boatName, ropeIndex) - the same scheme the moor/unmoor packets use - because a mooring rope is a
+        // permanent child of one boat and needs none of the ShipItem identity machinery.
+        // Body: boatName (string), ropeIndex (byte), holderSteamId (u64; 0 = released).
+        MooringRopeHeld = 221,           // Carrier -> all (host relays)
     }
 }

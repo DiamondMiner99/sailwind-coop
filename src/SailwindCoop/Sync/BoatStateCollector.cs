@@ -22,10 +22,30 @@ namespace SailwindCoop.Sync
             var boats = BoatUtility.FindAllBoats();
             var boatDataList = new List<NetworkBoatData>();
 
+            // (v0.2.39) PER-BOAT ISOLATION, host side. This loop had no guard, so ONE boat that threw
+            // while being read took down the ENTIRE join snapshot - observed in a live host log as
+            // "[JOIN] Join-state step 'BoatWorldState' FAILED", triggered by a Shipyard Expansion
+            // null-reference (SailScalePatch.LoadPatch -> Sail.GetScaleZ) on the third boat in the world.
+            // The guest then received no world state at all and eventually hit the join watchdog, which
+            // reads to a player as "joining just doesn't work".
+            //
+            // The APPLIER has had per-boat isolation since the 2026-07-02 rejoin lesson; the collector
+            // never got the same treatment, which left the host as a single point of failure for a
+            // problem it could see and route around. One unreadable boat now costs that boat only.
             foreach (var kvp in boats)
             {
-                var boatData = CollectBoatData(kvp.Value);
-                boatDataList.Add(boatData);
+                try
+                {
+                    var boatData = CollectBoatData(kvp.Value);
+                    boatDataList.Add(boatData);
+                }
+                catch (System.Exception e)
+                {
+                    var boatName = kvp.Value != null ? kvp.Value.gameObject.name : "<null>";
+                    Plugin.Log.LogError($"[JOIN] Could not collect state for boat '{boatName}'; it will be MISSING " +
+                        $"from the join snapshot and the guest will keep their own copy of it. A third-party mod " +
+                        $"that touches boats (e.g. Shipyard Expansion) is the usual cause. {e}");
+                }
             }
 
             var currentBoat = BoatUtility.GetCurrentBoat();

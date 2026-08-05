@@ -59,6 +59,22 @@ namespace SailwindCoop.Patches
                 if (!GameState.playing) return true;
                 if (!(Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.F10) || Input.GetKeyDown(KeyCode.JoystickButton6)))
                     return true;
+
+                // (v0.2.39) Our own IMGUI screens own the pause key while one is up, and for the remainder
+                // of the frame in which it swallowed one. Both terms are load-bearing:
+                //   IsOpen - Plugin.Update returns early when Steam never initialised, which is ABOVE the
+                //     screens' Tick calls, so Tick can be dead while the screen is drawn. The vanilla
+                //     re-pause still has to be blocked there; the panel's Done button remains the way out.
+                //   ConsumedPauseKeyThisFrame - stops the same press from also reaching vanilla and
+                //     unpausing after the screen closed itself.
+                // Without this, vanilla saw no active panel (ours hidden by the screen's Open, its own
+                // settingsUI disabled by OnPauseOpened) and re-entered GameToSettings while ALREADY paused,
+                // latching unpausedTimescale = 0 - a permanent freeze on the next resume.
+                if (SailwindCoop.UI.CharacterScreen.IsOpen ||
+                    SailwindCoop.UI.CharacterScreen.ConsumedPauseKeyThisFrame ||
+                    SailwindCoop.UI.FriendsScreen.IsOpen ||
+                    SailwindCoop.UI.FriendsScreen.ConsumedPauseKeyThisFrame) return false;
+
                 // OnEscape returns true if it handled it (resume / settings-back-to-pause) -> skip vanilla.
                 if (SailwindCoop.UI.CoopPauseMenu.OnEscape(__instance)) return false;
 

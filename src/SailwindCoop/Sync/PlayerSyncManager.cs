@@ -25,15 +25,15 @@ namespace SailwindCoop.Sync
         private PlayerCrouching _cachedCrouching;
         private float _crouchStandingHeight = -1f;
 
-        // LOOK-LEAN: cached lookup of the vanilla MouseLook instances (up to two: static look1/look2) and a
-        // cached ref-accessor for their PRIVATE clamped vertical-look field `rotationY` (positive = looking UP,
-        // clamped ~[-60,60]). Only the VERTICAL controller ever changes rotationY (the horizontal-only MouseX
-        // instance keeps it 0), so SampleLocalLookPitchDeg takes the value with the largest |magnitude|.
+        // LOOK-LEAN: cached ref-accessor for MouseLook's PRIVATE clamped vertical-look field `rotationY`
+        // (positive = looking UP, clamped ~[-60,60]). The instance is resolved by IDENTITY - see
+        // SampleHeadLookPitchDeg. (v0.2.39: the old scene-wide scan that took the largest |rotationY| is
+        // gone; that heuristic was a real bug, not merely a slow lookup, and its rationale is deleted here
+        // rather than left sitting next to the code that disproves it.)
         private static readonly AccessTools.FieldRef<MouseLook, float> MouseLookRotationYRef =
             AccessTools.FieldRefAccess<MouseLook, float>("rotationY");
-        private MouseLook[] _cachedMouseLooks;
         // (v0.2.25) empty-scan throttle: earliest realtime a missed MouseLook re-scan may run again.
-        private float _nextMouseLookScanTime;
+        private static float _nextMouseLookScanTime;
         private const float MouseLookRescanInterval = 1.5f;
 
         // A (guest-world-pinned-underway): embark self-heal watchdog state. Vanilla runs TWO parallel
@@ -80,6 +80,7 @@ namespace SailwindCoop.Sync
             // Runs before the 20Hz send gate on its own (slower) cadence, so the position rate limit
             // can't starve the probe.
             EmbarkSelfHealTick(charController);
+            OutOfWorldRescueTick(charController);
 
             // Rate limit to 20 Hz.
             // (v0.2.37) SLEEP-WARP SCALE. Scaled Time.time runs 16x during a co-op sleep, so this gate fired
@@ -99,7 +100,156 @@ namespace SailwindCoop.Sync
             if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.SleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
+            // (v0.2.39) DELIBERATELY NOT GATED ON IsJoinInProgress. An earlier cut of this fix added
+            // `if (BoatSyncManager.IsJoinInProgress) return;` here, to stop peers watching a joiner descend
+            // the 50m terrain-load perch. Adversarial review killed it, and the reason is the comment block
+            // directly above: PlayerPosition is the ONLY writer of RemoteAvatar.LastRemotePacketTime, which
+            // feeds the 12s unresponsive-crewmate watchdog. That gate is set on the GUEST only - the host
+            // never sets it - so the host's watchdog would keep running against a peer we had just silenced
+            // for the whole join (the codebase's own estimate is 15-20s, worst case 65s+). Both existing
+            // watchdog exclusions are already spent by then: _joinPendingPeers is cleared in the same method
+            // that sends the snapshot, and HasStreamedPacket is true for any real joiner. Net effect would be
+            // a mid-sleep join aborting the entire crew's sleep - a far worse bug than the cosmetic one it set
+            // out to fix.
+            //
+            // The descent itself is already fixed at its source: BoatStateApplicator now disables player
+            // control before the perch teleport, so the joiner no longer falls and peers see them parked,
+            // not plummeting. Suppressing the stream on top of that bought very little and cost the liveness
+            // contract. If the parked-at-altitude frame ever needs hiding too, do it WITHOUT muting this
+            // channel (e.g. hold the pre-join pose and keep sending it, or hide the avatar receiver-side).
             SendPlayerPosition(charController);
+        }
+
+        // (v0.2.39) Out-of-world rescue. See OutOfWorldRescueTick.
+        private const float OutOfWorldProbeInterval = 1f;
+        private const float OutOfWorldFloorY = -300f;    // well below the seabed at any island
+        private const float OutOfWorldCeilingY = 2000f;  // well above any mast, cliff or storm
+        private const float OutOfWorldRescueCooldown = 10f;
+        private float _lastOutOfWorldProbeTime;
+        private float _lastOutOfWorldRescueTime = -999f;
+        private int _outOfWorldHits;
+
+        /// <summary>
+        /// (v0.2.39) Bring back a crewmate who has fallen out of the world.
+        ///
+        /// A guest currently has NO way back. Vanilla's safety net is WorldBorder, which after two minutes
+        /// out of bounds calls Recovery.RecoverPlayer - and this mod disables WorldBorder outright for
+        /// guests, and separately refuses guest-side recovery because recovering the shared boat is the
+        /// captain's business. Both decisions are right on their own and together they leave a hole: a guest
+        /// who ends up under the seabed keeps falling until they close the game. Two new players hit exactly
+        /// this on a Reddit thread and concluded co-op did not work, which is a fair reading.
+        ///
+        /// The sibling watchdog above cannot help, because it heals by raycasting for a deck to stand on and
+        /// someone in free fall is not standing on anything. This one keys on the only thing still true in
+        /// that state: they are somewhere no part of the world exists.
+        ///
+        /// The rescue re-seats them on the crew boat rather than calling vanilla's Recovery, so nothing about
+        /// the SHARED boat is touched - it moves the person, not the ship. Requires several consecutive
+        /// probes so that a long legitimate fall (off a mast, off a cliff) is never interrupted mid-air, and
+        /// rate-limits itself so a rescue that lands somewhere still bad cannot become a teleport loop.
+        /// </summary>
+        private void OutOfWorldRescueTick(CharacterController charController)
+        {
+            if (Time.time - _lastOutOfWorldProbeTime < OutOfWorldProbeInterval) return;
+            _lastOutOfWorldProbeTime = Time.time;
+
+            // Guest-only, and never during the states that legitimately park the player outside the world:
+            // the join teleport parks them above the boat by design, recovery is vanilla moving them, and a
+            // sleep warp has its own placement.
+            if (Plugin.IsHost || !Plugin.IsMultiplayer
+                || BoatSyncManager.IsJoinInProgress
+                || GameState.recovering
+                || GameState.sleeping)
+            {
+                _outOfWorldHits = 0;
+                return;
+            }
+
+            float y = charController.transform.position.y;
+            if (y > OutOfWorldFloorY && y < OutOfWorldCeilingY) { _outOfWorldHits = 0; return; }
+
+            // Three seconds of being nowhere, not one frame of it.
+            if (++_outOfWorldHits < 3) return;
+            _outOfWorldHits = 0;
+
+            if (Time.time - _lastOutOfWorldRescueTime < OutOfWorldRescueCooldown) return;
+            _lastOutOfWorldRescueTime = Time.time;
+
+            try
+            {
+                var boat = ResolveRescueBoat();
+                var refs = boat != null ? boat.GetComponent<BoatRefs>() : null;
+                var deck = refs != null ? refs.boatModel : null;
+                if (deck == null)
+                {
+                    // Nothing to put them back onto. Say so rather than failing silently: without a boat
+                    // this is unrecoverable in-session and the player needs to know that is what happened.
+                    Plugin.Log.LogError($"[PLAYER:RESCUE] Player is out of the world at y={y:F0} and there is " +
+                        "no crew boat to return them to.");
+                    Plugin.Notify("You have fallen out of the world and there is no ship to return you to. " +
+                        "Rejoining the crew is the only way back.", 12f);
+                    return;
+                }
+
+                Plugin.Log.LogWarning($"[PLAYER:RESCUE] Player out of the world at y={y:F0}; returning them to " +
+                    $"'{boat.gameObject.name}'.");
+
+                // Place them ABOVE the deck and let them settle, the same "slightly high self-corrects,
+                // slightly low clips" rule the join teleport uses.
+                var target = deck.position + Vector3.up * 3f;
+                bool wasEnabled = charController.enabled;
+                charController.enabled = false;   // CharacterController ignores transform writes while enabled
+                charController.transform.position = target;
+                charController.enabled = wasEnabled;
+
+                // Re-establish the deck parenting too, or they stand on a moving ship in the world frame and
+                // get left behind the moment it makes way.
+                BoatStateApplicator.ForceEmbarkLocalPlayer(boat.transform);
+
+                Plugin.Notify("You fell out of the world. Back aboard.", 6f);
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogError("[PLAYER:RESCUE] could not return the player to the ship: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// (v0.2.39) Find the ship to put a fallen crewmate back on, using state that SURVIVES falling.
+        ///
+        /// The obvious answer, GameState.currentBoat, is the wrong one, and wrong in precisely the case this
+        /// rescue exists for. Vanilla nulls that field on every disembark path, and going into the sea IS a
+        /// disembark: PlayerEmbarkerNew disembarks after about three fixed frames of swimming, and anyone
+        /// falling to y &lt; -300 passed through the water on the way. So by the time the watchdog's
+        /// three-second dwell completes, the field it would have used has been cleared for roughly three
+        /// seconds. The rescue would have reported "there is no ship to return you to" while the ship sat
+        /// moored nearby - the exact dead end it was written to remove.
+        ///
+        /// GameState.lastBoat is only ever written on embark and vanilla never clears it, and the crew boat's
+        /// name is recorded independently at join time. Either outlives the fall.
+        /// </summary>
+        private static SaveableObject ResolveRescueBoat()
+        {
+            var boat = BoatUtility.GetCurrentBoat();
+            if (boat != null) return boat;
+
+            // lastBoat: set on embark, never nulled by vanilla.
+            var last = GameState.lastBoat;
+            if (last != null)
+            {
+                var saveable = last.GetComponent<SaveableObject>();
+                if (saveable != null) return saveable;
+            }
+
+            // The crew boat by name, recorded when the join seated us on it.
+            string shared = SleepSyncManager.Instance != null ? SleepSyncManager.Instance.SharedBoatName : null;
+            if (!string.IsNullOrEmpty(shared))
+            {
+                var byName = BoatUtility.FindBoatByName(shared);
+                if (byName != null) return byName;
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -262,44 +412,61 @@ namespace SailwindCoop.Sync
 
         /// <summary>
         /// LOOK-LEAN: the LOCAL player's clamped vertical look angle in degrees (~[-60,60]; positive = looking
-        /// UP), read from the vanilla MouseLook.rotationY private field. There can be up to two MouseLook
-        /// instances (static look1/look2); only the VERTICAL one ever moves rotationY (the horizontal-only
-        /// MouseX instance keeps it 0), so we take the value with the largest ABSOLUTE magnitude (0 when looking
-        /// straight = correct). Camera.main pitch is NOT usable here: in the ship-orbit camera Camera.main is the
-        /// orbit cam (not the head), whereas MouseLook.rotationY is camera-mode-independent. Returns 0 if no
-        /// MouseLook is loaded; re-finds when the cached instances go stale (scene change).
+        /// UP), read from the vanilla MouseLook.rotationY private field.
+        ///
+        /// (v0.2.39) Resolved by IDENTITY - the MouseLook on Refs.ovrCameraRig, which is the player head's
+        /// vertical look. It used to scan every MouseLook in the scene and take the LARGEST ABSOLUTE
+        /// rotationY, on the stated assumption that only the vertical head instance is ever non-zero. That
+        /// assumption is false and it produced a reported bug: a crewmate's avatar was seen folded fully
+        /// forward for a whole session, and only recovered when they toggled to the orbit camera and back.
+        ///
+        /// Vanilla has at least FIVE MouseLook instances (player yaw, player pitch, the bed/TrackingSpace
+        /// look, BoatCamera orbit yaw, BoatCamera orbit pitch). rotationY is a private accumulator written
+        /// ONLY in MouseLook.Update, so an instance that gets enabled=false (BoatCamera.SwitchOff, the
+        /// shipyard rotator) FREEZES its last value forever - nothing in vanilla or this mod ever resets it.
+        /// A parked orbit pitch sitting at its -60 clamp therefore wins the max-abs contest permanently and
+        /// decodes to a ~54 degree spine fold against the 55 degree cap: visually maxed. The camera toggle
+        /// "fixed" it only because it made that instance live-driven again.
+        ///
+        /// DO NOT "improve" this by filtering on ml.enabled - that INVERTS the bug. During the orbit camera
+        /// the player looks are DISABLED and the boat looks ENABLED, so an enabled-filter would make the
+        /// avatar mirror the orbit camera's pitch instead of holding the player's last first-person pitch.
+        /// The invariant to preserve: while the orbit cam is on, the sent pitch stays the player's head
+        /// pitch.
+        ///
+        /// Fails SAFE: if the head MouseLook cannot be resolved we return 0 (no lean, neutral spine) rather
+        /// than guessing from another instance. A missing lean is a cosmetic nothing; a wrong one is the bug
+        /// above.
         /// </summary>
-        private float SampleLocalLookPitchDeg()
+        private float SampleLocalLookPitchDeg() => SampleHeadLookPitchDeg();
+
+        /// <summary>
+        /// Shared head-pitch sampler. Public+static so LocalPlayerBody's third-person body and the networked
+        /// avatar cannot diverge - they previously held byte-identical copies of this logic, including the
+        /// same wrong comment, which is why the defect existed in two places at once.
+        /// </summary>
+        public static float SampleHeadLookPitchDeg()
         {
-            if (_cachedMouseLooks == null || _cachedMouseLooks.Length == 0)
+            if (_headMouseLook == null)
             {
-                // (v0.2.25) EMPTY-SCAN THROTTLE: with no MouseLook loaded (menus/loading) this ran a
-                // full-scene FindObjectsOfType EVERY call (20Hz), allocating and scanning for nothing.
-                // Cache the miss and rescan at most once per interval (realtime, load-lag immune).
+                // Throttle the re-resolve: during menus/loading the rig does not exist and this would
+                // otherwise probe every call on the 20Hz path.
                 float now = Time.realtimeSinceStartup;
                 if (now < _nextMouseLookScanTime) return 0f;
-                _cachedMouseLooks = Object.FindObjectsOfType<MouseLook>();
-                if (_cachedMouseLooks == null || _cachedMouseLooks.Length == 0)
+
+                var rig = Refs.ovrCameraRig;
+                _headMouseLook = rig != null ? rig.GetComponent<MouseLook>() : null;
+                if (_headMouseLook == null)
                 {
                     _nextMouseLookScanTime = now + MouseLookRescanInterval;
                     return 0f;
                 }
             }
-
-            float best = 0f, bestAbs = -1f;
-            bool anyLive = false;
-            for (int i = 0; i < _cachedMouseLooks.Length; i++)
-            {
-                var ml = _cachedMouseLooks[i];
-                if (ml == null) continue; // destroyed on a scene change
-                anyLive = true;
-                float ry = MouseLookRotationYRef(ml);
-                float a = Mathf.Abs(ry);
-                if (a > bestAbs) { bestAbs = a; best = ry; }
-            }
-            if (!anyLive) { _cachedMouseLooks = null; return 0f; } // all stale -> re-find next call
-            return best;
+            return MouseLookRotationYRef(_headMouseLook);
         }
+
+        /// <summary>The player head's vertical MouseLook. Null until resolved / after a scene change.</summary>
+        private static MouseLook _headMouseLook;
 
         private void SendPlayerPosition(CharacterController charController)
         {
@@ -430,8 +597,44 @@ namespace SailwindCoop.Sync
                     {
                         hasHeldItem = true;
                         heldItemId = prefab.instanceId;
-                        // Use boat-relative if on boat, otherwise REAL world position
+                        // Use boat-relative if on boat, otherwise REAL world position.
+                        //
+                        // (v0.2.39) The frame is chosen from `visualBoat`, but the isOnBoat FLAG on the wire
+                        // is derived separately (from the player's parent). Those two could disagree: when
+                        // GameState.currentBoat is null while the player is still parented to a hull, this
+                        // sent a REAL-WORLD point under isOnBoat=TRUE, and the receiver - which picks its
+                        // frame purely from the flag - fed that world point through boatModel.TransformPoint.
+                        // The held item lands wherever the hull's transform maps a world coordinate to, i.e.
+                        // wildly wrong, until the player re-grabs it.
+                        //
+                        // Reachable, not theoretical: vanilla Shipyard.DischargeShip nulls
+                        // GameState.currentBoat without touching the player's parent, so any player holding
+                        // something as a shipyard releases their ship hits it.
+                        //
+                        // Fix is to resolve the VISUAL model another way rather than to change the flag.
+                        // Deliberately NOT changing the wire flag: there is only one, and the avatar's own
+                        // frame depends on it, so repurposing it would be a wire change requiring the whole
+                        // crew to update. Deliberately NOT using the walkCol/physics frame either: a held
+                        // item is posed by GoPointer off the CAMERA, which lives in the visual frame, so
+                        // inverse-transforming through walkCol would be ~205m out underway.
                         var visualBoat = GameState.currentBoat;
+                        if (isOnBoat && visualBoat == null)
+                        {
+                            // Resolve from the player's PARENT, exactly as the avatar branch above already
+                            // does to derive the boatName that goes on the wire. NOT BoatUtility
+                            // .GetCurrentBoat(): its first statement is `if (GameState.currentBoat == null)
+                            // return null`, i.e. the very condition we are in, so that fallback was dead code.
+                            var boatRoot = playerParent != null ? playerParent.GetComponentInParent<SaveableObject>() : null;
+                            var refs = boatRoot != null ? boatRoot.GetComponent<BoatRefs>() : null;
+                            if (refs != null && refs.boatModel != null)
+                            {
+                                visualBoat = refs.boatModel;
+                                VerboseLogger.PlayerSend("Held item: GameState.currentBoat null but still parented to a " +
+                                    "hull; resolved the visual model via BoatRefs so the pose matches the isOnBoat flag.",
+                                    throttle: true);
+                            }
+                        }
+
                         if (isOnBoat && visualBoat != null)
                         {
                             heldItemPos = visualBoat.transform.InverseTransformPoint(heldItem.transform.position);

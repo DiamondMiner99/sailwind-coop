@@ -33,9 +33,10 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.2.38 build (mission-cargo outline clear, cargo-withdraw physics flash,
-        // fishing NRE, per-sender invite ignore list); shows as 0.2.38.
-        public const string PluginVersion = "0.2.38";
+        // load. This is the v0.2.39 build (shipyard sail-sync rope-cache fix, host-settings reconcile +
+        // mod manifest report, readable message panel, avatar look/crouch fixes, join sky-fall + toast,
+        // held-item smoothing, sustained-divergence escalation); shows as 0.2.39.
+        public const string PluginVersion = "0.2.39";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -61,6 +62,9 @@ namespace SailwindCoop
         // in singleplayer despite their authored floaterHeight. Read by ItemBuoyancyPatches; default
         // TRUE = restore the pre-0.38 floating players expect (set false for current-build sinking).
         public static ConfigEntry<bool> RestoreItemBuoyancyConfig { get; private set; }
+        // (v0.2.39) Kill switch for the guest hull-physics derivation - see the Config.Bind call for why a
+        // feature that cannot be tested solo needs one. Read by DamagePatches every frame, so it is live.
+        public static ConfigEntry<bool> GuestHullPhysicsConfig { get; private set; }
 
         // Crouch pose tuning (v0.2.25), read live every frame by RemotePlayerManager + LocalPlayerBody so
         // they can be tuned in-game with Configuration Manager. The crouch is a SQUAT: the hips/body drop and
@@ -72,6 +76,58 @@ namespace SailwindCoop
         public static ConfigEntry<float> CrouchArmBendDegConfig { get; private set; }
         public static ConfigEntry<float> CrouchStrideCutConfig { get; private set; }
         public static ConfigEntry<float> CrouchKneeForwardConfig { get; private set; }
+        // (v0.2.39) Squat shaping + ground plant - see the Config.Bind calls for the full rationale.
+        public static ConfigEntry<float> CrouchThighLiftDegConfig { get; private set; }
+        public static ConfigEntry<float> CrouchHipSetbackMaxMetersConfig { get; private set; }
+        public static ConfigEntry<float> AvatarSoleOffsetMetersConfig { get; private set; }
+
+        // (v0.2.39) This player's chosen avatar appearance, persisted as a "key=value;..." string.
+        public static ConfigEntry<string> AppearanceConfig { get; private set; }
+        public static ConfigEntry<float> CoopMenuButtonScaleConfig { get; private set; }
+        private static bool _localAppearanceLoaded;
+        private static Player.CoopAppearance _localAppearance;
+
+        /// <summary>
+        /// This machine's chosen look. Parsed once from config; an empty setting resolves to a
+        /// deterministic look derived from the player's own SteamId, so a player who never opens the
+        /// character screen still has a face of their own rather than slot 0 like everyone else.
+        /// </summary>
+        public static Player.CoopAppearance LocalAppearance
+        {
+            get
+            {
+                if (!_localAppearanceLoaded)
+                {
+                    string raw = AppearanceConfig != null ? AppearanceConfig.Value : null;
+                    if (string.IsNullOrEmpty(raw))
+                    {
+                        ulong id = 0UL;
+                        try { if (SteamClient.IsValid) id = SteamClient.SteamId; } catch { }
+                        // Only LATCH once we could actually read our own id. A first read before Steam is
+                        // valid would otherwise freeze the all-zero seed look for the whole process, and
+                        // every player in that situation would end up identical - the precise outcome the
+                        // deterministic default exists to avoid. Until then, recompute each read.
+                        if (id != 0UL) _localAppearanceLoaded = true;
+                        _localAppearance = Player.CoopAppearance.DeterministicFor(id);
+                    }
+                    else
+                    {
+                        _localAppearanceLoaded = true;
+                        _localAppearance = Player.CoopAppearance.Deserialize(raw);
+                    }
+                }
+                return _localAppearance;
+            }
+        }
+
+        /// <summary>Adopt a new look and persist it. Callers must rebuild the local body to see it - the
+        /// appearance is baked when the clone is activated, not applied live (see CoopAppearance).</summary>
+        public static void SetLocalAppearance(Player.CoopAppearance a)
+        {
+            _localAppearance = a;
+            _localAppearanceLoaded = true;
+            if (AppearanceConfig != null) AppearanceConfig.Value = a.Serialize();
+        }
 
         // LOOK-LEAN pose tuning (torso pitches on the hips toward where the player looks vertically, like a
         // Phasmophobia player model). Read live every frame by RemotePlayerManager + LocalPlayerBody. Applies
@@ -94,6 +150,14 @@ namespace SailwindCoop
         // BOTH the version gate and the mod gate was too blunt with six gated mods. Off by default.
         // Checked on BOTH sides, so both peers must enable it to actually play mismatched.
         public static ConfigEntry<bool> AllowModMismatchConfig { get; private set; }
+
+        // (v0.2.39) DEBUG: preview of the co-op message panel. The panel only ever appears on a failed join,
+        // so without this the only way to check that it is readable is to arrange a real mismatched session
+        // and then read fast before the refusal quits it. Entirely inert unless the bool is on.
+        public static ConfigEntry<bool> PreviewMessagePanelConfig { get; private set; }
+        public static ConfigEntry<string> PreviewMessagePanelKeyConfig { get; private set; }
+        public static ConfigEntry<float> PreviewMessagePanelSecondsConfig { get; private set; }
+        public static ConfigEntry<float> PreviewMessagePanelStartDelayConfig { get; private set; }
 
         // (v0.2.37) Guest-only physics relief during a co-op sleep warp. OPT-IN (default false), local and
         // per-player. See the Bind description and SleepSyncManager.ApplySleepCycleState for the rationale
@@ -263,6 +327,24 @@ namespace SailwindCoop
                 "Re-enable floating for dropped items. Older Sailwind builds floated free items; the current v0.38 build regressed this to a hard-coded floater disable every physics frame, so dropped items/crates sink even in singleplayer. Default on = restore the pre-0.38 floating everyone expects. Applies to THIS machine only; other crew members see their own local physics either way. Set false for exact current-build (sinking) behavior.");
             Log.LogInfo($"RestoreItemBuoyancy: {RestoreItemBuoyancyConfig.Value}");
 
+            // (v0.2.39) Kill switch for the guest hull-physics derivation. This exists because the feature
+            // it guards CANNOT BE TESTED WITHOUT A SECOND MACHINE - it only runs on a guest - so the first
+            // people to exercise it are a crew mid-voyage. If it ever goes wrong for them, the honest
+            // remedy has to be something they can do without waiting for a build. Read live, so a crew can
+            // flip it with Configuration Manager and see the difference immediately.
+            // Setting it false restores the pre-v0.2.39 behavior exactly: guests derive nothing and their
+            // hulls keep whatever buoyancy they loaded with, including a stale or zeroed one.
+            GuestHullPhysicsConfig = Config.Bind(
+                "Coop",
+                "GuestHullPhysics",
+                true,
+                "Let crew work out a boat's buoyancy and drag from the captain's water level. Default on. " +
+                "The game derives those from flooding in one place, which co-op used to skip entirely on " +
+                "crew machines, so a flooding boat floated at one height for the captain and another for " +
+                "everyone else, and a hull that loaded sunk stayed weightless forever. Turn this off only " +
+                "if boats start behaving worse than that for your crew; it restores the old behavior.");
+            Log.LogInfo($"GuestHullPhysics: {GuestHullPhysicsConfig.Value}");
+
             // Crouch pose tuning - live-editable (Configuration Manager). The crouch is a SQUAT: the body
             // drops and 2-bone leg IK re-plants the feet at their standing spot. All applied * the 0..1 crouch
             // amount. Shared by remote avatars and your own third-person (orbit-cam) body.
@@ -281,6 +363,35 @@ namespace SailwindCoop
             CrouchKneeForwardConfig = Config.Bind("Crouch", "CrouchKneeForward", 1f,
                 new ConfigDescription("Knee-forward pole sign for the leg IK. +1 bends the knees FORWARD (a squat). If the knees bend the wrong way (backward), set this to -1 to flip the pole live.",
                     new AcceptableValueRange<float>(-1f, 1f)));
+
+            // (v0.2.39) SQUAT vs SEIZA. The crouch used to drop the hips straight down while the feet stayed
+            // planted directly beneath them, which is kneeling geometry, not squatting - the reported "looks
+            // like I'm sitting on my own feet". A real squat sends the hips BACKWARD as they drop. That is
+            // also the ONLY lever available: with the hip above the foot the knee lies on a horizontal
+            // circle, so the IK pole sets the knee's compass direction but never its height, and with
+            // roughly equal thigh/shin bones the knee can never rise above the hip at all. Moving the hip
+            // back is what opens the thigh angle up; the shins and ankles then re-solve to follow.
+            CrouchThighLiftDegConfig = Config.Bind("Crouch", "CrouchThighLiftDeg", 8f,
+                new ConfigDescription("How far the thigh lifts toward the chest at full crouch, in degrees above the hip-to-ankle line. The hip setback needed to achieve it is solved from your rig's own measured bone lengths, so the same angle looks the same on any character - which is why this is an angle and not a distance. 0 keeps the old straight-down drop.",
+                    new AcceptableValueRange<float>(-30f, 25f)));
+            CrouchHipSetbackMaxMetersConfig = Config.Bind("Crouch", "CrouchHipSetbackMaxMeters", 0.35f,
+                new ConfigDescription("Safety clamp (metres) on how far back the hips may travel for CrouchThighLiftDeg. SET THIS TO 0 to disable the squat setback entirely and get the previous straight-down crouch back, without needing a new build.",
+                    new AcceptableValueRange<float>(0f, 0.6f)));
+
+            // (v0.2.39) Avatar ground plant. The body used to be planted with a hardcoded 0.9m guess at the
+            // distance from the player root down to the ground; the real distance is read live from the
+            // vanilla CharacterController instead (PlayerSyncManager.ControllerFeetGap), which is the same
+            // number the network send path has always used. This knob is only the residual nudge on top.
+            AvatarSoleOffsetMetersConfig = Config.Bind("Crouch", "AvatarSoleOffsetMeters", 0f,
+                new ConfigDescription("Fine adjustment (metres) to how high avatars stand relative to the surface under them. POSITIVE raises, NEGATIVE sinks. Leave at 0 unless bodies visibly hover above or sink into decks; the base value is now measured from the game rather than assumed. Takes effect on the next avatar build (leave and re-enter third person, or rejoin).",
+                    new AcceptableValueRange<float>(-0.5f, 0.5f)));
+
+            CoopMenuButtonScaleConfig = Config.Bind("Coop", "MenuButtonScale", 0.9f,
+                new ConfigDescription("Size of the buttons on the co-op pause menu, relative to vanilla. The column has a fixed height, so each button added to it tightens the spacing; 0.9 gives the seven-button menu roughly the breathing room the six-button one had. Lower if it still looks crowded, 1.0 for vanilla-sized buttons. Applies on the next time the menu lays out (open the pause menu again).",
+                    new AcceptableValueRange<float>(0.5f, 1f)));
+
+            AppearanceConfig = Config.Bind("Appearance", "Character", "",
+                "Your character's appearance, as \"slot=variant\" pairs (e.g. \"gender=0;hair=3;torso=7\"). Normally written by the in-game character screen rather than edited here. Leave EMPTY to get a look derived from your Steam ID - stable across sessions, and different from your crewmates' rather than everyone sharing one face. Unknown slot names are ignored and out-of-range variants fall back to that slot's default, so a hand-edited value can never produce an invisible or broken character.");
 
             // LOOK-LEAN tuning - live-editable (Configuration Manager). The avatar's upper body (Spine_01 ->
             // chest/head/arms) pitches on the hips toward where the player looks vertically, in every state
@@ -308,6 +419,20 @@ namespace SailwindCoop
 
             AllowModMismatchConfig = Config.Bind("Coop", "AllowModMismatch", false,
                 "Let players whose GAMEPLAY MOD SET differs from the host's join anyway (warning instead of refusal). Covers Shipyard Expansion, Sail Collision Fix, NAND Tweaks simulation options, Deep Ports (including its terrain bundle), Towable Boats and HMS Leopard. Mixed mod sets desync physics, terrain and rigs - leave this off unless you know exactly what differs. Both the host and the mismatched guest must enable it.");
+
+            PreviewMessagePanelConfig = Config.Bind("Debug", "PreviewMessagePanel", false,
+                "DEBUG / UI CHECK ONLY. Shows a SAMPLE of the co-op message panel - the 'your mods differ from the host's' screen - shortly after launch, and binds a key to re-show it, so its readability can be checked without arranging a real mismatched join. The sample is built from YOUR actual installed mods with a few differences invented, so it reads at real length with real names; it is clearly labelled as a preview, no join is attempted and nothing is changed. Off by default and has no effect on real sessions either way.");
+
+            PreviewMessagePanelKeyConfig = Config.Bind("Debug", "PreviewMessagePanelKey", "F9",
+                "Key that re-shows the sample panel while Debug.PreviewMessagePanel is on. Each press cycles the three real message shapes: refused before joining, admitted-with-warning, and refused by the host. Any UnityEngine.KeyCode name (F9, F10, Backslash...). Ignored when the preview is off.");
+
+            PreviewMessagePanelSecondsConfig = Config.Bind("Debug", "PreviewMessagePanelSeconds", 15f,
+                new ConfigDescription("How long the sample panel stays up before hiding itself. Escape or the Close button dismisses it early. Real refusals never auto-hide - the player is stuck and has to act - so this applies to the preview only.",
+                    new AcceptableValueRange<float>(1f, 600f)));
+
+            PreviewMessagePanelStartDelayConfig = Config.Bind("Debug", "PreviewMessagePanelStartDelay", 8f,
+                new ConfigDescription("Seconds after the mod loads before the sample appears once on its own; the main menu needs a moment to come up first. Set to 0 to disable the automatic show and use only the key, which is the reliable route if this delay lands mid-load.",
+                    new AcceptableValueRange<float>(0f, 120f)));
 
             try
             {
@@ -416,7 +541,23 @@ namespace SailwindCoop
 
         private void InitializeSteam()
         {
-            _steamInitialized = LobbyManager.Initialize();
+            // (v0.2.39) Guard the TOUCH of LobbyManager, not just what it does. If
+            // Facepunch.Steamworks.Win64.dll is missing, SteamLobbyManager cannot be laid out in memory
+            // (it holds a Lobby? field), so this line throws a TypeLoadException before Initialize() runs
+            // and its own try/catch never gets the chance to record why. Catching it here is what lets the
+            // player be told which file to restore instead of watching every co-op button do nothing.
+            try
+            {
+                _steamInitialized = LobbyManager.Initialize();
+            }
+            catch (System.Exception ex)
+            {
+                _steamInitialized = false;
+                Networking.SteamInitDiagnostics.RecordFailure(ex);
+                Log.LogError($"Steam layer could not load: {ex.GetType().Name}: {ex.Message}");
+                if (ex.InnerException != null) Log.LogError($"  inner: {ex.InnerException.Message}");
+            }
+
             if (_steamInitialized)
             {
                 Log.LogInfo($"Steam user: {SteamClient.Name} ({SteamClient.SteamId})");
@@ -424,6 +565,7 @@ namespace SailwindCoop
             else
             {
                 Log.LogError("Failed to initialize Steam. Coop features will be disabled.");
+                Log.LogError(Networking.SteamInitDiagnostics.Describe());
             }
         }
 
@@ -458,7 +600,12 @@ namespace SailwindCoop
 
             if (!p._steamInitialized)
             {
-                Notify(LobbyManager.InitFailureHint(), 8f);
+                // (v0.2.39) Ask SteamInitDiagnostics, NOT LobbyManager. When the failure is a missing
+                // Facepunch.Steamworks.Win64.dll, SteamLobbyManager cannot load at all - it has a Lobby?
+                // field, so Mono must resolve that type just to lay the class out - and merely touching the
+                // LobbyManager property here would throw, replacing the explanation with a second failure.
+                // The message naming the missing file has to come from somewhere that does not need it.
+                Notify(Networking.SteamInitDiagnostics.Describe(), 8f);
                 return false;
             }
             return true;
@@ -487,6 +634,40 @@ namespace SailwindCoop
                 NotificationUi.instance.ShowNotification(WrapForScroll(message), duration);
             else
                 Log.LogInfo($"[Coop] {message}");
+        }
+
+        /// <summary>
+        /// (v0.2.39) A notification with a quieter second line, for telling the player what to DO about it.
+        ///
+        /// This paints into VANILLA's notification scroll - the same one every game message uses - so the
+        /// banner keeps its native size and look on purpose. Resizing it would mean resizing a shared mesh
+        /// and shrinking every vanilla notification along with ours.
+        ///
+        /// The subtitle is styled with rich-text tags, which that TextMesh does not enable by default, so
+        /// we turn it on immediately before writing. Harmless for vanilla messages (none contain tags), and
+        /// if the field cannot be reached we fall back to a plain second line rather than printing raw
+        /// markup at the player.
+        /// </summary>
+        public static void NotifyWithHint(string message, string hint, float duration = 6f)
+        {
+            if (NotificationUi.instance == null)
+            {
+                Log.LogInfo($"[Coop] {message} ({hint})");
+                return;
+            }
+
+            bool rich = false;
+            try
+            {
+                var tm = HarmonyLib.Traverse.Create(NotificationUi.instance).Field("text").GetValue<TextMesh>();
+                if (tm != null) { tm.richText = true; rich = true; }
+            }
+            catch { /* fall through to the plain second line */ }
+
+            string body = WrapForScroll(message) + "\n" + (rich
+                ? "<i><color=#524439>" + hint + "</color></i>"
+                : hint);
+            NotificationUi.instance.ShowNotification(body, duration);
         }
 
         // The vanilla NotificationUi paints into a fixed-width parchment via a NON-wrapping TextMesh, so a long
@@ -535,6 +716,12 @@ namespace SailwindCoop
                 if (IsHost)
                     NetworkManager.AddPeer(friend.Id);
                 RemotePlayerManager.SpawnRemotePlayer(friend.Id, friend.Name);
+
+                // (v0.2.39) Re-announce our own look to the crew whenever anyone joins. Everyone doing this
+                // means a newcomer learns every existing player's appearance even without the host's roster
+                // replay, and a guest is not dependent on having been connected at the moment someone else
+                // last changed. It is a handful of bytes on a rare event, so the redundancy is free.
+                Player.AppearanceSync.BroadcastLocal();
 
                 Notify($"{friend.Name} joined the crew", 4f);
 
@@ -638,6 +825,25 @@ namespace SailwindCoop
             LobbyManager.OnLobbyLeft += () =>
             {
                 Sync.BoatUtility.ClearCaches(); // (v0.2.32, P2) fresh session = fresh boat map
+                // (v0.2.39) Hand back any mod settings we adopted from the host to make the join work. This
+                // is the other half of the reconcile contract: the player's own settings are borrowed for the
+                // session only, never written to their config file, and always returned here. No-op when
+                // nothing was adopted. Runs BEFORE the save below so a host's borrowed values can never be
+                // observed by anything that writes state.
+                Compat.CompatRegistry.RestoreLocalSettings();
+                // (v0.2.39) The panel is DontDestroyOnLoad, so without this a co-op message (and its cursor
+                // capture) would follow the player back into singleplayer.
+                UI.CoopMessagePanel.Hide();
+                // (v0.2.39) Appearances are per-session knowledge. Keeping them would let a stale entry
+                // dress a future crewmate in whoever last occupied that id in an earlier session.
+                Player.AppearanceRegistry.Clear();
+                // Carried-rope state is per-session too; a stale entry would pin a rope to an avatar that
+                // no longer exists.
+                Sync.MooringRopeHoldSync.Clear();
+                // (v0.2.39) Requests to come aboard, and the "not now" answers to them, belonged to the
+                // voyage that just ended. Rich presence is re-published on the next tick from whatever is
+                // true then, so friends stop being told we are sailing.
+                Networking.CoopPresence.OnLobbyEnded();
                 Notify("Lobby closed - playing solo", 5f);
 
                 // The HOST saves their world normally. A GUEST now ALSO saves on leave - but to the hidden
@@ -805,24 +1011,68 @@ namespace SailwindCoop
                     // MESSAGE only so the user learns which mod differs.
                     var hostMods = LobbyManager.GetLobbyData("mods") ?? "";
                     var ourMods = Compat.CompatRegistry.ModSignature;
+
+                    // (v0.2.39) SETTINGS RECONCILE, before the refusal. The commonest way to fail this gate is
+                    // not a missing mod - it is a crew running identical mods where one config line differs,
+                    // which used to be a hard refusal plus an unreadable vector dump. Adopt the host's
+                    // runtime-applicable settings for the session instead and let the join proceed. Only
+                    // converges when EVERY differing segment was fixable, so a genuine incompatibility still
+                    // refuses (see CompatRegistry.TryReconcileWith). Undone on session teardown.
+                    if (hostMods != ourMods && Compat.CompatRegistry.TryReconcileWith(hostMods))
+                    {
+                        ourMods = Compat.CompatRegistry.ModSignature;
+                        Notify("Matched the host's mod settings for this session (your own settings are restored when you leave).", 8f);
+                    }
+
                     if (hostMods != ourMods)
                     {
                         string modsMsg = "Mod set mismatch - " +
                             Compat.CompatRegistry.DescribeMismatch(hostMods, ourMods) +
                             ". Everyone must run the same gameplay mods (and the same settings for the flagged ones).";
                         Log.LogError($"[MODS] {modsMsg}");
+
+                        // (v0.2.39) Put the actionable version on a READABLE surface. This message is a list
+                        // of mods with versions and settings, and the vanilla notification ticker clips it
+                        // rather than wrapping - the reported "you can't even read it, it all runs off the
+                        // screen". It is also the moment the player is stuck and must act, so it is exactly
+                        // the wrong thing to render as ambient diegetic flavour.
+                        //
+                        // The manifest comes from LOBBY DATA here, not the handshake: this refusal happens
+                        // before any P2P session exists, so the handshake copy does not exist yet.
+                        // Built once, but SHOWN inside each branch below - the outcome differs and the panel
+                        // must not assert a refusal that did not happen. Raising "Cannot join" before this
+                        // branch meant an AllowModMismatch join proceeded normally with a box on screen
+                        // telling the player they had been refused and should fix their mods and try again.
+                        var panelLines = new System.Collections.Generic.List<string>(
+                            Compat.CompatRegistry.DescribeMismatchLines(hostMods, ourMods));
+                        panelLines.AddRange(Compat.ModManifest.DescribeDifferences(
+                            LobbyManager.GetLobbyData("manifest") ?? "", Compat.ModManifest.Local, "the host"));
+
                         if (AllowModMismatchConfig != null && AllowModMismatchConfig.Value)
                         {
                             Notify(modsMsg + "\n(Coop.AllowModMismatch is on - joining anyway; expect desyncs.)", 10f);
+                            // (v0.2.39) Waits for the player to dismiss it rather than expiring on a timer:
+                            // a mod mismatch you were admitted through is exactly the thing you want to have
+                            // actually READ when the session desyncs an hour later. NOT sticky through
+                            // teardown though - unlike a refusal, this is about a session the player is
+                            // still in, so leaving the lobby should take it away rather than carry it into
+                            // singleplayer.
+                            UI.CoopMessagePanel.Show("Joining anyway - your mods differ from the host's", panelLines,
+                                "Coop.AllowModMismatch is on, so you were admitted. Expect desyncs.",
+                                0f, stickyThroughTeardown: false);
                         }
                         else if (SaveSlots.currentSlot == CoopSave.PhantomSlot)
                         {
+                            UI.CoopMessagePanel.Show("Cannot join: your mods differ from the host's", panelLines,
+                                "Everyone must run the same gameplay mods, at the same versions. The full list is in the BepInEx log.");
                             _joinedAsGuest = true;
                             EndGuestSessionAndQuit(modsMsg);
                             return;
                         }
                         else
                         {
+                            UI.CoopMessagePanel.Show("Cannot join: your mods differ from the host's", panelLines,
+                                "Everyone must run the same gameplay mods, at the same versions. The full list is in the BepInEx log.");
                             Notify(modsMsg, 12f);
                             LobbyManager.LeaveLobby();
                             return;
@@ -861,12 +1111,33 @@ namespace SailwindCoop
                     {
                         w.Write(PluginVersion);
                         w.Write(Compat.CompatRegistry.ModSignature);
+                        // (v0.2.39) Additive trailing field, same tolerance contract as the mod token above:
+                        // an older host stops reading after the token and never sees this. REPORT ONLY - it
+                        // is never consulted by the gate below (see ModManifest's class doc).
+                        w.Write(Compat.ModManifest.Local);
                     });
+
+                    // (v0.2.39) Announce our look on the same proven connection, immediately after the
+                    // handshake. OnPlayerJoined does NOT fire on a guest for the host - the host is not
+                    // "joining" - so without this the host would never learn what a guest looks like, and
+                    // its roster replay to later joiners would be missing them.
+                    Player.AppearanceSync.BroadcastLocal();
                 }
 
                 if (joinedExistingPlayer)
                 {
-                    Notify("Aboard the host's ship!", 5f);
+                    // (v0.2.39) This used to say "Aboard the host's ship!" and it was simply not true. This
+                    // handler fires the instant Steam reports we entered the LOBBY - `joinedExistingPlayer`
+                    // means nothing more than "the lobby has another member in it" (its original purpose was
+                    // only to stop a solo host toasting themselves). At this point the guest is standing in
+                    // their OWN world, no host state has arrived, and the actual embark is anywhere from a
+                    // few seconds to a minute away (the host defers the snapshot up to 30s while asleep, and
+                    // the scene-load wait can add 30s more). It also claimed "aboard a ship" when the host was
+                    // on LAND, and when the host had refused admission and we were about to be quit.
+                    //
+                    // The real toast now fires from the join coroutine at the moment the embark actually
+                    // succeeds (BoatStateApplicator, STEP 7). This one is honest about being progress.
+                    Notify("Connected to the host - loading their world...", 5f);
                     // (No ocean reseed here: shipped Sailwind never instantiates the legacy FFT Ocean
                     // class. The live Crest wave state is synced by WeatherSyncManager, seeded by the
                     // host's join-time one-shot weather send.)
@@ -1013,6 +1284,10 @@ namespace SailwindCoop
                 // then refuses them exactly when this host runs SE (they could not sync SE anyway).
                 string guestMods = "";
                 try { guestMods = reader.ReadString(); } catch { /* legacy short payload */ }
+                // (v0.2.39) Informational plugin manifest; absent on pre-v0.2.39 guests, which reads as ""
+                // and makes the report a no-op rather than a false "you are missing everything".
+                string guestManifest = "";
+                try { guestManifest = reader.ReadString(); } catch { /* pre-v0.2.39 guest */ }
                 Log.LogInfo($"[VERSION] Handshake from {sender}: version {version} (ours {PluginVersion}), mods [{guestMods}] (ours [{Compat.CompatRegistry.ModSignature}])");
 
                 if (!IsHost) return;
@@ -1034,8 +1309,11 @@ namespace SailwindCoop
                 {
                     string what = !versionMatch
                         ? $"is on mod v{version} (you run v{PluginVersion})"
+                        // weAreTheHost: this message is shown to the HOST about a GUEST, so "you" is the
+                        // local captain and the guest is the one who has to change something. Without the
+                        // flag the wording tells the captain to edit a config that is already correct.
                         : "has a different mod set - " + Compat.CompatRegistry.DescribeMismatch(
-                              Compat.CompatRegistry.ModSignature, guestMods);
+                              Compat.CompatRegistry.ModSignature, guestMods, weAreTheHost: true);
                     string fix = !versionMatch
                         ? $"Everyone must run v{PluginVersion}."
                         : "Everyone must match the host's gameplay mods.";
@@ -1051,7 +1329,26 @@ namespace SailwindCoop
                     w.Write(PluginVersion);
                     w.Write(allow);
                     w.Write(Compat.CompatRegistry.ModSignature); // (v0.2.31, token composed since v0.2.32) trailing field, old guests ignore
+                    w.Write(Compat.ModManifest.Local);           // (v0.2.39) report-only manifest, old guests ignore
                 });
+
+                // (v0.2.39) Report non-gated mod differences to the HOST. Only for a guest we are actually
+                // admitting: a refused guest already got a specific refusal, and burying that under a
+                // cosmetic-mod list would just muddy it. Never affects admission.
+                if (allow)
+                {
+                    var diffs = Compat.ModManifest.DescribeDifferences(guestManifest, Compat.ModManifest.Local, guestName);
+                    if (diffs.Count > 0)
+                    {
+                        // (v0.2.39) LOG ONLY, deliberately no panel. The manifest covers every loaded plugin
+                        // indiscriminately, so on a real install (20+ mods) almost any join produces a diff -
+                        // one different HUD or skybox is enough. Raising a screen-centre panel for that would
+                        // put a box over the horizon on essentially every join, for information the host does
+                        // not need to act on. The panel is reserved for refusals, where the player is stuck.
+                        Compat.ModManifest.LogDifferences(diffs, guestName);
+                        Notify($"{guestName} joined with {diffs.Count} mod difference(s) - see the log.", 6f);
+                    }
+                }
 
                 if (!allow)
                 {
@@ -1070,7 +1367,23 @@ namespace SailwindCoop
                 // (v0.2.31) Tolerant read: a pre-0.2.31 host's ack ends after the bool.
                 string hostMods = "";
                 try { hostMods = reader.ReadString(); } catch { /* pre-0.2.31 host */ }
+                // (v0.2.39) Informational plugin manifest; absent on a pre-v0.2.39 host.
+                string hostManifest = "";
+                try { hostManifest = reader.ReadString(); } catch { /* pre-v0.2.39 host */ }
                 Log.LogInfo($"[VERSION] Handshake response from {sender}: version {version}, mods [{hostMods}], accepted: {accepted}");
+
+                // (v0.2.39) Report non-gated mod differences to the GUEST, when we are being admitted. On a
+                // refusal the block below delivers the actual reason and this would only compete with it.
+                if (!IsHost && accepted)
+                {
+                    var diffs = Compat.ModManifest.DescribeDifferences(hostManifest, Compat.ModManifest.Local, "the host");
+                    if (diffs.Count > 0)
+                    {
+                        // Log only - same reasoning as the host side above.
+                        Compat.ModManifest.LogDifferences(diffs, "the host");
+                        Notify($"You have {diffs.Count} mod difference(s) from the host - see the log.", 6f);
+                    }
+                }
 
                 // (v0.2.27) The host refused us - quit cleanly instead of playing a half-admitted
                 // session (the host has already revoked our admission). (v0.2.31) Name the actual
@@ -1082,6 +1395,20 @@ namespace SailwindCoop
                         : "Mod set mismatch - " + Compat.CompatRegistry.DescribeMismatch(
                               hostMods, Compat.CompatRegistry.ModSignature) +
                           ". Everyone must run the same gameplay mods.";
+
+                    // (v0.2.39) Readable panel alongside the quit notice. Here we DO have the host's manifest
+                    // (it rode the ack), so a refused guest finally learns about non-curated differences too -
+                    // previously this was reported only to players who were being ADMITTED, i.e. exactly the
+                    // people who did not need it.
+                    var lines = new System.Collections.Generic.List<string>();
+                    if (version != PluginVersion)
+                        lines.Add($"Co-op mod version: the host runs v{version}, you run v{PluginVersion}");
+                    else
+                        lines.AddRange(Compat.CompatRegistry.DescribeMismatchLines(hostMods, Compat.CompatRegistry.ModSignature));
+                    lines.AddRange(Compat.ModManifest.DescribeDifferences(hostManifest, Compat.ModManifest.Local, "the host"));
+                    UI.CoopMessagePanel.Show("The host refused your join", lines,
+                        "Match the host's mods and versions, then try again. The full list is in the BepInEx log.");
+
                     EndGuestSessionAndQuit(reason);
                 }
             });
@@ -1516,6 +1843,15 @@ namespace SailwindCoop
                 // hard-snap the guest's boat without the join machinery. The host resends BoatWorldState when
                 // recovery finishes, and its ApplyWorldState clears this flag + teleports us onto the boat.
                 BoatSyncManager.IsJoinInProgress = true;
+                // (v0.2.39) BOUND IT. This gate has no timeout and no coroutine of its own - it is cleared
+                // only when a later BoatWorldState arrives. The host side that must deliver that
+                // (ResendWorldStateAfterRecovery) calls SendBoatWorldState with no try/catch, over a
+                // collector that dereferences Camera.main unguarded, so a single throw there strands this
+                // flag TRUE for the rest of the session. The codebase already documents what that costs:
+                // "ApplyBoatTransform early-returns every frame -> the ashore guest's boat sync is dead for
+                // the session (a permanent desync softlock)". Self-heal after a generous window, mirroring
+                // the ClearRecoveryTextAfter coroutine this handler already starts.
+                Instance?.StartCoroutine(ClearRecoveryGateAfter(45f));
 
                 if (Sleep.instance != null && Sleep.instance.recoveryText != null)
                 {
@@ -1610,6 +1946,19 @@ namespace SailwindCoop
             {
                 var authorId = reader.ReadUInt64();
                 LeopardSyncManager?.OnBellRing(authorId, sender);
+            });
+
+            // (v0.2.39) Avatar appearance. Cosmetic and additive; see PacketType.PlayerAppearance for the
+            // wire shape and the two independent trust guards.
+            NetworkManager.RegisterHandler(PacketType.PlayerAppearance, (sender, reader) =>
+            {
+                Player.AppearanceSync.OnReceived(sender, reader);
+            });
+
+            // (v0.2.39) Who is carrying a mooring rope.
+            NetworkManager.RegisterHandler(PacketType.MooringRopeHeld, (sender, reader) =>
+            {
+                Sync.MooringRopeHoldSync.OnReceived(sender, reader);
             });
 
             // Mission sync packets
@@ -2102,6 +2451,87 @@ namespace SailwindCoop
             // this frame (Camera.main moves in LateUpdate). Doing this in Update lagged the menu one frame, so
             // it bobbed/drifted on screen while the boat moved. Cheap + self-guards on IsOpen.
             SailwindCoop.UI.CoopPauseMenu.LatePin();
+
+            // (v0.2.39) Park remotely-carried mooring ropes on their carriers. LateUpdate so the boat and
+            // the avatar are both placed for this frame - the same ordering the held-item visuals need.
+            Sync.MooringRopeHoldSync.LateUpdate();
+        }
+
+        /// <summary>(v0.2.39) IMGUI surface for our own screens. Draws nothing while they are closed.</summary>
+        private void OnGUI()
+        {
+            try { SailwindCoop.UI.CharacterScreen.Draw(); }
+            catch (System.Exception e) { Log.LogWarning("[Character] Draw failed: " + e.Message); }
+            try { SailwindCoop.UI.FriendsScreen.Draw(); }
+            catch (System.Exception e) { Log.LogWarning("[Friends] Draw failed: " + e.Message); }
+        }
+
+        // --- DEBUG message-panel preview (v0.2.39) ------------------------------------------------------
+        private bool _panelPreviewAutoShown;
+        private float _panelPreviewDueAt = -1f;
+        private KeyCode _panelPreviewKey = KeyCode.F9;
+        private bool _panelPreviewKeyParsed;
+        private bool _panelPreviewFailed;
+
+        /// <summary>
+        /// Drives Debug.PreviewMessagePanel. Wholly inert - not even a key read - unless that bool is on.
+        ///
+        /// The deadline is armed on the first Update rather than in Awake because Awake runs at chainloader
+        /// time, well before the main menu exists; timing it from the first frame of the game loop is what
+        /// makes "8 seconds" land somewhere near the menu instead of somewhere in the splash. Even so the key
+        /// is the dependable route, which is why the delay can be set to 0 and the key left as the only path.
+        /// </summary>
+        private void TickMessagePanelPreview()
+        {
+            try
+            {
+                if (_panelPreviewFailed) return;
+                if (PreviewMessagePanelConfig == null || !PreviewMessagePanelConfig.Value) return;
+
+                if (!_panelPreviewKeyParsed)
+                {
+                    _panelPreviewKeyParsed = true;
+                    var keyName = PreviewMessagePanelKeyConfig?.Value;
+                    if (!string.IsNullOrEmpty(keyName))
+                    {
+                        try { _panelPreviewKey = (KeyCode)System.Enum.Parse(typeof(KeyCode), keyName, true); }
+                        catch
+                        {
+                            Log.LogWarning($"[UI] Debug.PreviewMessagePanelKey '{keyName}' is not a KeyCode name; " +
+                                "falling back to F9.");
+                        }
+                    }
+                    Log.LogInfo($"[UI] Message-panel preview is ON (press {_panelPreviewKey} to re-show; " +
+                        "Debug.PreviewMessagePanel=false turns this off).");
+                }
+
+                float hold = PreviewMessagePanelSecondsConfig != null ? PreviewMessagePanelSecondsConfig.Value : 15f;
+                float startDelay = PreviewMessagePanelStartDelayConfig != null ? PreviewMessagePanelStartDelayConfig.Value : 8f;
+
+                if (!_panelPreviewAutoShown && startDelay > 0f)
+                {
+                    if (_panelPreviewDueAt < 0f) _panelPreviewDueAt = Time.realtimeSinceStartup + startDelay;
+                    if (Time.realtimeSinceStartup >= _panelPreviewDueAt)
+                    {
+                        _panelPreviewAutoShown = true;
+                        UI.PanelPreview.ShowNext(hold);
+                    }
+                }
+
+                if (Input.GetKeyDown(_panelPreviewKey))
+                {
+                    _panelPreviewAutoShown = true; // a manual show also satisfies the one-shot
+                    UI.PanelPreview.ShowNext(hold);
+                }
+            }
+            catch (System.Exception e)
+            {
+                // Stand down for the rest of the process rather than logging every frame. Deliberately a
+                // local flag and NOT a write to the ConfigEntry: BepInEx saves on set, so that would edit
+                // the player's config file behind their back over a transient failure.
+                _panelPreviewFailed = true;
+                Log.LogWarning("[UI] Message-panel preview tick failed, disabling it for this session: " + e.Message);
+            }
         }
 
         private void Update()
@@ -2109,7 +2539,34 @@ namespace SailwindCoop
             // Process command system (works even without Steam)
             CommandProcessor?.Update();
 
+            // (v0.2.39) DEBUG panel preview. ABOVE the Steam gate on purpose: checking that a refusal
+            // message is readable must not require a working Steam init, and the whole block self-gates
+            // on a config that is off by default.
+            TickMessagePanelPreview();
+
+            // (v0.2.39) Report any mod that patched the game and then failed to load. Deliberately a few
+            // seconds in rather than in Awake: the chainloader is still starting plugins at that point, so an
+            // early sweep would accuse every mod that simply had not loaded yet. Also above the Steam gate -
+            // a half-loaded mod is worth reporting whether or not co-op is going to be used at all.
+            if (Time.realtimeSinceStartup > 10f) Compat.BrokenModDetector.RunOnce();
+
+            // (v0.2.39) Character screen. ABOVE the Steam gate deliberately: this screen closes itself the
+            // moment the player leaves a cursor menu, and that watchdog must run even when Steam never
+            // initialised (a state the mod explicitly supports - the pause parchment still replaces vanilla
+            // pause solo). Below the gate, the watchdog and the pause-key handling were both dead code
+            // exactly where a stranded panel would be hardest to escape.
+            SailwindCoop.UI.CharacterScreen.Tick();
+            // Same reasoning for the friends screen: its watchdog is what makes a stranded, cursor-holding
+            // panel impossible, and that has to run whether or not Steam ever came up.
+            SailwindCoop.UI.FriendsScreen.Tick();
+
             if (!_steamInitialized) return;
+
+            // (v0.2.39) Publish/read Steam rich presence: what makes "friends playing now" and asking to
+            // come aboard possible against a lobby that is deliberately invisible. Self-throttling - it
+            // publishes only on change and sweeps only when a screen, a host, or an outstanding request
+            // would actually consume the result.
+            Networking.CoopPresence.Tick();
 
             // Process Steam callbacks
             Profiler?.StartMeasure();
@@ -2245,6 +2702,40 @@ namespace SailwindCoop
             Notify($"{friend.Name} sent no version handshake - they are likely on an older mod build. Everyone should run v{PluginVersion}.", 10f);
         }
 
+        /// <summary>
+        /// (v0.2.39) Watchdog for the recovery-scoped boat-sync gate. If the host's post-recovery
+        /// BoatWorldState never arrives (its send path is unguarded and can throw), clear the gate anyway so
+        /// the guest's boat sync resumes instead of being dead for the session.
+        ///
+        /// REALTIME, and generous: the host's own recovery is several seconds of scaled waits plus a boat
+        /// pass, and a normal resync clears this flag long before the timeout. Only fires on the failure
+        /// path. Fail-OPEN by design - a spurious clear costs one snap, a missed clear costs the session.
+        /// </summary>
+        private static System.Collections.IEnumerator ClearRecoveryGateAfter(float seconds)
+        {
+            yield return new WaitForSecondsRealtime(seconds);
+            if (!BoatSyncManager.IsJoinInProgress) yield break;
+
+            // OWNERSHIP CHECK - do not clear a gate someone is actively using. The same recovery that armed
+            // this timer normally triggers a follow-up world-state APPLY, and that coroutine sets this very
+            // flag for itself. Its own budget legitimately exceeds our timeout (a 2s settle plus a terrain
+            // load explicitly allowed up to 30s, after a host-side recovery that already burned several
+            // seconds), so clearing here would re-enable boat sync mid-teleport - the exact physics fight the
+            // gate exists to prevent. Every wait inside that coroutine is realtime-bounded and its finally
+            // clears the flag on all non-abort exits, so deferring to it cannot reintroduce a permanent latch.
+            if (Sync.BoatStateApplicator.IsApplyInFlight)
+            {
+                Log.LogInfo("[RECOVERY] Gate watchdog stood down: a world-state apply owns the gate and will clear it.");
+                yield break;
+            }
+
+            Log.LogWarning($"[RECOVERY] No post-recovery world state after {seconds:F0}s and no apply in flight; " +
+                "clearing the boat-sync gate so sync resumes (the host's resync appears to have failed).");
+            BoatSyncManager.IsJoinInProgress = false;
+            GameState.recovering = false;
+            BoatSyncManager.Instance?.SnapBoatToLiveTarget();
+        }
+
         private static void EndGuestSessionAndQuit(string reason)
         {
             if (!_joinedAsGuest || _endingGuestSession) return;
@@ -2353,7 +2844,9 @@ namespace SailwindCoop
             PushSyncManager?.ClearState(); // PushSyncManager has no Reset() (see OnLobbyLeft)
             _joinPendingPeers.Clear(); // clear the per-peer join-pending set on hot-reload teardown too
 
-            // Shutdown networking
+            // Shutdown networking. Take our rich-presence keys down FIRST, while Steam is still up:
+            // afterwards there is no client to tell, and friends would be left being told we are sailing.
+            Networking.CoopPresence.Stop();
             NetworkManager?.Shutdown();
             LobbyManager.Shutdown();
 
@@ -2476,6 +2969,9 @@ namespace SailwindCoop
                 // Ghost kit late-join replay: if someone is mid-charting, the joiner missed the
                 // ChartSession start - re-send every active session so the ghost appears.
                 NavigationSyncManager?.ReplayActiveChartSessionsTo(friend.Id.Value);
+                // (v0.2.39) Same late-join problem for avatar appearance: the joiner missed everyone's
+                // PlayerAppearance broadcast, so replay the roster or they see a crew of fallback faces.
+                Player.AppearanceSync.SendRosterTo(friend.Id);
             });
 
             // The join state is out; the guest still won't stream position until its load completes, so

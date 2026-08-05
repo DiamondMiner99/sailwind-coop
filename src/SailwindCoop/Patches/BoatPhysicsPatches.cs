@@ -36,9 +36,68 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(BoatMass), "UpdateMass")]
         public static class BoatMassGuestWeightPatch
         {
+            // (v0.2.39) Set while we have temporarily hidden GameState.currentBoat from vanilla's own
+            // center-of-mass math; see the prefix below.
+            private static Transform _suppressedCurrentBoat;
+
+            /// <summary>
+            /// (v0.2.39) Stop an ASHORE player from wrenching a boat's center of mass halfway to the island.
+            ///
+            /// Vanilla adds the local player's weight at a lever arm of
+            /// <c>Refs.observerMirror.transform.localPosition</c>, guarded by "is GameState.currentBoat one of
+            /// mine". That reads as a boat-LOCAL offset of a few metres, and in vanilla it always is, because
+            /// PlayerDisembark nulls GameState.currentBoat and reparents the observer to the shifting world in
+            /// the same breath. The two facts are one fact.
+            ///
+            /// This mod separates them. A joining crewmate has GameState.currentBoat seated on the shared boat
+            /// unconditionally, so that the join lands them on the right hull even when the host is ashore at
+            /// snapshot time - but the observer is only reparented under the boat when they are actually
+            /// aboard. Stand on the dock and vanilla's guard still passes while localPosition has become a
+            /// position in the shifting world: in one captured session, a lever arm of 379 metres where the
+            /// formula expects single digits. The center of mass then swings metres off the keel and the hull
+            /// librates, which is a boat that will not sit still and cannot be corrected into sitting still.
+            ///
+            /// Rather than reimplement vanilla's mass math, this hides currentBoat for the duration of the
+            /// call when the observer is not in fact parented under this boat - which makes vanilla's own
+            /// guard answer the question it was actually asking. Restored in the postfix, unconditionally.
+            /// </summary>
+            [HarmonyPrefix]
+            public static void Prefix(BoatMass __instance)
+            {
+                _suppressedCurrentBoat = null;
+                try
+                {
+                    var current = GameState.currentBoat;
+                    if (current == null || current.parent != __instance.transform) return;
+
+                    var observer = Refs.observerMirror != null ? Refs.observerMirror.transform : null;
+                    if (observer == null) return;
+
+                    // Aboard means the observer actually hangs off this boat. IsChildOf covers the walkCol
+                    // and boatModel frames alike without caring which one embarking happened to use.
+                    if (observer.IsChildOf(__instance.transform)) return;
+
+                    _suppressedCurrentBoat = current;
+                    GameState.currentBoat = null;
+                }
+                catch (System.Exception e)
+                {
+                    _suppressedCurrentBoat = null;
+                    Plugin.Log.LogWarning("[BoatMass] could not check whether the player is aboard: " + e.Message);
+                }
+            }
+
             [HarmonyPostfix]
             public static void Postfix(BoatMass __instance, Rigidbody ___body, float ___selfMass, float ___leverageMult)
             {
+                // Put it back FIRST and unconditionally - every early return below must not leak the
+                // suppression into the rest of the frame, where currentBoat means "the boat I am on".
+                if (_suppressedCurrentBoat != null)
+                {
+                    GameState.currentBoat = _suppressedCurrentBoat;
+                    _suppressedCurrentBoat = null;
+                }
+
                 // Only run on host in multiplayer
                 if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
 

@@ -641,8 +641,19 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void ResendRopeForCurrentBoat()
         {
+            ResendRopeForBoat(BoatUtility.GetCurrentBoat());
+        }
+
+        /// <summary>
+        /// (v0.2.39) Same re-seed against an EXPLICIT boat, for callers that cannot use GetCurrentBoat().
+        /// The shipyard-exit caller is exactly that case: vanilla DischargeShip nulls GameState.currentBoat in
+        /// the same call that ends shipyard mode, so GetCurrentBoat() is already null by the time the exit
+        /// handler runs and the re-seed it asked for silently did nothing. Andriy's host log shows the
+        /// "re-seeded N rope lengths" line absent for BOTH shipyard visits, confirming it has never once fired.
+        /// </summary>
+        public void ResendRopeForBoat(SaveableObject boat)
+        {
             if (!Plugin.IsHost) return;
-            var boat = BoatUtility.GetCurrentBoat();
             if (boat == null) return;
 
             var boatName = boat.gameObject.name;

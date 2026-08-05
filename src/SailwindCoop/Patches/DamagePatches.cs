@@ -1,3 +1,4 @@
+using Crest;          // BoatProbes - the hull buoyancy component a guest must keep in step with the host
 using HarmonyLib;
 using SailwindCoop.Debug;
 using SailwindCoop.Sync;
@@ -14,19 +15,124 @@ namespace SailwindCoop.Patches
         #region Disable Guest Damage Simulation
 
         /// <summary>
-        /// Disable UpdateWaterAndDrag on guest - host is authoritative for water level.
+        /// The host stays authoritative for how much water is in a hull. A GUEST, however, must still turn
+        /// that number into physics.
+        ///
+        /// (v0.2.39) This patch used to return false and stop, and that was a large hole rather than a small
+        /// one. `UpdateWaterAndDrag` is TWO things bolted together: it integrates waterLevel from leaks,
+        /// rain and bailing, and it then DERIVES the hull's physics from whatever waterLevel now is. It is
+        /// the only place in the entire game that writes `BoatProbes._forceMultiplier` (buoyancy),
+        /// `Rigidbody.drag` and the hull collider's enabled flag at runtime. Skipping the whole method
+        /// therefore did not just stop the guest simulating damage - it froze the guest's copy of the hull
+        /// at whatever buoyancy and drag it happened to have, permanently, however flooded the host's copy
+        /// became. A hull taking on water in a storm gets heavier and draggier on the host and stays buoyant
+        /// and slippery on the guest, so the two float at different heights: the boat rides high or sits
+        /// low depending on which end you are standing on.
+        ///
+        /// The nastier variant is the one that used to survive a restart. `BoatDamage.LoadDamage` pins
+        /// `_forceMultiplier` to 0 for a hull loaded at waterLevel >= 1 (a sunk wreck). A guest's phantom
+        /// save is a copy of their own solo world and is reused on every future join, so once it contained a
+        /// sunk boat, that hull loaded with zero buoyancy and - with this method skipped - NOTHING would
+        /// ever put it back. Not a rejoin, not a new session, not the join snapshot, which sets waterLevel
+        /// and clears `sunk` but never touches buoyancy.
+        ///
+        /// So the guest now runs the DERIVATION half and skips the INTEGRATION half. waterLevel and
+        /// hullDamage keep arriving from the host exactly as before; everything computed from them is
+        /// recomputed locally every frame, which also means a hull that loads wrong heals itself on the
+        /// next frame instead of staying wrong forever.
+        ///
+        /// Deliberately NOT replicated: `CacheItemsOnSinking()` and `sinkRotation`. Items and boat rotation
+        /// are both synced by their own managers, and letting the guest independently decide to cache a
+        /// sinking boat's contents would be a second authority over state that already has one.
+        ///
+        /// KEEP IN STEP WITH VANILLA: the body below is a transcription of the second half of
+        /// BoatDamage.UpdateWaterAndDrag. If that method changes in a game update, this has to change too.
         /// </summary>
         [HarmonyPatch(typeof(BoatDamage), "UpdateWaterAndDrag")]
         public static class BoatDamageUpdateWaterAndDragPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix()
+            public static bool Prefix(BoatDamage __instance)
             {
                 if (Plugin.IsMultiplayer && !Plugin.IsHost)
                 {
-                    return false; // Skip on guest
+                    // Coop.GuestHullPhysics is a kill switch, not a preference: this whole path is
+                    // unreachable without a second machine, so a crew that hits trouble with it needs a way
+                    // out that does not involve waiting for a build. Off = the pre-v0.2.39 behavior exactly.
+                    if (Plugin.GuestHullPhysicsConfig == null || Plugin.GuestHullPhysicsConfig.Value)
+                        ApplyGuestHullPhysics(__instance);
+                    return false; // the host owns the water level itself
                 }
                 return true;
+            }
+        }
+
+        // Private vanilla fields, resolved once. This runs per boat per frame, so a Traverse lookup per call
+        // would be the wrong tool.
+        private static readonly AccessTools.FieldRef<BoatDamage, float> _baseBuoyancy =
+            AccessTools.FieldRefAccess<BoatDamage, float>("baseBuoyancy");
+        private static readonly AccessTools.FieldRef<BoatDamage, BoatProbes> _probes =
+            AccessTools.FieldRefAccess<BoatDamage, BoatProbes>("boat");
+        private static readonly AccessTools.FieldRef<BoatDamage, CapsuleCollider> _hullCol =
+            AccessTools.FieldRefAccess<BoatDamage, CapsuleCollider>("boatCol");
+        private static readonly AccessTools.FieldRef<BoatDamage, Rigidbody> _body =
+            AccessTools.FieldRefAccess<BoatDamage, Rigidbody>("rigidbody");
+
+        /// <summary>
+        /// Turn the host's water level into the same hull physics the host has. Never advances waterLevel -
+        /// that remains the host's to decide. See the patch doc above for why this exists at all.
+        /// </summary>
+        private static void ApplyGuestHullPhysics(BoatDamage d)
+        {
+            try
+            {
+                var body = _body(d);
+                var probes = _probes(d);
+                var col = _hullCol(d);
+                // Start() has not run yet (a boat streamed in this frame). Do NOT fall back to
+                // GetComponent: a null here means vanilla has not captured baseBuoyancy either, so we would
+                // derive against a baseline of zero and pin the hull's buoyancy off. Next frame has it.
+                if (body == null || probes == null) return;
+
+                float baseBuoyancy = _baseBuoyancy(d);
+
+                // Vanilla clamps these before using them, and the values arrive over the wire, so clamp here
+                // too rather than trusting a packet to be in range.
+                if (d.waterLevel > 1f) d.waterLevel = 1f;
+                if (d.waterLevel < 0f) d.waterLevel = 0f;
+                if (d.hullDamage > 1f) d.hullDamage = 1f;
+                if (d.hullDamage < 0f) d.hullDamage = 0f;
+
+                if (d.sunk) body.drag += Time.deltaTime * 6.5f;
+                else body.drag = Mathf.Lerp(0f, d.waterDrag, d.waterLevel);
+                if (body.drag > 10f) body.drag = 10f;
+                if (body.drag < 0f) body.drag = 0f;
+
+                if (!d.sunk)
+                    probes._forceMultiplier = Mathf.Lerp(baseBuoyancy, baseBuoyancy * 0.66f, (d.waterLevel - 0.5f) * 2f);
+
+                if (d.waterLevel >= 1f)
+                {
+                    if (!d.sunk)
+                    {
+                        d.sunk = true;
+                        VerboseLogger.DamageEvent($"Hull '{d.gameObject.name}' is under; deriving sunk physics locally.");
+                    }
+                    probes._forceMultiplier -= Time.deltaTime * baseBuoyancy * 0.33f;
+                    if (probes._forceMultiplier < 0f) probes._forceMultiplier = 0f;
+                    if (col != null) col.enabled = false;
+                }
+                else
+                {
+                    d.sunk = false;
+                    if (col != null) col.enabled = true;
+                }
+            }
+            catch (System.Exception e)
+            {
+                // A hull that cannot derive its physics is a floating-height desync, not a crash. Log it and
+                // leave the hull alone rather than taking the frame down.
+                Plugin.Log.LogWarning("[Damage] could not derive guest hull physics: " + e.Message);
             }
         }
 

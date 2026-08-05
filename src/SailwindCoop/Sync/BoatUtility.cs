@@ -148,7 +148,7 @@ namespace SailwindCoop.Sync
         {
             if (boat == null) return new RopeController[0];
 
-            if (_cachedRopes.TryGetValue(boat, out var ropes))
+            if (_cachedRopes.TryGetValue(boat, out var ropes) && IsRopeCacheUsable(ropes))
             {
                 return ropes;
             }
@@ -158,8 +158,49 @@ namespace SailwindCoop.Sync
             // ropes that map to the same key (should not happen for distinct controllers, but defensive) keep
             // their original relative order rather than reshuffling non-deterministically.
             ropes = raw.Where(r => r != null).OrderBy(GetStableRopeKey, System.StringComparer.Ordinal).ToArray();
-            _cachedRopes[boat] = ropes;
+            // EMPTY-RESULT GUARD, same reasoning as FindAllBoats: an empty scan is "we looked at a bad moment",
+            // never "this boat has no ropes" - every boat has at least the anchor and steering-wheel singletons.
+            // Caching it would make the miss permanent (see IsRopeCacheUsable).
+            if (ropes.Length > 0) _cachedRopes[boat] = ropes;
             return ropes;
+        }
+
+        /// <summary>
+        /// (v0.2.39) A cached rope array is only usable while every controller in it is still ALIVE.
+        ///
+        /// The explicit InvalidateRopeCache calls are necessary but NOT sufficient, because invalidating only
+        /// schedules a re-derive - it does not control WHEN that re-derive happens. A sail rebuild (shipyard
+        /// edit) destroys the old RopeControllers and builds the new ones over the following frames, so any
+        /// GetRopeControllers call that lands inside that window re-caches either the DOOMED set (old
+        /// controllers, Destroy()-marked but not yet reading null) or an EMPTY scan (new hierarchy not active
+        /// yet). ControlSyncManager polls at 10 Hz, so it lands there routinely. Once that bad array is cached
+        /// nothing dislodges it: the invalidate already fired, and ControlSyncManager's own two rebuild
+        /// triggers (rope COUNT change, array IDENTITY change) both compare against the cached array itself,
+        /// so a stable-length cached array is self-confirming.
+        ///
+        /// Field report (Andriy, 2026-07-29 logs): after the HOST used the shipyard, its rope array went dead
+        /// and stayed dead - it broadcast none of its own sail changes and answered every one of the client's
+        /// with "RopeState FAILED: rope not found" - so sails desynced in BOTH directions until relaunch. The
+        /// guest survived the same rebuild only because its receive path happens to re-invalidate a frame later
+        /// (RestoreRopeTrim); the editor's own machine had no such second chance.
+        ///
+        /// Checking liveness on read makes the cache self-healing on every path at once, instead of requiring
+        /// each rebuild trigger to guess the settling frame. Cost is one native alive-check per rope per call
+        /// (~50 at 10 Hz), and it is self-limiting: the re-derived array is filtered non-null, so a healthy
+        /// cache passes and stays cached.
+        ///
+        /// NOTE this deliberately does NOT try to detect DEACTIVATED ropes (SE's jib flip SetActive(false)s a
+        /// RopeEffect). An inactive component is still alive, so it reads non-null here; that case stays the
+        /// job of the explicit InvalidateRopeCache calls on the flip paths.
+        /// </summary>
+        private static bool IsRopeCacheUsable(RopeController[] ropes)
+        {
+            if (ropes == null || ropes.Length == 0) return false;
+            for (int i = 0; i < ropes.Length; i++)
+            {
+                if (ropes[i] == null) return false; // destroyed by a sail rebuild - re-derive
+            }
+            return true;
         }
 
         /// <summary>

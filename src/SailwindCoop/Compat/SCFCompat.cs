@@ -84,6 +84,102 @@ namespace SailwindCoop.Compat
             }
         }
 
+        /// <summary>
+        /// (v0.2.39) Adopt a peer's SCF config for this session. ALL THREE options qualify: each is read
+        /// live at call time inside its Harmony patch body, and their effect points are shipyard sail-install
+        /// checks plus a col-checker OnTriggerEnter postfix - all of which keep running after a join, so a
+        /// runtime change genuinely converges behavior rather than only the token.
+        ///
+        /// Refuses (returns false) if the VERSION differs or either side reports "/cfg?" (unreadable), since
+        /// neither is fixable at runtime.
+        /// </summary>
+        public static bool TryAdoptToken(string desired)
+        {
+            if (!IsInstalled || string.IsNullOrEmpty(desired) || !desired.StartsWith("SCF=")) return false;
+            if (desired.Contains("cfg?") || ModSignature.Contains("cfg?")) return false;
+
+            // Version must already match: "SCF=<ver>/<flags>". Only the flag run is adoptable.
+            int slash = desired.IndexOf('/');
+            if (slash < 0) return false;
+            string desiredVersion = desired.Substring(4, slash - 4);
+            if (desiredVersion != Version) return false;
+
+            var wanted = ConfigAdoption.ParseTaggedFlags(desired.Substring(slash + 1));
+            if (wanted == null) return false;
+
+            try
+            {
+                var mainType = ResolveAssembly()?.GetType("SailCollisionFix.Main");
+                if (mainType == null) return false;
+
+                var entries = new BepInEx.Configuration.ConfigEntry<bool>[ConfigFields.Length];
+                for (int i = 0; i < ConfigFields.Length; i++)
+                {
+                    var f = mainType.GetField(ConfigFields[i], BindingFlags.NonPublic | BindingFlags.Static);
+                    entries[i] = f?.GetValue(null) as BepInEx.Configuration.ConfigEntry<bool>;
+                    if (entries[i] == null) return false; // all-or-nothing, never half-adopt
+                    if (!wanted.ContainsKey(ConfigTags[i])) return false;
+                }
+
+                if (_originalToken == null) _originalToken = ModSignature;
+
+                var changed = new System.Collections.Generic.List<string>();
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    bool want = wanted[ConfigTags[i]];
+                    if (entries[i].Value == want) continue;
+                    ConfigAdoption.SetWithoutSaving(entries[i], want);
+                    changed.Add($"{ConfigFields[i]} {(want ? "on" : "off")}");
+                }
+
+                _configToken = null; // re-derive
+                if (changed.Count > 0)
+                    Plugin.Log.LogInfo($"[SCFCompat] Adopted the host's Sail Collision Fix settings for this session: {string.Join(", ", changed)}");
+                return ModSignature == desired;
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("[SCFCompat] Could not adopt the host's SCF settings: " + e.Message);
+                _configToken = null;
+                return false;
+            }
+        }
+
+        /// <summary>Put the player's own SCF settings back after a co-op session. No-op if nothing adopted.</summary>
+        public static void RestoreLocalToken()
+        {
+            if (_originalToken == null) return;
+            string original = _originalToken;
+            _originalToken = null; // clear FIRST so a throw cannot strand a permanent restore attempt
+
+            try
+            {
+                int slash = original.IndexOf('/');
+                if (slash < 0) return;
+                var wanted = ConfigAdoption.ParseTaggedFlags(original.Substring(slash + 1));
+                var mainType = ResolveAssembly()?.GetType("SailCollisionFix.Main");
+                if (wanted == null || mainType == null) return;
+
+                for (int i = 0; i < ConfigFields.Length; i++)
+                {
+                    var f = mainType.GetField(ConfigFields[i], BindingFlags.NonPublic | BindingFlags.Static);
+                    var entry = f?.GetValue(null) as BepInEx.Configuration.ConfigEntry<bool>;
+                    if (entry != null && wanted.TryGetValue(ConfigTags[i], out bool want) && entry.Value != want)
+                        ConfigAdoption.SetWithoutSaving(entry, want);
+                }
+                _configToken = null;
+                Plugin.Log.LogInfo($"[SCFCompat] Restored your own Sail Collision Fix settings ({original}).");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("[SCFCompat] Could not restore your SCF settings; restart to be sure. " + e.Message);
+                _configToken = null;
+            }
+        }
+
+        /// <summary>The player's own token, captured before the first adopt. Null = nothing adopted.</summary>
+        private static string _originalToken;
+
         private static Assembly ResolveAssembly()
         {
             BepInEx.Bootstrap.Chainloader.PluginInfos.TryGetValue(SCFGuid, out var info);

@@ -96,6 +96,12 @@ namespace SailwindCoop.Sync
         // at most the single guest, so AllCrewInBed == (that one peer in bed) == the old _remotePlayerInBed.
         private readonly HashSet<SteamId> _inBedPeers = new HashSet<SteamId>();
         private string _sharedBoatName;  // moored checks use the SHARED boat, not the local player's current boat
+
+        /// <summary>(v0.2.39) The crew boat's name, as recorded at join. Read by the out-of-world rescue,
+        /// which needs a handle on the ship that outlives GameState.currentBoat - vanilla clears that on the
+        /// disembark that entering the water counts as.</summary>
+        public string SharedBoatName { get { return _sharedBoatName; } }
+
         private float _waitingSince;     // Time.time when the current WAITING state began (for the timeout)
         private const float WaitingTimeout = 90f; // auto-cancel a stuck WAITING handshake after this many seconds
         private float _sleepingSince;    // Time.time when the current SLEEPING state began (host backstop)
@@ -454,7 +460,7 @@ namespace SailwindCoop.Sync
                         if (!rpm.TryGetPeerSilence(peer, out float silence) || silence <= GuestSilenceTimeout)
                             continue;
                         Plugin.Log.LogWarning($"[SLEEP] Crewmate silent {silence:F0}s during {CurrentState}; aborting sleep (frozen/rejoining crewmate)");
-                        ShowNotification("Crewmate unresponsive - sleep cancelled", 3f);
+                        ShowNotification("Crewmate unresponsive - sleep canceled", 3f);
                         // From SLEEPING, SleepCancelled is IGNORED by the crew (it only acts in WAITING),
                         // which would free only us and leave the rest wedged at 16x. Broadcast WakeUp instead
                         // (OnWakeUpReceived handles it in SLEEPING); reserve SleepCancelled for the WAITING case.

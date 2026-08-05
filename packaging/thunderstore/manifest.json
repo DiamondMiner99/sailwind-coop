@@ -1,0 +1,9 @@
+{
+  "name": "SailwindCoop",
+  "version_number": "0.2.39",
+  "website_url": "https://github.com/DiamondMiner99/sailwind-coop",
+  "description": "Sail one ship together. Steam P2P co-op for Sailwind, up to 8 crew.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100"
+  ]
+}

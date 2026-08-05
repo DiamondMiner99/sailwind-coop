@@ -27,8 +27,10 @@ namespace SailwindCoop.Patches
     ///   - OceanRenderer.Instance   (no live Crest ocean = nothing to float on; also guards menus)
     /// LOCAL-ONLY: no wire change - each machine applies (or not) to its own physics; loose-item
     /// positions are host-relayed as usual, so crews mixing this setting just see the host's poses.
-    /// With the config OFF this postfix returns on its first line: zero behavior change by default,
-    /// and the ItemSyncManager settle-terminal tolerance (~1490-1620) is untouched.
+    /// The config defaults ON (Plugin.cs binds true), because the sinking is a current-build REGRESSION
+    /// and floating is what players expect. Setting it OFF makes this postfix return on its first line
+    /// for exact current-build (sinking) behavior. Either way the ItemSyncManager settle-terminal
+    /// tolerance (~1490-1620) is untouched.
     /// </summary>
     [HarmonyPatch(typeof(ItemRigidbody), "ToggleCollider")]
     public static class ItemBuoyancyRestorePatch
@@ -47,7 +49,7 @@ namespace SailwindCoop.Patches
         [HarmonyPostfix]
         public static void Postfix(ItemRigidbody __instance, bool state)
         {
-            // Config gate FIRST: off (default) = this postfix does nothing at all.
+            // Config gate FIRST: opted OUT (the non-default) = this postfix does nothing at all.
             if (Plugin.RestoreItemBuoyancyConfig == null || !Plugin.RestoreItemBuoyancyConfig.Value) return;
 
             // Collider-off calls (inventory/stove/disableCol) keep the vanilla floater-off too.

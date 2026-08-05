@@ -23,6 +23,11 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<string, NPCBoatTarget> _npcBoatTargets = new Dictionary<string, NPCBoatTarget>();
         private readonly HashSet<string> _warnedMissingPaths = new HashSet<string>();
         private bool _cacheInitialized;
+        // (v0.2.39) Throttle for the rebuild-on-miss in FindNPCBoat. Unscaled realtime. 2s is comfortably
+        // shorter than a player would notice a wrong-looking hull, and bounds a genuinely unresolvable path
+        // to one scene scan per 2s instead of one per received packet.
+        private float _lastCacheBuildTime = -999f;
+        private const float CacheRebuildInterval = 2f;
 
         // Host: skip sending an NPC boat state that hasn't meaningfully changed since we last sent it
         // (anchored/docked NPC boats at busy ports otherwise burn 5Hz x N packets for nothing). A
@@ -613,8 +618,22 @@ namespace SailwindCoop.Sync
                 _npcBoatCache.Remove(path);
             }
 
-            // Build cache if not done
-            if (!_cacheInitialized)
+            // (v0.2.39) REBUILD ON MISS, rate-limited - do NOT gate solely on _cacheInitialized.
+            //
+            // Field report (2026-07-29): the host saw a docked NPC ship beside the crew and the guest saw an
+            // empty berth for the whole session. The guest received that boat's state 131 times and applied
+            // it ZERO times. Cause: BuildCache populates from FindObjectsOfType<NPCBoatController>(), which
+            // EXCLUDES GameObjects vanilla has deactivated by distance culling, and _cacheInitialized was set
+            // unconditionally and only ever cleared by Reset() (lobby-leave / teardown). So a boat that was
+            // culled at cache-build time stayed unresolvable for the entire session, and the host's 1 Hz
+            // keepalive resend - which exists PRECISELY so a stationary boat converges - was fully defeated,
+            // because every keepalive hit the same dead cache.
+            //
+            // A miss is now allowed to re-derive, throttled so a genuinely unresolvable path costs at most
+            // one scene scan per interval rather than one per packet. UNSCALED time so a co-op sleep warp
+            // cannot make this fire far more often than intended.
+            float nowRt = Time.unscaledTime;
+            if (!_cacheInitialized || nowRt - _lastCacheBuildTime >= CacheRebuildInterval)
             {
                 BuildCache();
             }
@@ -649,6 +668,11 @@ namespace SailwindCoop.Sync
             }
 
             _cacheInitialized = true;
+            _lastCacheBuildTime = Time.unscaledTime;
+            // A rebuild can resolve paths that previously missed (a distance-culled hull reactivating), so
+            // clear the warn-once latch too - otherwise the log would keep implying a path is unresolvable
+            // long after it started resolving.
+            _warnedMissingPaths.Clear();
             VerboseLogger.NPCBoatApply($"Cache built, count={_npcBoatCache.Count}");
         }
 
@@ -698,6 +722,7 @@ namespace SailwindCoop.Sync
             _lastSentNPCDamage.Clear();
             _lastNPCHitApplied.Clear();
             _cacheInitialized = false;
+            _lastCacheBuildTime = -999f; // next session's first miss rebuilds immediately, not after a delay
             _lastSyncTime = 0f;
         }
     }
