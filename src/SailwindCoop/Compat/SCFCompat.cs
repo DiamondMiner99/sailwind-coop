@@ -85,7 +85,7 @@ namespace SailwindCoop.Compat
         }
 
         /// <summary>
-        /// (v0.2.39) Adopt a peer's SCF config for this session. ALL THREE options qualify: each is read
+        /// (v0.3.0) Adopt a peer's SCF config for this session. ALL THREE options qualify: each is read
         /// live at call time inside its Harmony patch body, and their effect points are shipyard sail-install
         /// checks plus a col-checker OnTriggerEnter postfix - all of which keep running after a join, so a
         /// runtime change genuinely converges behavior rather than only the token.

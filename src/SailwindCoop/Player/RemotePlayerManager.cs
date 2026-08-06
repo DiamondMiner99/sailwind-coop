@@ -49,7 +49,7 @@ namespace SailwindCoop.Player
         private float _animSpeed;
         private Transform _bSpine, _bUpperLegL, _bUpperLegR, _bLowerLegL, _bLowerLegR, _bShoulderL, _bShoulderR, _bElbowL, _bElbowR;
         private Quaternion _qSpine, _qUpperLegL, _qUpperLegR, _qLowerLegL, _qLowerLegR, _qShoulderL, _qShoulderR, _qElbowL, _qElbowR;
-        // (v0.2.39) Foot bind LOCAL rotations. The crouch ankle write is an ABSOLUTE world write, so it must
+        // (v0.3.0) Foot bind LOCAL rotations. The crouch ankle write is an ABSOLUTE world write, so it must
         // reset to these first every frame - otherwise it reads its own previous output and becomes a
         // self-feeding filter that freezes a rotated ankle into the standing pose. See SolveLegIk.
         private Quaternion _qFootL = Quaternion.identity, _qFootR = Quaternion.identity;
@@ -63,9 +63,9 @@ namespace SailwindCoop.Player
         private float _targetCrouch01;
         private Vector3 _bodyBaseLocalPos;
         private bool _hasBodyBase;
-        // (v0.2.39) Standing hip height above the planted ankle, root-local. Feeds the squat setback solve.
+        // (v0.3.0) Standing hip height above the planted ankle, root-local. Feeds the squat setback solve.
         private float _hipAboveFoot;
-        // (v0.2.39) The name tag is a SIBLING of the body, so it does not inherit the crouch drop and used
+        // (v0.3.0) The name tag is a SIBLING of the body, so it does not inherit the crouch drop and used
         // to hang at standing height over a crouched crewmate. Kept in step explicitly.
         private Vector3 _tagBaseLocalPos;
 
@@ -84,7 +84,7 @@ namespace SailwindCoop.Player
         private bool _legIkReady;
         private float _thighLenL, _shinLenL, _thighLenR, _shinLenR;   // bind segment lengths (world)
         private Vector3 _footLocalL, _footLocalR;      // standing ankle in stable-root local space
-        // (v0.2.39) Standing foot ORIENTATION in root space. The IK is 2-bone (hip + knee), so the foot bone
+        // (v0.3.0) Standing foot ORIENTATION in root space. The IK is 2-bone (hip + knee), so the foot bone
         // inherits whatever rotation the shin ends up with; the squat drives the shin ~70-78 deg off vertical,
         // which rotated the soles to near-vertical - the reported "tippy toes". Re-applying this captured
         // orientation after the solve keeps the sole flat to the deck, which is what the ankle does in life.
@@ -101,9 +101,25 @@ namespace SailwindCoop.Player
 
         /// <summary>
         /// The boat this avatar is currently on, or null if on land.
-        /// Used by BoatMass patch to apply guest weight.
+        ///
+        /// CAUTION: this is the boatMODEL child, not the boat root - FindBoatByName resolves through
+        /// BoatRefs and returns refs.boatModel. Comparing it against a root transform (a BoatMass or
+        /// SaveableObject transform, say) is always unequal, which is exactly how the host's remote crew
+        /// weight silently did nothing for every published release. Compare CurrentBoatName instead.
         /// </summary>
         public Transform CurrentBoat => _currentBoat;
+
+        /// <summary>
+        /// (v0.3.0) The last boat-relative position received for this crewmate, straight off the wire and
+        /// untouched: their FEET, in the VISUAL boat (boatModel) frame. That is the same frame and the same
+        /// packet the avatar itself is placed from, so anything deriving physics from where a crewmate is
+        /// standing should use this rather than re-deriving it from the avatar's world transform - the
+        /// avatar has smoothing and a capsule-height offset applied on top.
+        ///
+        /// Add PlayerSyncManager.ControllerFeetGap() to reach the CONTROLLER ORIGIN, which is what vanilla's
+        /// own centre-of-mass maths uses (Refs.observerMirror.transform.localPosition).
+        /// </summary>
+        public Vector3 BoatLocalFeetPosition => _targetBoatRelativePos;
 
         /// <summary>
         /// Root boat NAME the sender last reported ("" = on land / none). This is the sender's
@@ -229,7 +245,7 @@ namespace SailwindCoop.Player
         /// Each avatar instantiates its OWN clone of the manager's shared template.
         /// </summary>
         /// <summary>
-        /// (v0.2.39) Re-dress this avatar in place after their appearance changed.
+        /// (v0.3.0) Re-dress this avatar in place after their appearance changed.
         ///
         /// Deliberately does NOT destroy and rebuild the body. Rebuilding is throttled to ~1.5s, so a
         /// crewmate would VANISH for over a second every time an appearance packet arrived - and since any
@@ -270,7 +286,7 @@ namespace SailwindCoop.Player
                 // receiver places _remotePlayerObject at feet + 0.9 (capsule half-height), so put the
                 // body's feet at local y = -0.9. If the body visibly floats or sinks, adjust this offset.
                 body.transform.localPosition = new Vector3(0f, -0.9f, 0f);
-                // (v0.2.39) Appearance MUST be written while the clone is still INACTIVE. Activating fires
+                // (v0.3.0) Appearance MUST be written while the clone is still INACTIVE. Activating fires
                 // vanilla CharacterCustomizer.Start(), which is the pass that actually rebuilds the mesh
                 // from these fields; applying afterwards is silently ignored. That same rebuild is why
                 // every crew member used to wear the face of whichever shopkeeper loaded first - it was
@@ -349,7 +365,7 @@ namespace SailwindCoop.Player
             if (_bUpperLegR != null) _qUpperLegR = _bUpperLegR.localRotation;
             if (_bLowerLegL != null) _qLowerLegL = _bLowerLegL.localRotation;
             if (_bLowerLegR != null) _qLowerLegR = _bLowerLegR.localRotation;
-            // (v0.2.39) Foot bind LOCAL rotation. Required because the crouch ankle write is an absolute
+            // (v0.3.0) Foot bind LOCAL rotation. Required because the crouch ankle write is an absolute
             // world write: without restoring this first, the write would read its own previous output and
             // behave as a self-feeding filter that never returns to bind. See SolveLegIk.
             if (_bFootL != null) _qFootL = _bFootL.localRotation;
@@ -510,7 +526,7 @@ namespace SailwindCoop.Player
             }
             else if (_legIkReady)
             {
-                // (v0.2.39) STANDING/WALKING: guarantee the ankle is back at bind. The crouch block above is
+                // (v0.3.0) STANDING/WALKING: guarantee the ankle is back at bind. The crouch block above is
                 // gated off below 0.001, and nothing else in this mod ever writes the foot, so without this
                 // the last crouched frame's ankle rotation would persist into the standing and walking pose
                 // for the rest of the session.
@@ -526,7 +542,7 @@ namespace SailwindCoop.Player
         /// bone-&gt;child local aim axis points at the solved target (no reliance on the rig's local axis signs).
         /// </summary>
         /// <summary>
-        /// (v0.2.39) How far back the hips must travel, at a given drop, to lift the thigh to
+        /// (v0.3.0) How far back the hips must travel, at a given drop, to lift the thigh to
         /// CrouchThighLiftDeg above the hip-to-ankle line. MUST stay identical to LocalPlayerBody's copy or
         /// a player's own body squats differently to the one their crewmates see.
         ///
@@ -613,7 +629,7 @@ namespace SailwindCoop.Player
             Vector3 worldAim2 = knee.TransformDirection(shinAimLocal);
             knee.rotation = Quaternion.FromToRotation(worldAim2, wantShin.normalized) * knee.rotation;
 
-            // (v0.2.39) ANKLE ORIENTATION. Everything above solves the ankle's POSITION; nothing solved its
+            // (v0.3.0) ANKLE ORIENTATION. Everything above solves the ankle's POSITION; nothing solved its
             // ROTATION, and the rig chain is UpperLeg -> LowerLeg -> Foot, so the foot rigidly inherited the
             // shin's world rotation. At the default 0.6m crouch drop the shin sits roughly 70-78 deg off
             // vertical, which pitched the soles that far toes-down: the reported "tippy toes".
@@ -926,7 +942,7 @@ namespace SailwindCoop.Player
             // has to agree with them - changing it here alone would move every crewmate's body vertically.
             const float desiredFeetLocalY = -0.9f;
 
-            // (v0.2.39) Plant on the body PIVOT rather than the renderer-bounds minimum. The Synty rig's
+            // (v0.3.0) Plant on the body PIVOT rather than the renderer-bounds minimum. The Synty rig's
             // armature root sits at the soles, but the skinned-mesh bounds box hangs about 0.1m BELOW them,
             // so fitting the bounds lifted every avatar by that padding - this is the float players see, and
             // the old `Body fit: shift=0.10` log line was it announcing itself once per body. Bounds are
@@ -951,8 +967,24 @@ namespace SailwindCoop.Player
             // Report what the OLD bounds-based fit would have done, so the next log shows how much lift the
             // pivot plant removed: that number is the float this fix targets.
             float boundsMinLocalY = root.InverseTransformPoint(new Vector3(wb.center.x, wb.min.y, wb.center.z)).y;
+
+            // (v0.3.0) LATERAL DIAGNOSTIC. A crewmate was reported drawn sideways of where they actually
+            // were, with their held item in the right place - and moored in flat water, which rules out the
+            // heel-dependent frame mismatch that would otherwise explain it (that term is multiplied by
+            // sin(heel) and vanishes at zero). It has not reproduced since, so rather than guess at a fix,
+            // record the numbers that would identify it: the body's own offset inside the root, and where
+            // the skeleton actually sits inside the body. Either being non-zero at a mooring IS the bug;
+            // both zero means the displacement is upstream, in the received position itself.
+            var bodyLp = _bodyInstance.transform.localPosition;
+            string skel = "n/a";
+            if (_bSpine != null)
+            {
+                var spineLocal = root.InverseTransformPoint(_bSpine.position);
+                skel = $"spineRootLocal=({spineLocal.x:F3},{spineLocal.z:F3})";
+            }
             VerboseLogger.PlayerEvent($"Body fit: pivot feet->{feetLocalY:F3}, bodyH={wb.size.y:F3}, " +
-                $"boundsMinBelowPivot={(feetLocalY - boundsMinLocalY):F3} (was the erroneous lift)");
+                $"boundsMinBelowPivot={(feetLocalY - boundsMinLocalY):F3} (was the erroneous lift), " +
+                $"bodyLocalXZ=({bodyLp.x:F3},{bodyLp.z:F3}), {skel}");
         }
 
         /// <summary>
@@ -983,7 +1015,7 @@ namespace SailwindCoop.Player
             bool okR = CaptureOneLeg(root, _bUpperLegR, _bLowerLegR, _bFootR,
                 out _thighLenR, out _shinLenR, out _footLocalR, out _thighAimLocalR, out _shinAimLocalR, out _footRotRootR);
             _legIkReady = okL && okR;
-            // (v0.2.39) Standing hip height over the ankle, root-local; feeds the squat setback solve.
+            // (v0.3.0) Standing hip height over the ankle, root-local; feeds the squat setback solve.
             // MUST match LocalPlayerBody's capture or a player's own body squats differently to the one
             // their crewmates are looking at.
             if (_legIkReady)
@@ -1006,7 +1038,7 @@ namespace SailwindCoop.Player
         {
             Vector3 hp = hip.position, kp = knee.position;
             Vector3 ankle = foot != null ? foot.position : kp + (kp - hp);
-            // (v0.2.39) Standing sole orientation, in ROOT space so it follows the body's FACING. Note the
+            // (v0.3.0) Standing sole orientation, in ROOT space so it follows the body's FACING. Note the
             // root is forced YAW-ONLY every frame (the capsule is kept vertical and never heels), so
             // `root.rotation * footRotRoot` levels the sole to the WORLD horizon, NOT to the deck. That is
             // deliberate and self-consistent with the rest of the avatar, which is world-upright throughout.
@@ -1104,7 +1136,7 @@ namespace SailwindCoop.Player
         }
 
         /// <summary>Get the avatar for a crew member, or null if not spawned.</summary>
-        /// <summary>(v0.2.39) Rebuild one crew member's body so a newly-received appearance shows. No-op if
+        /// <summary>(v0.3.0) Rebuild one crew member's body so a newly-received appearance shows. No-op if
         /// we have no avatar for them yet - their body will simply be built with the new look when it
         /// first appears, which is the same outcome by a shorter route.</summary>
         public void RefreshAppearance(ulong playerId)

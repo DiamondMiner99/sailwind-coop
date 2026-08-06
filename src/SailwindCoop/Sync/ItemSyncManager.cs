@@ -779,7 +779,7 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// (v0.2.39) Remote held-item visuals moved OUT of Update and into LateUpdate.
+        /// (v0.3.0) Remote held-item visuals moved OUT of Update and into LateUpdate.
         ///
         /// UpdateRemoteHeldItemVisuals poses a held item with `boatModel.TransformPoint(state.RelativePos)`,
         /// i.e. against the hull's CURRENT transform, so it should run after anything that can rewrite that
@@ -818,7 +818,7 @@ namespace SailwindCoop.Sync
         {
             public int ItemId;
             // boat-local when on a boat; REAL (origin-independent) when on land - the floating-origin offset
-            // is added per frame at render, never baked in at receive time. (v0.2.39: it used to be baked in,
+            // is added per frame at render, never baked in at receive time. (v0.3.0: it used to be baked in,
             // which tore the item away from its carrier across an origin shift.)
             public Vector3 RelativePos;
             public Quaternion RelativeRot;
@@ -828,7 +828,7 @@ namespace SailwindCoop.Sync
             // (which picks the wrong hull with multiple boats / distant observers).
             public string BoatName;
 
-            // (v0.2.39) SMOOTHED pose, in the SAME space as RelativePos/RelativeRot. The raw target is a
+            // (v0.3.0) SMOOTHED pose, in the SAME space as RelativePos/RelativeRot. The raw target is a
             // 20Hz unreliable sample and used to be hard-snapped to every frame, which stair-steps: vanilla
             // holds an item ~1.15m in front of the camera, so an ordinary mouse-look moves it ~7-18cm per
             // packet. Worse, the avatar BODY is SmoothDamp'ed at 1/15s in LateUpdate while the item was
@@ -847,7 +847,7 @@ namespace SailwindCoop.Sync
             public bool HasSmoothed;
         }
         /// <summary>
-        /// (v0.2.39) Ease a held item's stored pose toward its latest streamed target.
+        /// (v0.3.0) Ease a held item's stored pose toward its latest streamed target.
         ///
         /// SmoothTime is deliberately the SAME 1/15s the remote avatar body uses. That is the entire point:
         /// matching the constant puts item and hand in phase with each other, so the item stops swimming
@@ -908,7 +908,7 @@ namespace SailwindCoop.Sync
                     _heldItemCarrier.Remove(state.ItemId);
             }
 
-            // (v0.2.39) DISCONTINUITY DETECTION, before the fields are overwritten. Smoothing may only ever
+            // (v0.3.0) DISCONTINUITY DETECTION, before the fields are overwritten. Smoothing may only ever
             // run between two poses in the SAME continuous space. Three of the four discontinuity cases are
             // right here (the fourth, a floating-origin shift, cannot desync the smoother because both the
             // stored value and the smoothed value are origin-independent - see the land branch below):
@@ -937,7 +937,7 @@ namespace SailwindCoop.Sync
                 // On land: store the REAL (origin-independent) position and add the CURRENT floating-origin
                 // offset per frame in UpdateRemoteHeldItemVisuals.
                 //
-                // (v0.2.39) This used to bake the offset in HERE, at receive time, and then reuse that world
+                // (v0.3.0) This used to bake the offset in HERE, at receive time, and then reuse that world
                 // value unchanged every frame until the next packet. A floating-origin shift landing between
                 // two 20Hz packets therefore displaced the remote-held item by the whole shift delta for up to
                 // a packet interval, while its CARRIER re-added the current offset every frame

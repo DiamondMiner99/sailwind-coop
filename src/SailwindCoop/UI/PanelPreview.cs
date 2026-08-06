@@ -3,7 +3,7 @@ using System.Collections.Generic;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) DEBUG-ONLY preview of <see cref="CoopMessagePanel"/>.
+    /// (v0.3.0) DEBUG-ONLY preview of <see cref="CoopMessagePanel"/>.
     ///
     /// WHY THIS EXISTS. The panel it previews only ever appears on a FAILED join, which means the only way to
     /// look at it is to arrange two machines whose mod sets deliberately disagree - and then you get about two

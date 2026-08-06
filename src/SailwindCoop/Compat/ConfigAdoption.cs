@@ -5,7 +5,7 @@ using BepInEx.Configuration;
 namespace SailwindCoop.Compat
 {
     /// <summary>
-    /// (v0.2.39) Shared plumbing for the settings reconcile: adopting a peer's config VALUES for the
+    /// (v0.3.0) Shared plumbing for the settings reconcile: adopting a peer's config VALUES for the
     /// duration of a session so a crew running identical mods is not refused over a config line.
     ///
     /// THE RULE EVERY CALLER MUST OBEY. A setting may only be adopted if changing it at runtime actually

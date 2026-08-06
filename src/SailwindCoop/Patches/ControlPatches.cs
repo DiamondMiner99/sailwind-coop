@@ -510,7 +510,7 @@ namespace SailwindCoop.Patches
         // === MOORING PATCHES ===
 
         /// <summary>
-        /// (v0.2.39) Broadcast "I picked up a mooring rope" so crewmates can see who is carrying it.
+        /// (v0.3.0) Broadcast "I picked up a mooring rope" so crewmates can see who is carrying it.
         /// OnPickup is the vanilla hook, and it also unmoors a moored rope - which the existing Unmoor
         /// patch already broadcasts, so the two compose rather than duplicate.
         /// </summary>
@@ -529,22 +529,69 @@ namespace SailwindCoop.Patches
             }
         }
 
-        /// <summary>(v0.2.39) The other half: released, so crewmates stop carrying it on their screens.</summary>
+        /// <summary>
+        /// (v0.3.0) The other half: released, so crewmates stop carrying it on their screens.
+        ///
+        /// NOT SENT DURING A THROW, and that exception is the whole reason this has a body worth reading.
+        /// Clicking a cleat while carrying a rope runs, in ONE frame (vanilla GoPointer.LateUpdate):
+        /// OnItemClick -> ThrowRope -> ThrowRopeTo -> StartCoroutine(ThrowRopeSequence), which sets
+        /// `throwing = true` and disables the collider synchronously, and THEN GoPointer calls OnDrop().
+        /// Vanilla's own OnDrop is a no-op in that state (its guard is `!mooredToSpring && !throwing`), but
+        /// this postfix ran regardless and broadcast "released" immediately. The rope is not moored yet - the
+        /// throw coroutine lerps it to the cleat over a full 0.8 seconds first - so every other machine took
+        /// the release at face value, called ResetRopePos, and snapped the rope back to its parked position
+        /// until the moor packet finally landed. That is the reported half-second where the rope vanishes
+        /// before reappearing on the cleat.
+        ///
+        /// Staying silent here is correct rather than merely quiet: the receivers keep the rope pinned to the
+        /// carrier for the length of the throw, and MooringRopeHoldSync's LateUpdate already drops it from
+        /// the carried set the moment IsMoored() turns true. So the handoff happens with no gap and no stow.
+        /// A throw that MISSES its cleat still releases, because vanilla clears `throwing` at the end of the
+        /// sequence and the rope then goes through the ordinary drop path.
+        /// </summary>
         [HarmonyPatch(typeof(PickupableBoatMooringRope), "OnDrop")]
         public static class MooringRopeDropPatch
         {
+            // `throwing` is private, and it is the only thing that distinguishes "thrown at a cleat" from
+            // "put down", which vanilla's own OnDrop guard already relies on.
+            private static readonly AccessTools.FieldRef<PickupableBoatMooringRope, bool> ThrowingRef =
+                AccessTools.FieldRefAccess<PickupableBoatMooringRope, bool>("throwing");
+
+            /// <summary>
+            /// Read `throwing` BEFORE the body runs, because the body sets it.
+            ///
+            /// Vanilla's OnDrop stows an unmoored rope by starting ThrowRopeSequenceLocal, and that
+            /// coroutine's first statement is `throwing = true` - which StartCoroutine executes
+            /// synchronously. So the flag means "a throw is in flight" on ENTRY and "either a throw is in
+            /// flight OR we just started stowing" on EXIT. Testing it in the postfix therefore saw true for
+            /// every ordinary put-down and suppressed the release for all of them, leaving the rope shown as
+            /// held on every other screen until someone picked it up again.
+            /// </summary>
+            [HarmonyPrefix]
+            public static void Prefix(PickupableBoatMooringRope __instance, out bool __state)
+            {
+                __state = false;
+                try { __state = ThrowingRef(__instance); }
+                catch { /* field moved in a game update: treat as a normal drop, i.e. the old behavior */ }
+            }
+
             [HarmonyPostfix]
-            public static void Postfix(PickupableBoatMooringRope __instance)
+            public static void Postfix(PickupableBoatMooringRope __instance, bool __state)
             {
                 if (!Plugin.IsMultiplayer) return;
                 if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
                     || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+
+                // Already throwing on entry: MooringRopeThrowPatch announced this one and knows WHERE it is
+                // going, so a release here would stow it on every other screen mid-flight.
+                if (__state) return;
+
                 Sync.MooringRopeHoldSync.OnLocalHoldChanged(__instance, false);
             }
         }
 
         /// <summary>
-        /// (v0.2.39) SAFETY, and the reason carrying a rope on a receiver is not simply "move the transform".
+        /// (v0.3.0) SAFETY, and the reason carrying a rope on a receiver is not simply "move the transform".
         ///
         /// Vanilla's OnTriggerEnter moors a rope to any dock cleat it touches while `!held`. On a RECEIVING
         /// machine `held` is always null - the local player is not carrying anything - so a rope pinned to a
@@ -559,7 +606,21 @@ namespace SailwindCoop.Patches
             [HarmonyPrefix]
             public static bool Prefix(PickupableBoatMooringRope __instance)
             {
-                return !Sync.MooringRopeHoldSync.IsRemotelyHeld(__instance);
+                // (v0.3.0) A rope in flight is suppressed for the same reason a carried one is. Vanilla's
+                // own thrower disables the rope's collider for the whole 0.8s throw, so the moor can only
+                // happen at the cleat that was aimed at; the replayed flight on a watching machine has no
+                // such disable, and it starts about a metre below the eye height the thrower aimed from, so
+                // it sweeps a live trigger past bollards the thrower had clearance over. Gating only the
+                // BROADCAST was not enough: when the thrower MISSES, no authoritative packet ever comes to
+                // correct a watcher that moored on the way, so that machine alone ends up with a real
+                // SpringJoint tying the boat to a bollard nobody else knows about.
+                //
+                // This is bounded, unlike copying the collider disable. DriveThrows runs unconditionally
+                // every LateUpdate and retires a flight after 0.8s of wall clock, so nothing here can
+                // outlive its own suppression - which is exactly the property a disabled collider lacks,
+                // and why the collider is still left alone.
+                return !Sync.MooringRopeHoldSync.IsRemotelyHeld(__instance)
+                       && !Sync.MooringRopeHoldSync.IsFlightInProgress(__instance);
             }
         }
 
@@ -588,6 +649,16 @@ namespace SailwindCoop.Patches
 
                 if (isApplying) return;
                 if (wasRecent) return;
+
+                // (v0.3.0) A rope this machine is only WATCHING fly toward a cleat. The replayed flight
+                // keeps a live collider (see MooringRopeHoldSync.IsFlightInProgress for why we do not copy
+                // vanilla's collider disable), so vanilla's trigger moors it here too - earlier than on the
+                // machine that actually threw it, whose collider is off for the full 0.8s. Letting that
+                // through would mean every throw-moor in a session is authored by someone who did not throw
+                // the rope, each receiver broadcasting its own rope length, and with three or more players
+                // no two machines agreeing on the spring's maxDistance. The local moor is left alone; the
+                // thrower's own packet arrives moments later and OnRemoteMooringChanged overwrites it.
+                if (Sync.MooringRopeHoldSync.IsFlightInProgress(__instance)) return;
 
                 var boat = __instance.GetBoatRigidbody()?.GetComponent<SaveableObject>();
                 if (boat == null) return;
@@ -756,6 +827,64 @@ namespace SailwindCoop.Patches
             }
         }
 
+        /// <summary>
+        /// (v0.3.0) Broadcast a rope THROWN at a cleat, with the cleat's position, so the crew watches the
+        /// same flight the thrower does.
+        ///
+        /// Patched here rather than on OnDrop because this is the only place that knows the TARGET. Vanilla
+        /// runs ThrowRopeTo -> ThrowRopeSequence (a 0.8s lerp toward the cleat, which moors nothing on its
+        /// own) and only then calls OnDrop, so a release broadcast from the drop patch describes an outcome
+        /// that has not happened yet.
+        /// </summary>
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "ThrowRopeTo")]
+        public static class MooringRopeThrowPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(PickupableBoatMooringRope __instance, GPButtonDockMooring mooring)
+            {
+                if (!Plugin.IsMultiplayer || mooring == null) return;
+                if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                    || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+                Sync.MooringRopeHoldSync.OnLocalThrow(__instance, mooring.transform.position);
+            }
+        }
+
+        // === MOORING ROPE LENGTH ADJUSTER HELD (v0.3.0) ===
+        // Pressing R on a moored rope hands you a MooringRopeLengthAdjuster with a pull rope running back to
+        // the cleat. The rope's length was already synced (the patch above); this broadcasts the fact that
+        // someone is HOLDING the adjuster, which is what the other crew could not see.
+        //
+        // Patched on OnPickup/OnDrop rather than on the two OnAltActivate entry points, because OnPickup is
+        // the single choke point every grab funnels through - GoPointer.PickUpItem calls it whether the
+        // player used R on the rope, R on the adjuster itself, or the ordinary grab button on a visible
+        // adjuster. Patching the alt-activates would have missed the last of those.
+
+        [HarmonyPatch(typeof(MooringRopeLengthAdjuster), "OnPickup")]
+        public static class MooringAdjusterPickupPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(MooringRopeLengthAdjuster __instance)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                // Suppressed while we are replaying a REMOTE pickup through these same vanilla methods,
+                // which would otherwise bounce straight back out as a local one.
+                if (MooringRopeAdjustSync.IsApplying) return;
+                MooringRopeAdjustSync.OnLocalAdjustChanged(__instance, held: true);
+            }
+        }
+
+        [HarmonyPatch(typeof(MooringRopeLengthAdjuster), "OnDrop")]
+        public static class MooringAdjusterDropPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(MooringRopeLengthAdjuster __instance)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                if (MooringRopeAdjustSync.IsApplying) return;
+                MooringRopeAdjustSync.OnLocalAdjustChanged(__instance, held: false);
+            }
+        }
+
         // === TOW-CLEAT TRIGGER GUARD (v0.2.32) ===
         // Vanilla auto-moors an unheld, displaced rope to ANY GPButtonDockMooring collider it touches
         // (decomp PickupableBoatMooringRope.cs:223-233). Towable Boats makes cleats-on-hulls such
@@ -815,6 +944,24 @@ namespace SailwindCoop.Patches
             private static readonly AccessTools.FieldRef<GPButtonSteeringWheel, float> RotationAngleLimitRef =
                 AccessTools.FieldRefAccess<GPButtonSteeringWheel, float>("rotationAngleLimit");
 
+            /// <summary>(v0.3.0) The wheel this machine's player was steering last frame, so releasing it can
+            /// be detected as a falling edge and answered with one reliable final angle. One wheel, because a
+            /// player can only have hold of one at a time.</summary>
+            private static GPButtonSteeringWheel _wasSteeringWheel;
+
+            /// <summary>(v0.3.0) Whether this machine actually PREDICTED during the grab now ending. Without
+            /// it the falling edge below fires for a grab that never turned the wheel, exporting an angle this
+            /// machine did not produce. See the release-edge comment for what that costs.</summary>
+            private static bool _drovePredictedWheel;
+
+            /// <summary>Clear the per-grab helm edge state. Called from ControlSyncManager.Reset so a wheel
+            /// reference does not survive session end or a world reload.</summary>
+            internal static void ResetHelmEdgeState()
+            {
+                _wasSteeringWheel = null;
+                _drovePredictedWheel = false;
+            }
+
             // Access locked field for helm lock sync
             public static readonly AccessTools.FieldRef<GPButtonSteeringWheel, bool> LockedRef =
                 AccessTools.FieldRefAccess<GPButtonSteeringWheel, bool>("locked");
@@ -844,6 +991,47 @@ namespace SailwindCoop.Patches
                 bool isLocked = LockedRef(__instance);
 
                 bool isSteering = stickyClickedBy != null || isClicked || (rotHandle != null && rotHandle.IsGrabbed());
+
+                // (v0.3.0) LET-GO HANDOFF. HelmInput rides an UNRELIABLE channel, so if the last packet of a
+                // turn is the one that drops, the host finishes holding an angle one input short of ours -
+                // and half a second later SweepStaleHelmLeases sends that slightly-stale value back as a
+                // reliable terminal, which we apply. That is the small correction still visible after the
+                // host stopped integrating deltas: no longer accumulated drift, just the final packet.
+                // One reliable absolute at the moment the wheel is released closes it.
+                //
+                // ONLY IF WE ACTUALLY STEERED. This edge sits outside the isSteering block, outside the
+                // !isLocked gate and outside the "did the input move" gate, so without the latch it also
+                // fires for a bare click on a wheel nobody turned. That is not harmless: while a guest is
+                // grabbing, the prefix skips vanilla's ExtraLateUpdate and OnRemoteHelmChanged drops
+                // non-final HelmState for the grabbed wheel, so currentInput is frozen at whatever the last
+                // non-grabbing frame left it - and on a boat the host is not aboard, that value has been
+                // free-running under the local rudder's centering force. Shipping it made the host's rudder
+                // jump to a passenger's stale local angle, and it also took the helm lease away from
+                // whoever was really steering for up to half a second.
+                if (_wasSteeringWheel != null && _wasSteeringWheel == __instance && !isSteering)
+                {
+                    bool drove = _drovePredictedWheel;
+                    _drovePredictedWheel = false;
+                    _wasSteeringWheel = null;
+                    if (drove)
+                    {
+                        var releasedBoat = __instance.GetComponentInParent<SaveableObject>();
+                        if (releasedBoat != null)
+                        {
+                            ControlSyncManager.Instance?.SendFinalHelmAbsolute(
+                                releasedBoat.gameObject.name, __instance.currentInput);
+                        }
+                    }
+                }
+                if (isSteering)
+                {
+                    // A grab of a DIFFERENT wheel starts clean. Without this, a latch left set by a grab
+                    // that never reached its falling edge (the boat or the wheel was destroyed underneath
+                    // it, so the == test below can no longer match) would carry into the next wheel and
+                    // report an angle that grab never produced.
+                    if (_wasSteeringWheel != __instance) _drovePredictedWheel = false;
+                    _wasSteeringWheel = __instance;
+                }
 
                 if (isSteering)
                 {
@@ -903,18 +1091,24 @@ namespace SailwindCoop.Patches
                             var boat = __instance.GetComponentInParent<SaveableObject>();
                             if (boat != null)
                             {
-                                // Send input to host
-                                ControlSyncManager.Instance?.OnLocalHelmInput(boat.gameObject.name, inputDelta);
-
+                                // (v0.3.0) PREDICT FIRST, THEN SEND. The send used to come before the local
+                                // prediction, which was fine while the packet carried only a delta but is not
+                                // now that it carries the resulting angle - sending first would report the
+                                // angle from BEFORE this frame's turn, so the host would always trail the
+                                // helmsman by one input.
+                                //
                                 // C2: predict locally ONLY if the host hasn't denied us. A guest grabbing a wheel
                                 // another crew member is steering gets a HelmDenied; while denied we must NOT
                                 // predict (OnRemoteHelmChanged drives currentInput from the authoritative state so
-                                // our wheel follows the real rudder), but we still SENT the input above so the host
-                                // can grant us the lease the instant the current holder releases.
+                                // our wheel follows the real rudder), but we still SEND below regardless so the
+                                // host can grant us the lease the instant the current holder releases.
                                 if (ControlSyncManager.Instance?.IsHelmDenied(boat.gameObject.name) != true)
                                 {
                                     // Apply locally for prediction (host will correct via sync)
                                     __instance.currentInput += inputDelta;
+                                    // This grab has now produced an angle of our own, so the release edge
+                                    // above may report it.
+                                    _drovePredictedWheel = true;
 
                                     // Clamp to rotation limits
                                     float rotationAngleLimit = RotationAngleLimitRef(__instance);
@@ -951,6 +1145,14 @@ namespace SailwindCoop.Patches
 
                                     VerboseLogger.ControlLocal($"Guest helm input: delta={inputDelta:F3}, newInput={__instance.currentInput:F1}");
                                 }
+
+                                // Report the angle we ended up at, not the one we started from. While we hold
+                                // the lease the host adopts this outright, so it must be what this machine is
+                                // showing. Sent even while DENIED - the absolute is ignored in that case (our
+                                // wheel is following the host's), but the packet is still what asks for the
+                                // lease when the current holder lets go.
+                                ControlSyncManager.Instance?.OnLocalHelmInput(
+                                    boat.gameObject.name, inputDelta, __instance.currentInput);
                             }
                         }
                     }

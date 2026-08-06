@@ -34,7 +34,7 @@ namespace SailwindCoop.Player
         private bool _rigReady;
         private Transform _bSpine, _bUpperLegL, _bUpperLegR, _bLowerLegL, _bLowerLegR, _bShoulderL, _bShoulderR, _bElbowL, _bElbowR;
         private Quaternion _qSpine, _qUpperLegL, _qUpperLegR, _qLowerLegL, _qLowerLegR, _qShoulderL, _qShoulderR, _qElbowL, _qElbowR;
-        // (v0.2.39) Foot bind LOCAL rotations - see RemoteAvatar.SolveLegIk for why the crouch ankle write
+        // (v0.3.0) Foot bind LOCAL rotations - see RemoteAvatar.SolveLegIk for why the crouch ankle write
         // must reset to these every frame instead of slerping from its own previous output.
         private Quaternion _qFootL = Quaternion.identity, _qFootR = Quaternion.identity;
 
@@ -47,14 +47,14 @@ namespace SailwindCoop.Player
         private float _crouch01;
         private Vector3 _bodyBaseLocalPos;
         private bool _hasBodyBase;
-        // (v0.2.39) Standing hip height above the planted ankle, root-local. Feeds the squat setback solve.
+        // (v0.3.0) Standing hip height above the planted ankle, root-local. Feeds the squat setback solve.
         private float _hipAboveFoot;
-        // (v0.2.39) The name tag is a SIBLING of the body, not a child, so it does not inherit the crouch
+        // (v0.3.0) The name tag is a SIBLING of the body, not a child, so it does not inherit the crouch
         // drop - it used to hang at standing height over a crouched player. Kept in step explicitly.
         private Vector3 _tagBaseLocalPos;
 
         // LOOK-LEAN (local body): the vertical look pitch is eased into a torso pitch on the hips - same math
-        // as the remote avatars. (v0.2.39) The sampling itself now lives in ONE place,
+        // as the remote avatars. (v0.3.0) The sampling itself now lives in ONE place,
         // PlayerSyncManager.SampleHeadLookPitchDeg; the ref-accessor, instance cache and rescan throttle that
         // used to be duplicated here went with it.
         private float _lookPitch;
@@ -66,7 +66,7 @@ namespace SailwindCoop.Player
         private bool _legIkReady;
         private float _thighLenL, _shinLenL, _thighLenR, _shinLenR;
         private Vector3 _footLocalL, _footLocalR;
-        // (v0.2.39) Standing sole orientation in root space - see RemoteAvatar for the full rationale.
+        // (v0.3.0) Standing sole orientation in root space - see RemoteAvatar for the full rationale.
         private Quaternion _footRotRootL = Quaternion.identity, _footRotRootR = Quaternion.identity;
         private Vector3 _thighAimLocalL, _shinAimLocalL, _thighAimLocalR, _shinAimLocalR;
 
@@ -155,7 +155,7 @@ namespace SailwindCoop.Player
             _body.transform.SetParent(_root.transform, false);
             _body.transform.localRotation = Quaternion.identity;
             _body.transform.localPosition = new Vector3(0f, -0.9f, 0f);
-            // (v0.2.39) Appearance MUST be written while the clone is still INACTIVE. Activating is what
+            // (v0.3.0) Appearance MUST be written while the clone is still INACTIVE. Activating is what
             // fires vanilla CharacterCustomizer.Start(), and that is the pass which actually rebuilds the
             // mesh from these fields - applying afterwards would be silently ignored. This is also why
             // every player used to look like the same shopkeeper: that rebuild was overwriting the clone
@@ -186,7 +186,7 @@ namespace SailwindCoop.Player
             VerboseLogger.PlayerEvent("Local third-person body built");
         }
 
-        // (v0.2.39) Single live instance, so the character screen can reach the body without a lookup.
+        // (v0.3.0) Single live instance, so the character screen can reach the body without a lookup.
         private static LocalPlayerBody _instance;
         private void Awake() { _instance = this; }
 
@@ -236,7 +236,7 @@ namespace SailwindCoop.Player
             Bounds wb = _renderers[0].bounds;
             for (int i = 1; i < _renderers.Length; i++) wb.Encapsulate(_renderers[i].bounds);
             if (wb.size.y < 0.5f) return; // bounds not ready yet
-            // (v0.2.39) TWO fixes here, both causes of "I float a few inches above the deck and tables".
+            // (v0.3.0) TWO fixes here, both causes of "I float a few inches above the deck and tables".
             //
             // (1) The drop is now MEASURED, not guessed. This root sits at the vanilla CharacterController
             //     origin, and the distance from there down to the ground is height/2 - center.y - which the
@@ -294,7 +294,7 @@ namespace SailwindCoop.Player
             bool okR = CaptureOneLeg(root, _bUpperLegR, _bLowerLegR, _bFootR,
                 out _thighLenR, out _shinLenR, out _footLocalR, out _thighAimLocalR, out _shinAimLocalR, out _footRotRootR);
             _legIkReady = okL && okR;
-            // (v0.2.39) Standing hip height over the ankle, in root space. The squat setback is solved from
+            // (v0.3.0) Standing hip height over the ankle, in root space. The squat setback is solved from
             // this plus the bone lengths, so the pose comes out the same on any rig proportions.
             if (_legIkReady)
                 _hipAboveFoot = root.InverseTransformPoint(_bUpperLegL.position).y - _footLocalL.y;
@@ -309,7 +309,7 @@ namespace SailwindCoop.Player
         {
             Vector3 hp = hip.position, kp = knee.position;
             Vector3 ankle = foot != null ? foot.position : kp + (kp - hp);
-            // (v0.2.39) See RemoteAvatar.CaptureOneLeg - standing sole orientation in root space.
+            // (v0.3.0) See RemoteAvatar.CaptureOneLeg - standing sole orientation in root space.
             footRotRoot = foot != null ? Quaternion.Inverse(root.rotation) * foot.rotation : Quaternion.identity;
             thighLen = Vector3.Distance(hp, kp);
             shinLen  = Vector3.Distance(kp, ankle);
@@ -322,7 +322,7 @@ namespace SailwindCoop.Player
         }
 
         /// <summary>
-        /// (v0.2.39) How far back the hips must travel, at a given drop, to lift the thigh to
+        /// (v0.3.0) How far back the hips must travel, at a given drop, to lift the thigh to
         /// CrouchThighLiftDeg above the hip-to-ankle line. MUST stay identical to RemoteAvatar's copy.
         ///
         /// WHY A SOLVE AND NOT A CONSTANT. The old crouch dropped the hips straight down over planted feet,
@@ -403,7 +403,7 @@ namespace SailwindCoop.Player
             Vector3 worldAim2 = knee.TransformDirection(shinAimLocal);
             knee.rotation = Quaternion.FromToRotation(worldAim2, wantShin.normalized) * knee.rotation;
 
-            // (v0.2.39) Ankle orientation - keeps the sole flat instead of inheriting the shin's ~70-78 deg
+            // (v0.3.0) Ankle orientation - keeps the sole flat instead of inheriting the shin's ~70-78 deg
             // squat tilt ("tippy toes"). MUST stay identical to RemoteAvatar.SolveLegIk: this body and the
             // networked avatar have to agree on the pose. See that copy for the full rationale.
             if (foot != null)
@@ -434,7 +434,7 @@ namespace SailwindCoop.Player
         }
 
         /// <summary>
-        /// LOOK-LEAN: the local player's clamped vertical look angle in degrees. (v0.2.39) Delegates to the
+        /// LOOK-LEAN: the local player's clamped vertical look angle in degrees. (v0.3.0) Delegates to the
         /// ONE shared sampler, PlayerSyncManager.SampleHeadLookPitchDeg - see there for how the instance is
         /// resolved and why. This was previously a byte-identical copy of that method, refuted rationale
         /// included, which is exactly how the max-abs defect came to exist in two places at once: the

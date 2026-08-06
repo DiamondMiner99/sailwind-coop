@@ -4,7 +4,7 @@ using UnityEngine;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) A private, offscreen "photo studio" that renders the player's character for the
+    /// (v0.3.0) A private, offscreen "photo studio" that renders the player's character for the
     /// character screen: one mannequin, its own camera, its own lights, on their own layer, parked far
     /// below the world and drawn into a RenderTexture.
     ///

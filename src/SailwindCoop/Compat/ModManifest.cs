@@ -6,7 +6,7 @@ using System.Text;
 namespace SailwindCoop.Compat
 {
     /// <summary>
-    /// (v0.2.39) INFORMATIONAL inventory of every BepInEx plugin loaded on this machine, exchanged in the
+    /// (v0.3.0) INFORMATIONAL inventory of every BepInEx plugin loaded on this machine, exchanged in the
     /// P2P handshake so a crew can SEE which mods differ.
     ///
     /// This is deliberately NOT a gate and must never become one. CompatRegistry.ModSignature is the gate:
@@ -185,7 +185,7 @@ namespace SailwindCoop.Compat
         }
 
         /// <summary>
-        /// Write the full difference set to the log. (v0.2.39) The on-screen half moved to
+        /// Write the full difference set to the log. (v0.3.0) The on-screen half moved to
         /// UI.CoopMessagePanel: this used to build a 3-line summary for the vanilla notification ticker,
         /// which clipped rather than wrapped and made a list of mod names unreadable - the whole reason the
         /// panel exists. The panel takes the full list, so nothing needs capping for display any more.

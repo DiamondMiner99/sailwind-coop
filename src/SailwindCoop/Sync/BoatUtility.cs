@@ -166,7 +166,7 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// (v0.2.39) A cached rope array is only usable while every controller in it is still ALIVE.
+        /// (v0.3.0) A cached rope array is only usable while every controller in it is still ALIVE.
         ///
         /// The explicit InvalidateRopeCache calls are necessary but NOT sufficient, because invalidating only
         /// schedules a re-derive - it does not control WHEN that re-derive happens. A sail rebuild (shipyard

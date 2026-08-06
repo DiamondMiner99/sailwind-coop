@@ -6,7 +6,7 @@ using SailwindCoop.Networking;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) "Friends playing now" - who else is at sea, and the two things you can do about it:
+    /// (v0.3.0) "Friends playing now" - who else is at sea, and the two things you can do about it:
     /// ask to come aboard, or let someone aboard.
     ///
     /// WHY THIS EXISTS RATHER THAN THE STEAM OVERLAY. The host's Invite button used to call
@@ -28,11 +28,16 @@ namespace SailwindCoop.UI
     public static class FriendsScreen
     {
         private static bool _open;
+        /// <summary>Whether this screen was opened from the PAUSE menu (and so should put it back on close),
+        /// rather than from the title menu, where there is nothing behind us to restore.</summary>
+        private static bool _reopenPauseOnClose;
         private static Vector2 _scroll;
         private static bool _stylesBuilt;
         private static GUIStyle _panel, _title, _label, _small, _button, _band, _name;
         private static Texture2D _panelTex, _titleTex, _bandTex;
         private static int _keyConsumedFrame = -1;
+        /// <summary>Title-menu buttons we switched off while this screen covers them. See SuppressMenuButtons.</summary>
+        private static readonly List<GoPointerButton> _suppressed = new List<GoPointerButton>();
 
         public static bool IsOpen { get { return _open; } }
 
@@ -51,7 +56,11 @@ namespace SailwindCoop.UI
                 }
                 _scroll = Vector2.zero;
                 _open = true;
+                // (v0.3.0) Remember whether we are covering the PAUSE parchment, so closing restores only
+                // what was actually there. See ForceClose.
+                _reopenPauseOnClose = CoopPauseMenu.IsOpen;
                 CoopPauseMenu.Hide();
+                SuppressMenuButtons();
                 // The presence sweep skips its work when nothing would read it, and this screen opening is
                 // precisely that "something" - so ask for a fresh one now rather than showing a list up to
                 // one heartbeat out of date.
@@ -60,12 +69,72 @@ namespace SailwindCoop.UI
             catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Open failed: " + e.Message); }
         }
 
+        /// <summary>
+        /// (v0.3.0) Restores the pause parchment ONLY if this screen was covering it.
+        ///
+        /// This used to reopen it whenever GameState.inCursorMenu was true, which was a sound proxy for
+        /// "the player came from the pause menu" for exactly as long as the pause menu was the only way in.
+        /// The title menu is also a cursor menu, so once a Friends button appeared there, closing this
+        /// screen drew the in-game pause parchment on top of the main menu - two menus at once, neither of
+        /// which the player asked for.
+        /// </summary>
         public static void ForceClose()
         {
             if (!_open) return;
             _open = false;
-            try { if (GameState.inCursorMenu) CoopPauseMenu.Reopen(); }
+            bool restore = _reopenPauseOnClose;
+            _reopenPauseOnClose = false;
+            RestoreMenuButtons();
+            try { if (restore && GameState.inCursorMenu) CoopPauseMenu.Reopen(); }
             catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Could not restore the pause menu: " + e.Message); }
+        }
+
+        /// <summary>
+        /// (v0.3.0) Switch off the world-space menu buttons underneath this screen.
+        ///
+        /// An IMGUI window is drawn, not raycast. MouseButtonPointer.FixedUpdate keeps casting the mouse at
+        /// layer 5 for as long as GameState.inCursorMenu is true, and inCursorMenu is exactly the condition
+        /// this screen requires to open, so nothing about drawing a panel over the parchment stops a click
+        /// from reaching what is behind it. Vanilla's only suppressor is GoPointerButton.unclickable.
+        ///
+        /// From the pause menu, hiding the co-op panel was enough, because that panel IS the parchment there.
+        /// The title menu is a different situation: CoopPauseMenu.Hide() is a no-op, and vanilla's own
+        /// 'start UI' stays live behind us. A click on a friend row landing over Continue starts loading the
+        /// player's solo save behind a Friends panel that is still drawn; over Quit Game it opens the confirm
+        /// prompt; over New Game it tears the title menu down.
+        ///
+        /// Only buttons that are ACTIVE AND ALREADY CLICKABLE are recorded, so restoring is unambiguously
+        /// "put these back to clickable" - vanilla suppresses these itself during menu animations, and a
+        /// blanket restore would fight that. We stay off the GameObject's active state entirely: vanilla
+        /// FadeStartMenu owns it, and TitleJoinManager.HideStartUI deliberately deactivates it during a join.
+        /// </summary>
+        private static void SuppressMenuButtons()
+        {
+            if (_suppressed.Count > 0) return; // already covering something; don't double-record
+            try
+            {
+                var sm = Object.FindObjectOfType<StartMenu>();
+                if (sm == null) return;
+                foreach (var b in sm.GetComponentsInChildren<GoPointerButton>(false))
+                {
+                    if (b == null || b.unclickable) continue;
+                    b.unclickable = true;
+                    _suppressed.Add(b);
+                }
+            }
+            catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Could not suppress the menu underneath: " + e.Message); }
+        }
+
+        private static void RestoreMenuButtons()
+        {
+            if (_suppressed.Count == 0) return;
+            try
+            {
+                for (int i = 0; i < _suppressed.Count; i++)
+                    if (_suppressed[i] != null) _suppressed[i].unclickable = false;
+            }
+            catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Could not restore the menu underneath: " + e.Message); }
+            finally { _suppressed.Clear(); }
         }
 
         /// <summary>Drive from Plugin.Update. Cheap no-op while closed.</summary>
@@ -161,7 +230,7 @@ namespace SailwindCoop.UI
         {
             if (Plugin.IsHost) return "Only you can let anyone aboard.";
             if (Plugin.IsMultiplayer) return "The captain decides who comes aboard.";
-            return "Co-op sessions are invite-only - asking is how you get one.";
+            return "Co-op sessions are invite-only.";
         }
 
         // --- sections ------------------------------------------------------------------------------------
@@ -178,6 +247,18 @@ namespace SailwindCoop.UI
             if (GUILayout.Button("Join " + invite.SenderName, _button, GUILayout.Width(220f)))
             {
                 ForceClose();
+                // Unpause before joining. ForceClose puts the pause parchment back, which leaves the world
+                // frozen, and a join that starts at timeScale 0 never finishes - see CoopPauseMenu.Resume.
+                //
+                // ONLY IN-GAME, and this is not a tidy-up. ResumeGame routes to vanilla SettingsToGame, which
+                // is the UNPAUSE path and assumes a pause happened: it writes `Time.timeScale =
+                // unpausedTimescale`, a field assigned nowhere but GameToSettings. At the title menu that
+                // pause never happened, so the field is still its default 0 - and SettingsToGame also calls
+                // DisableStartMenu. Accepting from the title screen therefore froze the game and hid the
+                // menu, then TitleJoinManager's LoadGame parked forever on the first scaled WaitForSeconds
+                // inside LoadGameAnimation, which sits before GameState.playing is ever set. The player was
+                // left on a dead menu until the 45s "Load timed out".
+                if (GameState.playing) CoopPauseMenu.ResumeGame();
                 if (Plugin.EnsureCoopReady()) lm.AcceptPendingInvite();
             }
             if (GUILayout.Button("Not now", _button, GUILayout.Width(120f))) lm.DeclinePendingInvite();

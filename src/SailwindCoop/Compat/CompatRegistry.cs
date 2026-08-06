@@ -68,7 +68,7 @@ namespace SailwindCoop.Compat
         }
 
         /// <summary>
-        /// (v0.2.39) The same diff as DescribeMismatch but kept as SEPARATE LINES, for the readable message
+        /// (v0.3.0) The same diff as DescribeMismatch but kept as SEPARATE LINES, for the readable message
         /// panel. The joined single-string form is still what the log and the notification ticker use; a
         /// semicolon-joined paragraph is precisely what made the on-screen refusal unreadable.
         /// </summary>
@@ -91,14 +91,18 @@ namespace SailwindCoop.Compat
                 // Name the actual OPTIONS that differ. "host [NT=b1s0w1f1v1d0] vs you [NT=b0s0w1f1v1d0]" is
                 // unreadable to a player and gives them nothing to act on. Only reachable when the reconcile
                 // could not fix it.
-                else if (k == "NT") diffs.Add($"{name}: {NANDTweaksCompat.DescribeVectorDiff(h, o)}");
+                // (v0.3.0) NAND Tweaks gets ONE LINE PER SETTING. It is the only entry here that can
+                // contribute five differing options at once, and joining them made a single bullet that
+                // read as a paragraph and swamped the one-line entries around it. Each returned line names
+                // the mod itself, so they still read correctly on their own.
+                else if (k == "NT") diffs.AddRange(NANDTweaksCompat.DescribeVectorDiffLines(h, o));
                 else diffs.Add($"{name}: {DescribeSegmentDiff(k, h, o, weAreTheHost)}");
             }
             return diffs;
         }
 
         /// <summary>
-        /// (v0.2.39) Say what actually differs about one mod, in the player's own vocabulary.
+        /// (v0.3.0) Say what actually differs about one mod, in the player's own vocabulary.
         ///
         /// This used to print the two raw segments side by side: "host [SE=0.10.0/topsailPatch1/addSails1]
         /// vs you [SE=0.10.0/topsailPatch0/addSails1]". Two 34-character strings differing in one character,
@@ -260,7 +264,7 @@ namespace SailwindCoop.Compat
         private static string Show(string v) { return string.IsNullOrEmpty(v) ? "(none)" : v; }
 
         /// <summary>
-        /// (v0.2.39) Try to make THIS machine's token equal the host's by adopting the host's SETTINGS, so a
+        /// (v0.3.0) Try to make THIS machine's token equal the host's by adopting the host's SETTINGS, so a
         /// crew running identical mods is not refused over a single config line.
         ///
         /// Only differences that are purely config-valued AND applicable at runtime can be reconciled. Today

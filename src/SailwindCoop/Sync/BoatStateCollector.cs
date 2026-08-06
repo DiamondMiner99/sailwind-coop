@@ -22,7 +22,7 @@ namespace SailwindCoop.Sync
             var boats = BoatUtility.FindAllBoats();
             var boatDataList = new List<NetworkBoatData>();
 
-            // (v0.2.39) PER-BOAT ISOLATION, host side. This loop had no guard, so ONE boat that threw
+            // (v0.3.0) PER-BOAT ISOLATION, host side. This loop had no guard, so ONE boat that threw
             // while being read took down the ENTIRE join snapshot - observed in a live host log as
             // "[JOIN] Join-state step 'BoatWorldState' FAILED", triggered by a Shipyard Expansion
             // null-reference (SailScalePatch.LoadPatch -> Sail.GetScaleZ) on the third boat in the world.
@@ -70,6 +70,15 @@ namespace SailwindCoop.Sync
                     hostPosition = visualBoat.transform.InverseTransformPoint(bodyTransform.position);
                     // FLOAT-ON-BOAT fix: drop controller-origin -> feet (must match PlayerSyncManager's
                     // 20Hz send exactly, or the avatar pops vertically on the first packet after join).
+                    hostPosition.y -= PlayerSyncManager.ControllerFeetGap();
+                }
+                else if (Refs.charController != null)
+                {
+                    // (v0.3.0) Was camera minus a constant 1.7m eye height. Crouch in this game moves ONLY
+                    // the camera rig, so that sent a crouching host's feet ~0.95m below the deck. Sourced
+                    // from the controller to match PlayerSyncManager's send exactly - the two must agree or
+                    // the avatar pops vertically on the first packet after the join snapshot.
+                    hostPosition = visualBoat.transform.InverseTransformPoint(Refs.charController.transform.position);
                     hostPosition.y -= PlayerSyncManager.ControllerFeetGap();
                 }
                 else

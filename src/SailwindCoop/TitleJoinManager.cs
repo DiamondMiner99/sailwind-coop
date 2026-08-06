@@ -70,6 +70,25 @@ namespace SailwindCoop
                 float t0 = Time.realtimeSinceStartup;
                 while (Anims(sm) > 0 && Time.realtimeSinceStartup - t0 < 10f) yield return null;
 
+                // (v0.3.0) NEVER START THIS LOAD FROZEN. LoadGameAnimation's first two waits are
+                // `WaitForSeconds` - scaled - and both sit BEFORE it sets GameState.playing, so at
+                // timeScale 0 the coroutine parks on the first one and never comes back. Vanilla's own
+                // animsPlaying counter is incremented by LoadGame and only decremented at the end of that
+                // animation, and StartMenu.ButtonClick early-returns while it is above zero - so a frozen
+                // load does not merely stall, it kills every button on the menu behind it. The player is
+                // left staring at a dead title screen until the timeout below finally speaks.
+                //
+                // Three separate paths reached this frozen in v0.3.0 (a guest joining from the pause menu,
+                // a host opening a session there, and accepting an invite from the title friends list), so
+                // the guard belongs HERE, at the one place they all funnel through, rather than only at each
+                // caller.
+                if (Time.timeScale <= 0f)
+                {
+                    Plugin.Log.LogWarning("[TitleJoin] timeScale was 0 at load time - restoring it, or the load would park forever.");
+                    Time.timeScale = 1f;
+                    Physics.autoSyncTransforms = true;
+                }
+
                 // Run the full vanilla load coroutine (blackout, deserialize, enable controllers, set playing).
                 // Guard the deserialize: a single corrupt saveable in the guest's phantom must not abort the
                 // whole load (that left GameState.playing false -> our wait below timed out -> never joined).
@@ -81,9 +100,38 @@ namespace SailwindCoop
                 while (!GameState.playing && Time.realtimeSinceStartup - t0 < 45f) yield return null;
                 if (!GameState.playing)
                 {
-                    Plugin.Notify("Load timed out - load the save manually, then accept the invite.", 7f);
+                    // (v0.3.0) HAND THE MENU BACK. Bailing out alone left the player with nothing to click:
+                    // vanilla's LoadGame incremented animsPlaying and only LoadGameAnimation decrements it,
+                    // and StartMenu.ButtonClick early-returns while it is above zero - so a load that never
+                    // finished silently disabled every button on the title screen. Reported as "I think my
+                    // game is stuck, I can't interact with the menu at all", which it was.
+                    Plugin.Log.LogError("[TitleJoin] Phantom load did not reach GameState.playing within 45s - restoring the title menu.");
+                    try
+                    {
+                        Traverse.Create(sm).Field("animsPlaying").SetValue(0);
+                        Traverse.Create(sm).Method("EnableStartMenu").GetValue();
+                    }
+                    catch (System.Exception e) { Plugin.Log.LogWarning("[TitleJoin] could not restore the title menu: " + e.Message); }
+                    // Drop the phantom context too, or the next thing this player saves goes to slot 99.
+                    try { CoopSave.ClearContext(); } catch { }
+
+                    UI.CoopMessagePanel.Show("Could not load your world",
+                        new System.Collections.Generic.List<string>
+                        {
+                            "The co-op world did not finish loading, so the join was abandoned.",
+                        },
+                        "Load a save from the menu, then accept the invite again.");
                     yield break;
                 }
+
+                // (v0.3.0) The world is now on screen, and the join does not reach JoinLobby for another
+                // couple of seconds: the F-gate spin below, then a deliberate 1.5s settle. Raising the join
+                // screen only at JoinLobby therefore left the player looking at their own freshly loaded
+                // world for that whole stretch before anything acknowledged the join, which is exactly the
+                // "I still saw my world load first" report. Begin is idempotent, so JoinLobby's own call
+                // further down is a harmless no-op after this one. Everything between here and JoinLobby is
+                // guarded and non-throwing, so this cannot raise a blackout that never comes down.
+                UI.JoinProgressScreen.Begin();
 
                 // FRESH PHANTOM: a brand-new phantom was seeded from a solo save, which carries that
                 // save's hunger/sleep state. Reset to a clean rested/fed baseline so the guest's first

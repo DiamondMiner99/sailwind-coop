@@ -36,12 +36,12 @@ namespace SailwindCoop.Patches
         [HarmonyPatch(typeof(BoatMass), "UpdateMass")]
         public static class BoatMassGuestWeightPatch
         {
-            // (v0.2.39) Set while we have temporarily hidden GameState.currentBoat from vanilla's own
+            // (v0.3.0) Set while we have temporarily hidden GameState.currentBoat from vanilla's own
             // center-of-mass math; see the prefix below.
             private static Transform _suppressedCurrentBoat;
 
             /// <summary>
-            /// (v0.2.39) Stop an ASHORE player from wrenching a boat's center of mass halfway to the island.
+            /// (v0.3.0) Stop an ASHORE player from wrenching a boat's center of mass halfway to the island.
             ///
             /// Vanilla adds the local player's weight at a lever arm of
             /// <c>Refs.observerMirror.transform.localPosition</c>, guarded by "is GameState.currentBoat one of
@@ -104,16 +104,20 @@ namespace SailwindCoop.Patches
                 var remoteManager = RemotePlayerManager.Instance;
                 if (remoteManager == null || !remoteManager.HasRemotePlayer) return;
 
-                // Skip crew weight while moored: a moored boat is held to the dock by a SpringJoint whose
-                // stiffness is mass*6 (vanilla PickupableBoatMooringRope.MoorTo). Adding +160 per remote crew
-                // inflates that spring enough that driving a still-moored boat heels the deck under the
-                // waterline and WaveSplashZone.Overflow floods it with zero hull damage. While docked the boat
-                // is held by the springs anyway, so the trim/center-of-mass contribution is cosmetic; crew
-                // weight resumes the instant they cast off.
-                // (Also skips while ANCHORED - AnyRopeMoored() is true when the anchor is set too; the anchor's
-                // joint holds the boat, so the crew COM is likewise cosmetic there.)
-                var moorRopes = __instance.GetComponentInParent<BoatMooringRopes>();
-                if (moorRopes?.ropes != null && moorRopes.AnyRopeMoored()) return;
+                // (v0.3.0) Crew weight used to be skipped entirely while moored OR anchored, so a crewmate
+                // walking a docked deck moved nothing. The hazard it was guarding against is real but far
+                // narrower than the guard: a mooring spring's stiffness is `boatRigidbody.mass * 6`, and
+                // extra crew mass in that figure stiffens it enough that driving a still-moored boat heels
+                // the deck under the waterline, where WaveSplashZone.Overflow floods it with no hull damage.
+                //
+                // But vanilla reads that mass ONCE, inside MoorTo, and never recomputes it while the boat
+                // stays tied up. So the exposure is a single frame, and the answer is to suppress the crew
+                // contribution for that frame (see MooringSpringCrewMassPatch below) rather than for the
+                // whole time the boat is at a dock.
+                //
+                // The anchored half of the old guard had no justification at all: AnyRopeMoored() also
+                // returns true for a set anchor, but nothing in the anchor derives a joint stiffness from
+                // boat mass. Anchored crew weight was suppressed purely by association.
 
                 // Per-crew weight (kg). Vanilla uses 160 for every person (host included); this is configurable
                 // and lower by default so a crowd on one side of a small boat doesn't pile up enough heel to
@@ -122,15 +126,42 @@ namespace SailwindCoop.Patches
                 if (crewWeight <= 0f) return;
 
                 // Add weight for each remote crew member currently on this boat.
+                //
+                // (v0.3.0) THIS LOOP NEVER RAN. It filtered on `avatar.CurrentBoat != __instance.transform`,
+                // and those are two different objects: BoatMass sits on the boat ROOT (vanilla's own guard is
+                // `GameState.currentBoat.parent == base.transform`), while CurrentBoat comes from
+                // FindBoatByName, which resolves through BoatRefs and deliberately returns the boatMODEL
+                // CHILD. The comparison was always unequal, every crewmate hit `continue`, and the host added
+                // exactly zero crew mass. That is why a guest leaning on the rail heeled the boat on their own
+                // screen and did nothing on the host's, which is the authoritative one. Dead in every
+                // published release, not a v0.3.0 regression.
+                //
+                // Identity now comes from the reported NAME - the sender takes it from GameState.lastBoat, the
+                // root SaveableObject name, which is the key BoatUtility is keyed by and is unambiguous about
+                // which node of the hierarchy it means.
                 foreach (var avatar in remoteManager.Avatars)
                 {
-                    if (avatar.CurrentBoat != __instance.transform) continue;
+                    // A crewmate still loading has no meaningful position yet, and one that has gone quiet may
+                    // have dropped without us noticing. Either would trim the boat from a stale spot.
+                    if (avatar == null || !avatar.HasStreamed) continue;
+                    if (Time.unscaledTime - avatar.LastRemotePacketTime > StaleCrewSeconds) continue;
 
-                    var capsule = avatar.GetRemoteCapsule();
-                    if (capsule == null) continue;
+                    var boatName = avatar.CurrentBoatName;
+                    if (string.IsNullOrEmpty(boatName)) continue;                 // ashore, no contribution
+                    if (boatName != __instance.gameObject.name) continue;         // standing on some other hull
 
-                    // Convert world position to boat-local
-                    Vector3 guestLocalPos = __instance.transform.InverseTransformPoint(capsule.position);
+                    // Lever arm from the WIRE, not from the avatar's world transform. The packet is already
+                    // boatModel-local, which is the frame vanilla's centre-of-mass maths works in
+                    // (Refs.observerMirror.transform.localPosition). Re-deriving it from the avatar would pick
+                    // up the position smoothing and capsule-height offset applied on receive, and the old line
+                    // inverse-transformed through the ROOT - a second frame error hiding behind the first.
+                    Vector3 deckLocal = avatar.BoatLocalFeetPosition;
+                    // The wire carries FEET; vanilla's lever arm is the controller origin.
+                    deckLocal.y += Sync.PlayerSyncManager.ControllerFeetGap();
+
+                    // Reject anything that cannot be a place to stand on this boat. One bad packet here moves
+                    // the centre of mass of a whole ship, so it is worth being strict.
+                    if (!IsFinite(deckLocal) || deckLocal.magnitude > MaxCrewLeverMeters) continue;
 
                     // Add guest mass
                     ___body.mass += crewWeight;
@@ -138,9 +169,110 @@ namespace SailwindCoop.Patches
                     // Center-of-mass offset (same formula as the host player in BoatMass.UpdateMass) - scales
                     // with the weight, so lowering crewWeight also lightens the heel this crew member induces.
                     float ratio = crewWeight / ___selfMass;
-                    Vector3 offset = Quaternion.Euler(0f, -90f, 0f) * guestLocalPos * ratio * ___leverageMult;
+                    Vector3 offset = Quaternion.Euler(0f, -90f, 0f) * deckLocal * ratio * ___leverageMult;
                     ___body.centerOfMass += offset;
                 }
+            }
+
+            /// <summary>Seconds of silence after which a crewmate stops contributing trim. They may have
+            /// dropped without a clean disconnect, and a boat held in a heel by a player who is gone reads as
+            /// a physics bug with no visible cause.</summary>
+            private const float StaleCrewSeconds = 5f;
+
+            /// <summary>Furthest a crewmate can be from the boat origin and still be standing on it. Larger
+            /// than any hull in the game, so it rejects only genuinely broken values.</summary>
+            private const float MaxCrewLeverMeters = 100f;
+
+            /// <summary>float.IsFinite is .NET Core only; this target is net472.</summary>
+            internal static bool IsFinite(Vector3 v)
+            {
+                return !float.IsNaN(v.x) && !float.IsInfinity(v.x)
+                    && !float.IsNaN(v.y) && !float.IsInfinity(v.y)
+                    && !float.IsNaN(v.z) && !float.IsInfinity(v.z);
+            }
+
+            /// <summary>
+            /// (v0.3.0) Total remote crew mass currently standing on the named boat root. Uses the same
+            /// eligibility rules as the mass loop above, so the two cannot drift apart.
+            /// </summary>
+            internal static float RemoteCrewMassOn(string boatRootName)
+            {
+                if (string.IsNullOrEmpty(boatRootName)) return 0f;
+                if (!Plugin.IsMultiplayer || !Plugin.IsHost) return 0f;
+
+                var remoteManager = RemotePlayerManager.Instance;
+                if (remoteManager == null || !remoteManager.HasRemotePlayer) return 0f;
+
+                float crewWeight = Plugin.CrewMemberWeightConfig != null ? Plugin.CrewMemberWeightConfig.Value : 90f;
+                if (crewWeight <= 0f) return 0f;
+
+                float total = 0f;
+                foreach (var avatar in remoteManager.Avatars)
+                {
+                    if (avatar == null || !avatar.HasStreamed) continue;
+                    if (Time.unscaledTime - avatar.LastRemotePacketTime > StaleCrewSeconds) continue;
+                    if (avatar.CurrentBoatName != boatRootName) continue;
+                    total += crewWeight;
+                }
+                return total;
+            }
+        }
+
+        /// <summary>
+        /// (v0.3.0) Keep remote crew weight out of a mooring spring's stiffness, so crew weight can apply
+        /// while a boat is tied up instead of being switched off for the whole time it is at a dock.
+        ///
+        /// Vanilla sets `mooring.spring.spring = boatRigidbody.mass * 6` inside MoorTo, and never revisits
+        /// it while the boat stays moored. With crew mass folded into that one reading, the spring comes out
+        /// stiff enough that driving a still-moored boat heels the deck under the waterline, where
+        /// WaveSplashZone.Overflow floods the hull with no damage to explain it. That is a real hazard, but
+        /// it lives in a single frame, so the whole-time suppression it used to justify was far too broad -
+        /// it is why a crewmate walking a docked deck moved nothing at all.
+        ///
+        /// Subtracting the crew here gives the spring the stiffness vanilla would have computed for the hull
+        /// alone. The value is restored immediately, and BoatMass.UpdateMass rewrites body.mass from scratch
+        /// on the next FixedUpdate regardless, so nothing downstream sees the dip.
+        /// </summary>
+        [HarmonyPatch(typeof(PickupableBoatMooringRope), "MoorTo")]
+        public static class MooringSpringCrewMassPatch
+        {
+            [HarmonyPrefix]
+            public static void Prefix(PickupableBoatMooringRope __instance, out float __state)
+            {
+                __state = 0f;
+                if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+                try
+                {
+                    var body = __instance.GetBoatRigidbody();
+                    if (body == null) return;
+                    var saveable = body.GetComponent<SaveableObject>();
+                    if (saveable == null) return;
+
+                    float crewMass = BoatMassGuestWeightPatch.RemoteCrewMassOn(saveable.gameObject.name);
+                    // Never drive the mass to zero or negative - a spring of stiffness 0 would not hold the
+                    // boat to the dock at all, which is a far worse failure than a slightly stiff one.
+                    if (crewMass <= 0f || crewMass >= body.mass) return;
+
+                    body.mass -= crewMass;
+                    __state = crewMass;
+                }
+                catch (System.Exception e)
+                {
+                    __state = 0f;
+                    Plugin.Log.LogWarning("[BoatMass] Could not exclude crew mass from a mooring spring: " + e.Message);
+                }
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix(PickupableBoatMooringRope __instance, float __state)
+            {
+                if (__state <= 0f) return;
+                try
+                {
+                    var body = __instance.GetBoatRigidbody();
+                    if (body != null) body.mass += __state;
+                }
+                catch { /* UpdateMass rewrites body.mass next FixedUpdate anyway */ }
             }
         }
 

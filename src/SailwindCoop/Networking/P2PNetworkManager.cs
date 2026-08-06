@@ -21,6 +21,16 @@ namespace SailwindCoop.Networking
         private readonly HashSet<SteamId> _connectedPeers;
         private readonly byte[] _receiveBuffer;
 
+        // (v0.3.0) Peers we have refused but whose refusal packet may still be sitting in Steam's send
+        // queue. CloseP2PSessionWithUser discards everything queued for that peer, and the host closes a
+        // session from three places once admission is gone (the per-packet backstop, the session-request
+        // gate, and RemovePeer). The v0.3.0 playtest hit all of them in the same frame as the send: the
+        // host logged REFUSED and tore the session down, so the guest never received a HandshakeAck. It
+        // fell through to the generic 45s join watchdog, which blamed Steam friendship for what was a mod
+        // refusal. A peer named here still has every packet DROPPED - admission is already revoked, so
+        // nothing reaches the sync managers - but its session is left open until the refusal has flushed.
+        private readonly HashSet<SteamId> _refusalGrace = new HashSet<SteamId>();
+
         public event Action<SteamId> OnConnected;
         public event Action<SteamId> OnDisconnected;
 
@@ -380,7 +390,11 @@ namespace SailwindCoop.Networking
             // already key off the host/star topology.
             if (Plugin.IsHost && !(SteamLobbyManager.Instance?.IsAdmitted(sender) ?? false))
             {
-                SteamNetworking.CloseP2PSessionWithUser(sender);
+                // (v0.3.0) A peer inside its refusal grace still gets dropped here, but we must not close
+                // the session: a refused guest keeps streaming position packets, so this path fires within
+                // a frame or two of the refusal and would discard the refusal packet itself.
+                if (!_refusalGrace.Contains(sender))
+                    SteamNetworking.CloseP2PSessionWithUser(sender);
                 float now = UnityEngine.Time.realtimeSinceStartup;
                 if (now - _lastUnadmittedDropLogRealtime > 5f)
                 {
@@ -487,6 +501,21 @@ namespace SailwindCoop.Networking
             return _connectedPeers.Contains(peerId);
         }
 
+        /// (v0.3.0) Mark a refused peer's session as "do not close yet" so the refusal packet we just
+        /// queued can leave the machine. Admission should already be revoked before this is called: the
+        /// grace suppresses only the session teardown, never the packet drop.
+        public void BeginRefusalGrace(SteamId peerId)
+        {
+            _refusalGrace.Add(peerId);
+        }
+
+        /// (v0.3.0) End the grace and close the session for good. Safe to call for a peer that was never
+        /// in the grace set.
+        public void EndRefusalGrace(SteamId peerId)
+        {
+            _refusalGrace.Remove(peerId);
+        }
+
         private void OnP2PSessionRequest(SteamId requester)
         {
             // (v0.2.25) HOST ADMISSION at the TRANSPORT layer. The old comment here said "the lobby
@@ -499,6 +528,14 @@ namespace SailwindCoop.Networking
             // star-topology branch below already ignores non-host requesters for peering.
             if (Plugin.IsHost && !(SteamLobbyManager.Instance?.IsAdmitted(requester) ?? false))
             {
+                // (v0.3.0) Same reasoning as the per-packet backstop: leave a refused peer's session
+                // alone until its refusal has flushed. We do not accept the new request either, so no
+                // traffic starts flowing; the existing session simply survives long enough to drain.
+                if (_refusalGrace.Contains(requester))
+                {
+                    Plugin.Log.LogInfo($"Holding the session with {requester} open while their refusal is delivered");
+                    return;
+                }
                 SteamNetworking.CloseP2PSessionWithUser(requester);
                 Plugin.Log.LogWarning($"REFUSED P2P session from {requester}: not admitted by the host's admission gate (session closed, packets will be dropped)");
                 return;

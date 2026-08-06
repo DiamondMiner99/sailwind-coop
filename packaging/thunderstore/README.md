@@ -30,7 +30,7 @@ The plugins folder is on none of those lists. Every Steam call then failed with 
 players described was "co-op only works if I launch through Steam" - they were really falling back to
 a separate game-root install that had the file.
 
-As of v0.2.39 the mod loads `steam_api64.dll` by absolute path from beside its own assembly, so it
+As of v0.3.0 the mod loads `steam_api64.dll` by absolute path from beside its own assembly, so it
 works from a plugins folder. A copy next to `Sailwind.exe` still wins if one is there, so ordinary
 installs are unchanged.
 

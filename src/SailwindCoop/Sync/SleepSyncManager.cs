@@ -97,7 +97,7 @@ namespace SailwindCoop.Sync
         private readonly HashSet<SteamId> _inBedPeers = new HashSet<SteamId>();
         private string _sharedBoatName;  // moored checks use the SHARED boat, not the local player's current boat
 
-        /// <summary>(v0.2.39) The crew boat's name, as recorded at join. Read by the out-of-world rescue,
+        /// <summary>(v0.3.0) The crew boat's name, as recorded at join. Read by the out-of-world rescue,
         /// which needs a handle on the ship that outlives GameState.currentBoat - vanilla clears that on the
         /// disembark that entering the water counts as.</summary>
         public string SharedBoatName { get { return _sharedBoatName; } }

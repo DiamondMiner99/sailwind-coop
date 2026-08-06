@@ -5,7 +5,7 @@ using Steamworks;
 namespace SailwindCoop.Networking
 {
     /// <summary>
-    /// (v0.2.39) Steam rich presence: how a co-op crew finds each other when the lobby itself is invisible.
+    /// (v0.3.0) Steam rich presence: how a co-op crew finds each other when the lobby itself is invisible.
     ///
     /// THE PROBLEM THIS SOLVES. The lobby is <c>SetPrivate()</c> - deliberately, after a 2026-07-02 report of
     /// a stranger boarding through a friends-only lobby (a friend of a GUEST, unknown to the host, clicked
@@ -149,6 +149,24 @@ namespace SailwindCoop.Networking
         // the permanent seen-invite de-dupe.
         private static ulong _recentAskLobby;
         private static float _recentAskUntil;
+
+        /// <summary>
+        /// (v0.3.0) True when a friend is advertising RIGHT NOW that they are sailing in this lobby - i.e.
+        /// the lobby is LIVE, not one Steam is still re-offering after it died.
+        ///
+        /// The invite de-dupe cannot tell those apart by itself, because a lobby id is just a lobby id. A
+        /// host who leaves their session open across a guest's relaunch keeps the SAME id, so the guest's
+        /// re-delivered invite was indistinguishable from a stale one and got suppressed - no toast, nothing
+        /// in the friends list, and a Steam "accept" that launched the game and then did nothing. Presence
+        /// is the evidence that was missing.
+        /// </summary>
+        public static bool IsLobbyLive(ulong lobbyId)
+        {
+            if (lobbyId == 0UL) return false;
+            for (int i = 0; i < _friends.Count; i++)
+                if (_friends[i] != null && _friends[i].LobbyId == lobbyId) return true;
+            return false;
+        }
 
         /// <summary>True if an invite to this lobby is plausibly the answer to a request we made.</summary>
         public static bool AnswersOurRecentAsk(ulong lobbyId)

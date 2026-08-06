@@ -4,7 +4,7 @@ using System.IO;
 namespace SailwindCoop.Networking
 {
     /// <summary>
-    /// (v0.2.39) Why co-op could not start, said in a class that can still load when it could not.
+    /// (v0.3.0) Why co-op could not start, said in a class that can still load when it could not.
     ///
     /// THE BUG THIS EXISTS TO FIX. This explanation used to live on SteamLobbyManager, which declares
     /// <c>private Lobby? _currentLobby</c> - a value-type field, so Mono has to resolve

@@ -98,7 +98,7 @@ namespace SailwindCoop.Compat
         ///
         /// Both are labelled "(requires a restart)" in SE's own config description, but that label is only
         /// literally true for ONE of them, and the difference matters if this token is ever widened into a
-        /// reconcile (v0.2.39 audit):
+        /// reconcile (v0.3.0 audit):
         ///   addSails      GENUINELY restart-only. Its single read site is a Postfix on PrefabsDirectory.Start
         ///                 that constructs sail prefabs into PrefabsDirectory.sails[156..158]. A plain Unity
         ///                 Start on a MonoBehaviour, so it cannot re-run for that instance. A peer that
@@ -148,7 +148,7 @@ namespace SailwindCoop.Compat
             {
                 if (!IsInstalled) return "";
                 if (!_reflectionOk) return "SE=" + Version + "/noSync";
-                // (v0.2.39) Advertise BUNDLE HEALTH, not just the version. A guest whose SE asset bundles
+                // (v0.3.0) Advertise BUNDLE HEALTH, not just the version. A guest whose SE asset bundles
                 // failed to load ("ShipyardExpansion: Asset bundle missing!" / "Unable to open archive
                 // file: shipyard_expansion.assets") still reports the same version as a healthy host, so
                 // the gate passed them - and then the join wrecked every boat they owned. Vanilla's
@@ -161,7 +161,7 @@ namespace SailwindCoop.Compat
             }
         }
 
-        /// <summary>(v0.2.39) Whether SE's asset bundles loaded. Defaults TRUE and is only cleared on
+        /// <summary>(v0.3.0) Whether SE's asset bundles loaded. Defaults TRUE and is only cleared on
         /// positive evidence of failure - see the read in Init for why this fails open.</summary>
         public static bool BundlesLoaded { get; private set; } = true;
 
@@ -173,7 +173,7 @@ namespace SailwindCoop.Compat
         private static string _originalRigContract;
 
         /// <summary>
-        /// (v0.2.39) Adopt a peer's SE rig contract for this session. ONLY `topsailPatch` is adoptable, and
+        /// (v0.3.0) Adopt a peer's SE rig contract for this session. ONLY `topsailPatch` is adoptable, and
         /// the asymmetry is load-bearing:
         ///
         ///   topsailPatch  ADOPTABLE. Read live, per call, in a Postfix on Mast.TopsailCheckAndAttach, which
@@ -343,7 +343,7 @@ namespace SailwindCoop.Compat
                 _loadSailConfig = sdm != null ? sdm.GetMethod("LoadSailConfig", BindingFlags.Public | BindingFlags.Static) : null;
                 _reflectionOk = _saveSailConfig != null && _loadSailConfig != null;
 
-                // (v0.2.39) Are SE's asset bundles actually loaded? An install whose .assets files are
+                // (v0.3.0) Are SE's asset bundles actually loaded? An install whose .assets files are
                 // missing still reports its version normally, so the gate saw two identical SE versions and
                 // let the join through - after which the guest's smaller part list made vanilla's
                 // customization LoadData throw mid-way, leaving every boat stripped of sails and winches.

@@ -8,7 +8,7 @@ using UnityEngine;
 namespace SailwindCoop.Player
 {
     /// <summary>
-    /// (v0.2.39) Per-player avatar appearance, built on the Synty POLYGON modular character system that
+    /// (v0.3.0) Per-player avatar appearance, built on the Synty POLYGON modular character system that
     /// Sailwind already ships.
     ///
     /// WHY THIS IS EVEN POSSIBLE. Every shopkeeper NPC in the game is a "Modular NPC" carrying a LIVE
@@ -256,7 +256,14 @@ namespace SailwindCoop.Player
         private static bool IsWearable(GameObject go)
         {
             if (go == null) return false;
-            return go.GetComponent<SkinnedMeshRenderer>() != null;
+            var smr = go.GetComponent<SkinnedMeshRenderer>();
+            if (smr == null) return false;
+            // (v0.3.0) A renderer is not the same thing as something to look at. One head entry carries a
+            // SkinnedMeshRenderer with no geometry behind it, so it counted as a choice and gave the player
+            // an invisible head at 23 of 23. Requiring actual vertices drops it and leaves 22 real heads,
+            // and does so by what the entry IS rather than by hardcoding an index that would drift the
+            // moment the game shipped a different part list.
+            return smr.sharedMesh != null && smr.sharedMesh.vertexCount > 0;
         }
 
         /// <summary>
@@ -442,7 +449,7 @@ namespace SailwindCoop.Player
     }
 
     /// <summary>
-    /// (v0.2.39) Who looks like what, keyed by SteamId. The single source of truth for appearance on this
+    /// (v0.3.0) Who looks like what, keyed by SteamId. The single source of truth for appearance on this
     /// machine: the network layer writes into it, the avatar builders read from it.
     ///
     /// It is deliberately a REGISTRY rather than a field on the avatar, because the two events - "we learned
@@ -492,7 +499,7 @@ namespace SailwindCoop.Player
     }
 
     /// <summary>
-    /// (v0.2.39) Wire layer for <see cref="CoopAppearance"/> - packet 220.
+    /// (v0.3.0) Wire layer for <see cref="CoopAppearance"/> - packet 220.
     ///
     /// SHAPE: authorId (u64), slotCount (byte), slotCount variant bytes. Author-keyed rather than
     /// sender-keyed because the host RELAYS other players' appearances, so "who sent this" and "who this

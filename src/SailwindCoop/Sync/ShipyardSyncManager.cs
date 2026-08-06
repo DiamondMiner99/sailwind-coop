@@ -466,7 +466,7 @@ namespace SailwindCoop.Sync
             // every current rope length so crew whose sails were rebuilt to defaults by LoadData converge
             // immediately instead of waiting for the next host winch movement.
             //
-            // (v0.2.39) Use `edited`, NOT GetCurrentBoat(). This block asked for the boat the same way the SE
+            // (v0.3.0) Use `edited`, NOT GetCurrentBoat(). This block asked for the boat the same way the SE
             // block above deliberately does not: DischargeShip nulls GameState.currentBoat in the very call
             // that ends shipyard mode - the reason `edited` was memorised at entry in the first place - so
             // GetCurrentBoat() here was ALWAYS null and both the invalidate and the re-seed were dead code.
@@ -480,7 +480,7 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// (v0.2.39) Post-shipyard rope re-seed, one frame after the exit so the sail rebuild has settled.
+        /// (v0.3.0) Post-shipyard rope re-seed, one frame after the exit so the sail rebuild has settled.
         /// Invalidates on every machine (the editor's own rope array is the one a rebuild strands); only the
         /// host broadcasts, since only the host's trim is authoritative.
         /// </summary>

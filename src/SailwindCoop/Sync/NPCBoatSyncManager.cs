@@ -23,7 +23,7 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<string, NPCBoatTarget> _npcBoatTargets = new Dictionary<string, NPCBoatTarget>();
         private readonly HashSet<string> _warnedMissingPaths = new HashSet<string>();
         private bool _cacheInitialized;
-        // (v0.2.39) Throttle for the rebuild-on-miss in FindNPCBoat. Unscaled realtime. 2s is comfortably
+        // (v0.3.0) Throttle for the rebuild-on-miss in FindNPCBoat. Unscaled realtime. 2s is comfortably
         // shorter than a player would notice a wrong-looking hull, and bounds a genuinely unresolvable path
         // to one scene scan per 2s instead of one per received packet.
         private float _lastCacheBuildTime = -999f;
@@ -618,7 +618,7 @@ namespace SailwindCoop.Sync
                 _npcBoatCache.Remove(path);
             }
 
-            // (v0.2.39) REBUILD ON MISS, rate-limited - do NOT gate solely on _cacheInitialized.
+            // (v0.3.0) REBUILD ON MISS, rate-limited - do NOT gate solely on _cacheInitialized.
             //
             // Field report (2026-07-29): the host saw a docked NPC ship beside the crew and the guest saw an
             // empty berth for the whole session. The guest received that boat's state 131 times and applied

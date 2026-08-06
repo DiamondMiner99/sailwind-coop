@@ -645,7 +645,7 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// (v0.2.39) Same re-seed against an EXPLICIT boat, for callers that cannot use GetCurrentBoat().
+        /// (v0.3.0) Same re-seed against an EXPLICIT boat, for callers that cannot use GetCurrentBoat().
         /// The shipyard-exit caller is exactly that case: vanilla DischargeShip nulls GameState.currentBoat in
         /// the same call that ends shipyard mode, so GetCurrentBoat() is already null by the time the exit
         /// handler runs and the re-seed it asked for silently did nothing. Andriy's host log shows the
@@ -746,25 +746,61 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// Guest sends helm input delta to host
+        /// Guest sends its helm input to the host.
+        ///
+        /// (v0.3.0) Reports the ABSOLUTE resulting wheel angle as well as the delta, and is called AFTER
+        /// the local prediction has run so the absolute is the angle this machine is actually showing. While
+        /// this guest holds the helm lease the host adopts that number outright, which is what makes the
+        /// person steering authoritative over their own wheel.
         /// </summary>
-        public void OnLocalHelmInput(string boatName, float inputDelta)
+        public void OnLocalHelmInput(string boatName, float inputDelta, float absolute)
         {
             if (!Plugin.IsMultiplayer) return;
             // Only guest sends input to host
             if (Plugin.IsHost) return;
 
-            VerboseLogger.ControlSend($"HelmInput, boat={boatName}, delta={inputDelta:F3}");
+            VerboseLogger.ControlSend($"HelmInput, boat={boatName}, delta={inputDelta:F3}, abs={absolute:F3}");
 
             var packet = new HelmInputPacket
             {
                 BoatName = boatName,
-                InputDelta = inputDelta
+                InputDelta = inputDelta,
+                Absolute = absolute
             };
 
             // Send unreliable for low latency (high frequency input)
             Plugin.NetworkManager.SendToAllUnreliable(PacketType.HelmInput, w =>
                 PacketSerializer.WriteHelmInput(w, packet));
+        }
+
+        /// <summary>
+        /// (v0.3.0) Guest: one RELIABLE final angle at the moment the wheel is let go.
+        ///
+        /// The steering stream is unreliable, which is right for something sent every frame - but it means
+        /// the LAST packet of a turn is as droppable as any other, and that one matters. If it is lost the
+        /// host settles one input short of where the helmsman actually stopped, and half a second later
+        /// SweepStaleHelmLeases sends that slightly-stale angle back as a reliable terminal, which the guest
+        /// applies. Adopting the helmsman's absolute removed the accumulated drift; this removes what was
+        /// left, which is exactly one dropped packet's worth.
+        ///
+        /// Sent with a zero delta: nothing integrates it any more, and a phantom delta would be wrong for
+        /// any peer that still did.
+        /// </summary>
+        public void SendFinalHelmAbsolute(string boatName, float absolute)
+        {
+            if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
+            if (Plugin.NetworkManager == null || string.IsNullOrEmpty(boatName)) return;
+            if (float.IsNaN(absolute) || float.IsInfinity(absolute)) return;
+
+            VerboseLogger.ControlSend($"HelmInput FINAL (wheel released), boat={boatName}, abs={absolute:F3}");
+
+            Plugin.NetworkManager.SendToAllReliable(PacketType.HelmInput, w =>
+                PacketSerializer.WriteHelmInput(w, new HelmInputPacket
+                {
+                    BoatName = boatName,
+                    InputDelta = 0f,
+                    Absolute = absolute
+                }));
         }
 
         // === Helm single-controller lease ===
@@ -975,10 +1011,27 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            VerboseLogger.ControlRecv($"HelmInput, boat={packet.BoatName}, delta={packet.InputDelta:F3}, from={sender}");
+            VerboseLogger.ControlRecv($"HelmInput, boat={packet.BoatName}, delta={packet.InputDelta:F3}, abs={packet.Absolute:F3}, from={sender}");
 
-            // Apply the input delta
-            wheel.currentInput += packet.InputDelta;
+            // (v0.3.0) THE HELMSMAN OWNS THEIR OWN WHEEL. The host used to integrate the deltas
+            // (`currentInput += InputDelta`) and therefore held its own opinion of the angle, arrived at by a
+            // different route from the guest's local prediction. Deltas ride an UNRELIABLE channel, so the two
+            // drifted apart on every dropped packet, and 0.5s after the guest stopped turning,
+            // SweepStaleHelmLeases sent a reliable terminal carrying the HOST's number - which the guest
+            // applies unconditionally. That is the snap that made steering feel clunky: not a correction
+            // while you steer, but a jolt half a second after you stop.
+            //
+            // Adopting the helmsman's absolute removes both halves at once. There is no second opinion to
+            // drift from, and the terminal the sweep later sends is the guest's own value coming back, so it
+            // lands as a no-op. A dropped packet now costs one stale frame instead of permanent divergence,
+            // because the next absolute is self-correcting where a missed delta was lost forever.
+            //
+            // Authority is unchanged: the wheel angle is an INPUT to the boat's physics, which the host still
+            // runs and still streams. Only the origin of this one scalar moves.
+            if (!float.IsNaN(packet.Absolute) && !float.IsInfinity(packet.Absolute))
+                wheel.currentInput = packet.Absolute;
+            else
+                wheel.currentInput += packet.InputDelta; // pre-v0.3.0 sender, or a truncated packet
 
             // Apply rotation limit (same logic as game)
             float rotationAngleLimit = RotationAngleLimitRef(wheel);
@@ -1816,6 +1869,10 @@ namespace SailwindCoop.Sync
             _helmLeaseLastInput.Clear();
             _helmDeniedUntil.Clear();
             _lastHelmDeniedSent.Clear();
+            // (v0.3.0) The guest steering patch holds a wheel reference and a "did we actually steer this
+            // grab" latch across frames. Both are per-grab state and neither should outlive the session or a
+            // world reload.
+            Patches.ControlPatches.SteeringWheelGuestPatch.ResetHelmEdgeState();
             _recentNetworkMooringChanges.Clear(); // per-session map; stale rope-instanceId keys must not
                                                   // bleed into the next session.
             _mooringTerminals.Clear();            // drop any pending debounced mooring terminals

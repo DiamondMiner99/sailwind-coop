@@ -50,7 +50,7 @@ namespace SailwindCoop.Sync
                 // dead for the session (a permanent desync softlock, worse than the yank BS2 removed). Drop it
                 // here (recovery-scoped). The continuous BoatTransform sync the comment relies on is exactly what
                 // this gate disables, so the self-heal is impossible without this clear.
-                // (v0.2.39) Only take ownership of these flags when nothing else holds them. A join apply
+                // (v0.3.0) Only take ownership of these flags when nothing else holds them. A join apply
                 // that is still in flight owns both, and its own finally clears them on every non-abort exit;
                 // clearing them from here mid-teleport would re-enable boat sync during the join's own
                 // repositioning. Its STEP 6 snap also makes the SnapBoatToLiveTarget below redundant in that
@@ -86,10 +86,23 @@ namespace SailwindCoop.Sync
                 GameState.recovering = false;
                 GameState.loadingBoatLocalItems = false;
                 ItemSyncManager.Instance?.SetApplyingRemoteState(false);
-                // (v0.2.39) The perch banner is written before the first yield, so an abort here leaves
+                // (v0.3.0) The perch banner is written before the first yield, so an abort here leaves
                 // "Joining the crew..." on screen for the session. Self-guarded (only clears text it wrote)
                 // and never throws, so calling it unconditionally cannot wipe the recovery or quit notices.
                 ClearJoinBanner();
+                // (v0.3.0) The join screen has the same StopCoroutine problem as the banner, and a worse
+                // consequence. Only drop it when the packet REPLACING this one is a recovery reseat: a
+                // recovery never reaches STEP 7, so nothing would ever fade the screen out and the player
+                // would sit behind a blackout until the hard cap. When the replacement is a genuine join the
+                // screen must stay up, and the restarted coroutine re-issues its checkpoints - SetStep never
+                // moves backwards, so the bar holds its position rather than rewinding.
+                if (packet.IsRecovery) UI.JoinProgressScreen.Abort("a boat recovery interrupted the join");
+                // A genuine replacement join keeps the screen, but the abandoned attempt's step label and
+                // patience clock must not carry over, or the screen sits at "Placing the boats" and 75%
+                // while the new coroutine is actually back at the start of a fresh terrain wait, then
+                // reports a stall time accumulated across both attempts. Re-arms the clocks; the bar itself
+                // holds its position rather than rewinding.
+                else UI.JoinProgressScreen.Restart();
                 // Controls too: the aborted coroutine disabled them before its first yield and its finally
                 // never runs on a StopCoroutine, so without this the guest is frozen with no gravity.
                 try { Refs.SetPlayerControl(true); MouseLook.ToggleMouseLook(true); }
@@ -103,13 +116,13 @@ namespace SailwindCoop.Sync
         /// Replaces old Recovery-based approach that required a port.
         /// </summary>
         /// <summary>
-        /// (v0.2.39) True while the world-state apply coroutine is running. Read by the recovery-gate
+        /// (v0.3.0) True while the world-state apply coroutine is running. Read by the recovery-gate
         /// watchdog so it never clears a join gate that this coroutine still owns.
         /// </summary>
         public static bool IsApplyInFlight => _applyCoroutine != null;
 
         /// <summary>
-        /// (v0.2.39) Clear the join perch banner, but ONLY if it still says what we wrote. That TextMesh is
+        /// (v0.3.0) Clear the join perch banner, but ONLY if it still says what we wrote. That TextMesh is
         /// shared with the host-recovery notice and the join watchdog, so an unconditional clear would wipe a
         /// message another system is still relying on. Never throws - this runs from a finally.
         /// </summary>
@@ -170,9 +183,14 @@ namespace SailwindCoop.Sync
             }
 
             // === STEP 2: Direct teleport to trigger terrain loading ===
+            // (v0.3.0) The host's world arrived and we know where we are going. Recovery reseats reuse this
+            // coroutine and are NOT joins - the player never left - so they get no join screen, the same
+            // !IsRecovery reasoning the perch banner below uses.
+            if (!packet.IsRecovery) UI.JoinProgressScreen.SetStep(UI.JoinProgressScreen.Step.Placing);
+
             GameState.recovering = true;  // Enable instant FloatingOriginManager shifts
 
-            // (v0.2.39) FREEZE THE PLAYER FOR THE PERCH. The teleport below parks the guest 50m ABOVE the
+            // (v0.3.0) FREEZE THE PLAYER FOR THE PERCH. The teleport below parks the guest 50m ABOVE the
             // host's boat so the terrain around it streams in before we place them precisely, and they then
             // sit there through a 2s wait plus a scene-load wait (up to 30s). Nothing was disabling the
             // controller for that window, so gravity and WASD stayed live and the guest FELL the whole 50m in
@@ -186,7 +204,7 @@ namespace SailwindCoop.Sync
             Refs.SetPlayerControl(false);
             Plugin.Log.LogInfo("[JOIN] Player control disabled for the terrain-load perch");
 
-            // (v0.2.39) Tell the player WHY they cannot move. The freeze above lasts a 2s wait plus a
+            // (v0.3.0) Tell the player WHY they cannot move. The freeze above lasts a 2s wait plus a
             // scene-load wait (up to 30s) plus settles - bounded, but several seconds of a dead controller
             // immediately after clicking Join reads as "the game hung". The only other feedback is the
             // lobby-entry toast, which fires when Steam reports the lobby and is normally long expired by
@@ -299,6 +317,10 @@ namespace SailwindCoop.Sync
             catch (System.Exception e) { Plugin.Log.LogWarning($"[JOIN] FOM re-center skipped: {e.Message}"); }
 
             // === STEP 3: Wait for terrain to load ===
+            // The long one, and the only step with a genuine fraction behind it - the screen reads
+            // GameState.loadingScenes directly rather than easing through this slice.
+            if (!packet.IsRecovery) UI.JoinProgressScreen.SetStep(UI.JoinProgressScreen.Step.LoadingTerrain);
+
             // Initial wait to trigger terrain loading. REALTIME (not WaitForSeconds): the co-op world replicates
             // the HOST's timeScale onto the guest, and a host that is paused/at a port runs at timeScale==0. A
             // scaled WaitForSeconds NEVER completes at timeScale 0, so the join HANGS here forever - the guest is
@@ -319,6 +341,8 @@ namespace SailwindCoop.Sync
                 Plugin.Log.LogWarning($"[JOIN] Terrain loading timed out, continuing anyway");
 
             // === STEP 4: Apply boat states ===
+            if (!packet.IsRecovery) UI.JoinProgressScreen.SetStep(UI.JoinProgressScreen.Step.ApplyingBoats);
+
             // Prevent BoatLocalItems from caching/restoring items while we apply host state
             var wasLoadingBoatItems = GameState.loadingBoatLocalItems;
             GameState.loadingBoatLocalItems = true;
@@ -360,7 +384,7 @@ namespace SailwindCoop.Sync
                     // BOTH Phase B and the physics re-enable loop further down, so a boat that never
                     // reaches it is left KINEMATIC for the whole session - a dead, unmovable hull.
                     //
-                    // (v0.2.39) Moved ABOVE Phase A, not merely above the SE apply. The old placement
+                    // (v0.3.0) Moved ABOVE Phase A, not merely above the SE apply. The old placement
                     // protected the boat from a third-party rig apply but not from Phase A itself, and
                     // Phase A is where the throw actually observed in the wild happens: vanilla's
                     // customization LoadData indexes host-sized arrays against guest-sized ones. A boat
@@ -475,7 +499,7 @@ namespace SailwindCoop.Sync
                     }
                 }
 
-                // (v0.2.39) This had no else branch, and the silence was expensive. If the host's boat is not
+                // (v0.3.0) This had no else branch, and the silence was expensive. If the host's boat is not
                 // in the guest's world, or has no usable model, STEP 6 still places the player - against
                 // whatever stale boat their OWN save happened to leave in GameState.currentBoat, or failing
                 // that by taking a boat-LOCAL offset of a few metres and using it as a WORLD position. That
@@ -497,10 +521,14 @@ namespace SailwindCoop.Sync
                 }
 
                 // Sync wind and weather
+                if (!packet.IsRecovery) UI.JoinProgressScreen.SetStep(UI.JoinProgressScreen.Step.ApplyingWorld);
+
                 Wind.currentWind = packet.WindState;
                 WeatherSyncManager.Instance?.OnWeatherStateReceived(packet.WeatherState);
 
                 // === STEP 6: Teleport to exact position ===
+                if (!packet.IsRecovery) UI.JoinProgressScreen.SetStep(UI.JoinProgressScreen.Step.Aboard);
+
                 // AT-SEA JOIN FIX: boat sync has been gated off (IsJoinInProgress) for this whole multi-second
                 // join, so GameState.currentBoat is still sitting at the STALE join snapshot. If the host has
                 // been SAILING, the real boat is now tens-to-hundreds of metres away. Snap our boat to the
@@ -523,11 +551,16 @@ namespace SailwindCoop.Sync
                 MouseLook.ToggleMouseLook(true);
                 Plugin.Log.LogInfo("[JOIN] Re-enabled player controls");
 
-                // (v0.2.39) Clear the perch banner. Same !IsRecovery gate as the write, so a recovery reseat
+                // (v0.3.0) Clear the perch banner. Same !IsRecovery gate as the write, so a recovery reseat
                 // cannot wipe the recovery handler's own message out from under it.
                 if (!packet.IsRecovery) ClearJoinBanner();
 
-                // (v0.2.39) THE REAL "you have arrived" TOAST, emitted here because THIS is the first moment
+                // (v0.3.0) Fade the join screen back to the world. Deliberately AFTER the placement above:
+                // this is the first moment the player is genuinely standing where they belong, so it is the
+                // first moment the blackout is safe to lift without showing them the perch or the snap.
+                if (!packet.IsRecovery) UI.JoinProgressScreen.Finish();
+
+                // (v0.3.0) THE REAL "you have arrived" TOAST, emitted here because THIS is the first moment
                 // it is true: the world state has been applied and TeleportPlayer above has just placed (and,
                 // when on a boat, embarked) the player. The lobby-join handler used to claim this the instant
                 // Steam reported another lobby member, which was up to a minute early and could be wrong in
@@ -584,7 +617,7 @@ namespace SailwindCoop.Sync
             // Re-enable physics sync now that join is complete
             Debug.VerboseLogger.RecoveryApply("Recovery resync complete; guest re-boarded on recovered boat, join phase ended");
             BoatSyncManager.IsJoinInProgress = false;
-            // (v0.2.39) Opens the post-join diagnostic window: for the next minute the boat-position error is
+            // (v0.3.0) Opens the post-join diagnostic window: for the next minute the boat-position error is
             // logged from 1m instead of 5m, so a gradual divergence shows as the ramp it is rather than
             // appearing as a sudden step change once it crosses 5m.
             BoatSyncManager.NoteJoinComplete();
@@ -607,7 +640,7 @@ namespace SailwindCoop.Sync
                 // run this finally (Unity semantics) - that path is handled at the StopCoroutine call site (D3).
                 GameState.recovering = false;
                 BoatSyncManager.IsJoinInProgress = false;
-                // (v0.2.39) Open the post-join diagnostic window on EVERY exit, not just the happy path: an
+                // (v0.3.0) Open the post-join diagnostic window on EVERY exit, not just the happy path: an
                 // aborted or throwing join is exactly when the extra boat-position detail is most wanted.
                 // Idempotent, so the STEP 7 call on the success path is harmless.
                 BoatSyncManager.NoteJoinComplete();
@@ -621,6 +654,10 @@ namespace SailwindCoop.Sync
                 // Same defence for the perch banner: an abort before STEP 7 would otherwise leave "Joining
                 // the crew..." on screen for the rest of the session.
                 if (!packet.IsRecovery) ClearJoinBanner();
+                // (v0.3.0) And the same defence for the join screen, which fails far worse than a banner: a
+                // throw above STEP 7 would leave a full-screen blackout up until its own hard cap expired.
+                // A no-op on the success path, where Finish has already started the fade out.
+                if (!packet.IsRecovery) UI.JoinProgressScreen.Abort("the join did not finish");
             }
         }
 
@@ -661,7 +698,7 @@ namespace SailwindCoop.Sync
                     Plugin.Log.LogDebug($"Unmoored dock ropes from {data.Name}");
                 }
 
-                // 0b. OWNERSHIP FIRST. (v0.2.39) This used to be step 8, and being late is what turned a
+                // 0b. OWNERSHIP FIRST. (v0.3.0) This used to be step 8, and being late is what turned a
                 // single throw in the customization step into the whole reported failure: "his boat still
                 // has a purchased for 75 gold sign, I can't get water from his barrel, I can't see the
                 // sails, I can't see the winches, can't interact with the mooring line".
@@ -709,7 +746,7 @@ namespace SailwindCoop.Sync
                 // 3. Apply customization (this destroys old sails/ropes and creates new ones)
                 // NOTE: Destroy() is deferred until end of frame, so old ropes still exist here
                 //
-                // (v0.2.39) ISOLATED. Vanilla's SaveableBoatCustomization.LoadData calls RemoveAllSails()
+                // (v0.3.0) ISOLATED. Vanilla's SaveableBoatCustomization.LoadData calls RemoveAllSails()
                 // FIRST and then indexes into availableParts - so if that index is out of range the boat is
                 // left permanently stripped, sails gone and never rebuilt. That is exactly what happens
                 // when the two machines disagree about how many parts a boat has, which a broken or
@@ -842,7 +879,7 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            // (v0.2.39) CLAMP TO WHAT THIS MACHINE ACTUALLY HAS, before handing anything to vanilla.
+            // (v0.3.0) CLAMP TO WHAT THIS MACHINE ACTUALLY HAS, before handing anything to vanilla.
             //
             // SaveableBoatCustomization.LoadData is unguarded in two places, and both are reachable purely
             // by the two peers disagreeing about a boat:
@@ -1651,7 +1688,7 @@ namespace SailwindCoop.Sync
                     // and could fling the guest by the whole cross-region offset). Use it directly with a small drop.
                     worldPosition = position + new Vector3(0, 0.5f, 0);
 
-                    // (v0.2.39) But a boat-local offset used as a world position lands within a few metres of
+                    // (v0.3.0) But a boat-local offset used as a world position lands within a few metres of
                     // the world origin - open sea, and quite possibly under it. This branch is already the
                     // "we do not know where you should be" branch, so at minimum do not put the player
                     // somewhere they cannot survive: find a surface if there is one, and never place them

@@ -18,7 +18,7 @@ namespace SailwindCoop.Compat
     /// A peer WITHOUT the mod has the VANILLA vector (all zeros), so cosmetic-only installs and
     /// "everything off" both match a vanilla peer. NOTE the mod's DEFAULTS are not vanilla (FIVE of
     /// six default true - only wheelCenter defaults false), and that count is load-bearing for the
-    /// v0.2.39 reconcile: all THREE non-adoptable options default TRUE, so an NT-at-defaults host
+    /// v0.3.0 reconcile: all THREE non-adoptable options default TRUE, so an NT-at-defaults host
     /// facing a guest who turned any of them off still refuses, so host-at-defaults vs no-mod-guest is a REAL sim difference and is
     /// correctly refused - the refusal message (CompatRegistry.DescribeMismatch) names the vector so
     /// users can see which options differ. Values snapshot at token time (lobby create/join);
@@ -32,7 +32,7 @@ namespace SailwindCoop.Compat
         private static readonly string[] SimConfigTags = { "b", "s", "w", "f", "v", "d" };
 
         /// <summary>
-        /// (v0.2.39) Which of the six can actually be ADOPTED from a host at join and take effect this
+        /// (v0.3.0) Which of the six can actually be ADOPTED from a host at join and take effect this
         /// session. Index-parallel to SimConfigFields/SimConfigTags.
         ///
         /// This distinction is the whole safety of the reconcile, and getting it wrong is worse than having
@@ -141,7 +141,7 @@ namespace SailwindCoop.Compat
         }
 
         /// <summary>
-        /// (v0.2.39) Adopt a peer's sim vector for THIS SESSION, so a crew running the same mods is not
+        /// (v0.3.0) Adopt a peer's sim vector for THIS SESSION, so a crew running the same mods is not
         /// refused over a checkbox.
         ///
         /// ONLY the options in SimConfigAdoptable can be adopted. If the host differs from us on any option
@@ -149,7 +149,7 @@ namespace SailwindCoop.Compat
         /// take effect this session and pretending otherwise would produce a matching token over divergent
         /// behavior. See SimConfigAdoptable for the per-option evidence.
         ///
-        /// CORRECTION (v0.2.39, from an adversarial re-audit): an earlier version of this method adopted all
+        /// CORRECTION (v0.3.0, from an adversarial re-audit): an earlier version of this method adopted all
         /// six and justified it with "every option is read inside its patch body, and we apply at JOIN before
         /// the guest's world is live". BOTH halves of that were wrong. Reading `.Value` inside a method body
         /// says nothing about whether that method still runs after we join - three of the six are reachable
@@ -304,7 +304,7 @@ namespace SailwindCoop.Compat
             {
                 if (!them.TryGetValue(SimConfigTags[i], out bool t)) continue;
                 if (!us.TryGetValue(SimConfigTags[i], out bool o)) continue;
-                // (v0.2.39) Name the setting the way NAND Tweaks' own config file names it. This printed
+                // (v0.3.0) Name the setting the way NAND Tweaks' own config file names it. This printed
                 // SimConfigFields[i], the C# field name, which is exactly the unfindable-word problem
                 // SettingLabels exists to end: a player told "saveLoadState" differs will not find that
                 // string anywhere, because the line in the file reads "Save and load ship state".
@@ -318,6 +318,49 @@ namespace SailwindCoop.Compat
                 }
             }
             return diffs.Count == 0 ? "NAND Tweaks settings differ" : string.Join(", ", diffs);
+        }
+
+        /// <summary>
+        /// (v0.3.0) The same diff as DescribeVectorDiff, but ONE ENTRY PER SETTING.
+        ///
+        /// The joined form is right for the log and the notification ticker, and wrong for the refusal
+        /// panel: this mod alone can contribute five differing settings, so comma-joining them produced a
+        /// single bullet that filled a third of the panel and read as a paragraph.
+        ///
+        /// The section name is stripped of the dashes NAND Tweaks pads its config headers with, so this
+        /// reads "under Water and Bailing" rather than "under [---- Water and Bailing ----]".
+        /// </summary>
+        public static List<string> DescribeVectorDiffLines(string theirVector, string ourVector)
+        {
+            var outLines = new List<string>();
+            var them = ParseVector(theirVector);
+            var us = ParseVector(ourVector);
+            if (them == null || us == null)
+            {
+                outLines.Add("NAND Tweaks settings could not be read on one side");
+                return outLines;
+            }
+
+            for (int i = 0; i < SimConfigTags.Length; i++)
+            {
+                if (!them.TryGetValue(SimConfigTags[i], out bool t)) continue;
+                if (!us.TryGetValue(SimConfigTags[i], out bool o)) continue;
+                if (t == o) continue;
+
+                var label = SettingLabels.Find("NT", SimConfigTags[i]);
+                string shown = label != null ? "\"" + label.Label + "\"" : SimConfigFields[i];
+                string where = "";
+                if (label != null)
+                {
+                    string section = (label.Section ?? "").Trim(' ', '-', '[', ']');
+                    if (section.Length > 0) where = $", under {section}";
+                    if (label.NeedsRestart) where += " (needs a restart)";
+                }
+                outLines.Add($"NAND Tweaks: {shown} - host {(t ? "on" : "off")}, you {(o ? "on" : "off")}{where}");
+            }
+
+            if (outLines.Count == 0) outLines.Add("NAND Tweaks: settings differ");
+            return outLines;
         }
     }
 }

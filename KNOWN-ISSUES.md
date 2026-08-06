@@ -17,6 +17,14 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 
 ## Open / deferred
 
+- 🟡 **Anchor Improvements 1.1.7 is broken on Sailwind 0.38, with or without this mod.** It patches
+  `Anchor.Start` and `Anchor.FixedUpdate`, and the game renamed both in 0.38, so it throws partway
+  through applying its patches. Harmony does not undo the ones that already applied, so a little of it
+  runs and none of the anchor behavior does. It has been reported as a co-op incompatibility; it is not
+  one, and co-op cannot fix it. Worth knowing that when a mod fails like this, BepInEx drops it from its
+  plugin list, so it will not appear in the crew mod-difference report either - a crewmate running a
+  crashed mod looks the same to us as one running none.
+
 - 🟠 **Recovery placement ("recover-under-pier").** After a host boat recovery, the player
   may end up at the dock instead of re-embarked on the deck in some cases. The cause is
   understood but the fix needs a live v0.38 session to confirm; deferred until then.

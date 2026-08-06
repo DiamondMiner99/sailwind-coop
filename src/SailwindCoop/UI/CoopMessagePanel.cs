@@ -4,7 +4,7 @@ using UnityEngine;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) A plain, readable IMGUI panel for messages that are too important or too long for the
+    /// (v0.3.0) A plain, readable IMGUI panel for messages that are too important or too long for the
     /// vanilla notification scroll.
     ///
     /// WHY THIS EXISTS. Co-op's two most information-dense messages - "your join was refused because these
@@ -38,6 +38,7 @@ namespace SailwindCoop.UI
         private bool _stickyThroughTeardown;        // refusals survive the teardown that triggered them
         private CursorLockMode _prevLockState;
         private bool _prevCursorVisible;
+        private bool _prevInCursorMenu;
         private bool _cursorCaptured;
 
         private GUIStyle _panelStyle, _titleStyle, _bodyStyle, _footerStyle, _buttonStyle;
@@ -102,6 +103,24 @@ namespace SailwindCoop.UI
             if (_instance != null && !_instance._stickyThroughTeardown) _instance.Dismiss();
         }
 
+        /// (v0.3.0) Whether a message is on screen right now. The guest-quit path polls this so it can wait
+        /// for the player to finish reading a refusal instead of closing the game out from under them on a
+        /// fixed timer - a refusal listing several mods is more than six seconds of reading, and having it
+        /// vanish into a desktop mid-sentence reads as a crash.
+        public static bool IsShowing
+        {
+            get { return _instance != null && _instance._visible; }
+        }
+
+        private int _keyConsumedFrame = -1;
+
+        /// <summary>(v0.3.0) True if this panel swallowed a pause key this frame, so the same press does not
+        /// also open the vanilla pause menu behind it. Same contract as CharacterScreen/FriendsScreen.</summary>
+        public static bool ConsumedPauseKeyThisFrame
+        {
+            get { return _instance != null && _instance._keyConsumedFrame == Time.frameCount; }
+        }
+
         private void SetContent(string title, IEnumerable<string> lines, string footer, float autoHideSeconds,
             bool? stickyThroughTeardown)
         {
@@ -127,8 +146,17 @@ namespace SailwindCoop.UI
             {
                 _prevLockState = Cursor.lockState;
                 _prevCursorVisible = Cursor.visible;
+                try { _prevInCursorMenu = GameState.inCursorMenu; } catch { _prevInCursorMenu = true; }
                 _cursorCaptured = true;
             }
+
+            // (v0.3.0) STOP THE CAMERA TOO, not just the cursor. Freeing the cursor alone left the player
+            // dragging the view around behind the panel: MouseLook.Update turns the camera whenever
+            // `mouseLookEnabled && !cursorEnabled` (MouseLook.cs:66), and neither of those is touched by
+            // writing Cursor.lockState. Calling vanilla's own ToggleMouseLookAndCursor(false) sets
+            // cursorEnabled and GameState.inCursorMenu together, which is exactly the state every vanilla
+            // menu puts the game into, so the world stops responding to the mouse the way a player expects.
+            try { MouseLook.ToggleMouseLookAndCursor(false); } catch { /* title screen, or no MouseLook yet */ }
             Cursor.lockState = CursorLockMode.None;
             Cursor.visible = true;
             _visible = true;
@@ -161,15 +189,36 @@ namespace SailwindCoop.UI
             if (!_cursorCaptured) return;
             _cursorCaptured = false;
             if (Cursor.lockState != CursorLockMode.None || !Cursor.visible) return; // someone else took it
+
+            // (v0.3.0) If we interrupted GAMEPLAY (the game was not already in a cursor menu), hand look and
+            // cursor back through the same vanilla call we took them with, so mouseLookEnabled/cursorEnabled
+            // and GameState.inCursorMenu all end up consistent. Writing the raw Cursor fields back would
+            // leave cursorEnabled set and the camera dead. If we opened over a MENU, do the opposite and
+            // leave the menu's free cursor alone - re-locking there would be the bug in reverse.
+            if (!_prevInCursorMenu)
+            {
+                try { MouseLook.ToggleMouseLookAndCursor(true); return; } catch { /* fall through */ }
+            }
             Cursor.lockState = _prevLockState;
             Cursor.visible = _prevCursorVisible;
+            try { GameState.inCursorMenu = _prevInCursorMenu; } catch { }
         }
 
         private void Update()
         {
             if (!_visible) return;
             // Keyboard dismissal, because a locked-cursor player may have no usable pointer at all.
-            if (Input.GetKeyDown(KeyCode.Escape)) { Dismiss(); return; }
+            if (Input.GetKeyDown(KeyCode.Escape))
+            {
+                // (v0.3.0) Claim the press, or the SAME Escape that closed this panel also reaches vanilla
+                // and opens the pause menu behind it - which is what a player saw after dismissing a
+                // refusal: the message goes away and a pause parchment appears for no reason, on a session
+                // that is in the middle of ending. The other two screens already do this; this one did not,
+                // and MenuPatches only knew to ask them.
+                _keyConsumedFrame = Time.frameCount;
+                Dismiss();
+                return;
+            }
             // Informational panels expire on their own; refusals (autoHide 0) stay until dismissed.
             if (_autoHideAt > 0f && Time.realtimeSinceStartup >= _autoHideAt) Dismiss();
         }
@@ -221,6 +270,21 @@ namespace SailwindCoop.UI
             _stylesBuilt = true;
         }
 
+        /// <summary>
+        /// (v0.3.0) Height the body needs at a given width, INCLUDING the vertical margin GUILayout puts
+        /// between labels. CalcHeight alone reports only the text box, which is what left the old estimate
+        /// short by a few pixels per line and forced a scrollbar onto a two-line message.
+        /// </summary>
+        private float MeasureBody(float width)
+        {
+            float h = 0f;
+            for (int i = 0; i < _lines.Count; i++)
+                h += _bodyStyle.CalcHeight(new GUIContent("- " + _lines[i]), width) + _bodyStyle.margin.vertical;
+            if (!string.IsNullOrEmpty(_footer))
+                h += 8f + _footerStyle.CalcHeight(new GUIContent(_footer), width) + _footerStyle.margin.vertical;
+            return h;
+        }
+
         private static Texture2D MakeTex(Color c)
         {
             var t = new Texture2D(1, 1);
@@ -237,17 +301,33 @@ namespace SailwindCoop.UI
 
             // Sized as a fraction of the screen, capped, so it is readable at 1080p and not absurd at 4K.
             float w = Mathf.Min(Screen.width * 0.62f, 900f);
-            float maxH = Screen.height * 0.7f;
+            float maxH = Screen.height * 0.8f;
             float x = (Screen.width - w) * 0.5f;
             float y = Screen.height * 0.14f;
 
-            // Measure so short messages get a small box and long ones scroll rather than overflowing.
-            float bodyW = w - 44f;
-            float contentH = 0f;
-            for (int i = 0; i < _lines.Count; i++)
-                contentH += _bodyStyle.CalcHeight(new GUIContent("- " + _lines[i]), bodyW);
-            float footerH = string.IsNullOrEmpty(_footer) ? 0f : _footerStyle.CalcHeight(new GUIContent(_footer), bodyW) + 8f;
-            float h = Mathf.Min(maxH, 44f + contentH + footerH + 66f);
+            // (v0.3.0) MEASURE PROPERLY AND ONLY SCROLL WHEN WE MUST. The previous version guessed the
+            // chrome at a flat "44 + 66", ignored the per-label margins GUILayout inserts, and then wrapped
+            // the body in a scroll view unconditionally. A one-line message therefore came out a few pixels
+            // short of its own contents and grew a scrollbar to reach the footer - reported, fairly, as
+            // silly when the box could simply have been drawn tall enough. Worse, once a vertical scrollbar
+            // appears it eats horizontal space, which re-wraps the text longer, which needs more height.
+            //
+            // So: derive every band from the styles themselves, and drop the scroll view entirely unless the
+            // content genuinely exceeds the screen cap. A small overestimate here is the right error - it
+            // spends empty parchment, which there is plenty of, instead of clipping the text.
+            float innerW = w - _panelStyle.padding.horizontal;
+            float scrollbarW = 20f;
+
+            float titleH = _titleStyle.CalcHeight(new GUIContent(_title), innerW);
+            float buttonH = _buttonStyle.CalcHeight(new GUIContent("Close  (Esc)"), 140f);
+            float fixedH = _panelStyle.padding.vertical + titleH + 8f + 6f + buttonH + 6f;
+
+            float bodyH = MeasureBody(innerW);
+            float wantedH = fixedH + bodyH;
+            bool needsScroll = wantedH > maxH;
+            // Re-measure narrower when a scrollbar will steal width, so the cap is honest about what fits.
+            if (needsScroll) bodyH = MeasureBody(innerW - scrollbarW);
+            float h = needsScroll ? maxH : wantedH;
 
             GUI.depth = 0;
             GUILayout.BeginArea(new Rect(x, y, w, h), _panelStyle);
@@ -255,7 +335,7 @@ namespace SailwindCoop.UI
             GUILayout.Label(_title, _titleStyle);
             GUILayout.Space(8f);
 
-            _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
+            if (needsScroll) _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
             for (int i = 0; i < _lines.Count; i++)
                 GUILayout.Label("- " + _lines[i], _bodyStyle);
             if (!string.IsNullOrEmpty(_footer))
@@ -263,7 +343,8 @@ namespace SailwindCoop.UI
                 GUILayout.Space(8f);
                 GUILayout.Label(_footer, _footerStyle);
             }
-            GUILayout.EndScrollView();
+            if (needsScroll) GUILayout.EndScrollView();
+            else GUILayout.FlexibleSpace();
 
             GUILayout.Space(6f);
             GUILayout.BeginHorizontal();

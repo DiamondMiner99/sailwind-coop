@@ -102,7 +102,10 @@ namespace SailwindCoop.Networking.Packets
     public struct HelmInputPacket
     {
         public string BoatName;
-        public float InputDelta;     // Delta to add to currentInput
+        public float InputDelta;     // What the helmsman just turned the wheel by, this frame
+        public float Absolute;       // (v0.3.0) The helmsman's OWN resulting wheel angle. While they hold
+                                     // the lease the host ADOPTS this instead of integrating the deltas, so
+                                     // whoever is steering is authoritative over their own wheel.
     }
 
     [Serializable]

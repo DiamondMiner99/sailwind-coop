@@ -3,7 +3,7 @@ using System.Collections.Generic;
 namespace SailwindCoop.Compat
 {
     /// <summary>
-    /// (v0.2.39) Translate the mod-gate token's internal names into the words a player can actually find.
+    /// (v0.3.0) Translate the mod-gate token's internal names into the words a player can actually find.
     ///
     /// THE BUG THIS FIXES IS A WORDING BUG WITH A MECHANICAL CAUSE. The gate token is built by reflecting
     /// over each third-party mod's ConfigEntry FIELDS, so it carries C# field names: `topsailPatch`,

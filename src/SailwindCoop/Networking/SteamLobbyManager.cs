@@ -96,7 +96,7 @@ namespace SailwindCoop.Networking
         /// Message from the last FAILED Steam init (null if the last attempt succeeded). Drives the
         /// in-game failure notice and the debug-overlay status line.
         ///
-        /// (v0.2.39) The value now LIVES in SteamInitDiagnostics, which carries no Facepunch types and can
+        /// (v0.3.0) The value now LIVES in SteamInitDiagnostics, which carries no Facepunch types and can
         /// therefore still be read when this class cannot load at all. Kept here as a forwarder for callers
         /// that already hold a live manager - see that class for why the distinction is load-bearing.
         public string LastInitError { get { return SteamInitDiagnostics.LastError; } }
@@ -137,7 +137,7 @@ namespace SailwindCoop.Networking
 
             try
             {
-                // (v0.2.39) Make sure the NATIVE Steam library can be found before anything tries to call
+                // (v0.3.0) Make sure the NATIVE Steam library can be found before anything tries to call
                 // into it - see PreloadNativeSteamApi for why a mod manager install could not.
                 PreloadNativeSteamApi();
 
@@ -173,7 +173,7 @@ namespace SailwindCoop.Networking
         private static bool _nativePreloadAttempted;
 
         /// <summary>
-        /// (v0.2.39) Load steam_api64.dll by full path, so co-op works from a mod manager install.
+        /// (v0.3.0) Load steam_api64.dll by full path, so co-op works from a mod manager install.
         ///
         /// THE ASYMMETRY THAT BROKE THUNDERSTORE. Facepunch.Steamworks is a MANAGED assembly, and BepInEx
         /// resolves those out of any subfolder of the plugin path - so it loads fine wherever the mod is
@@ -353,7 +353,7 @@ namespace SailwindCoop.Networking
                 // bundle hash + Towable Boats + HMS Leopard). Guests pre-check this BEFORE opening
                 // P2P, exactly like the version stamp above. Opaque - compare for equality only.
                 lobby.SetData("mods", SailwindCoop.Compat.CompatRegistry.ModSignature);
-                // (v0.2.39) REPORT-ONLY plugin manifest, published here as well as over P2P so a guest
+                // (v0.3.0) REPORT-ONLY plugin manifest, published here as well as over P2P so a guest
                 // refused at the LOBBY PRE-CHECK can still be told what differs. That refusal happens before
                 // any P2P session exists, so the handshake copy never reaches the one player who most needs
                 // it - they were the only person getting no information at all.
@@ -395,9 +395,18 @@ namespace SailwindCoop.Networking
 
             Plugin.Log.LogInfo($"Joining lobby {lobbyId}...");
 
+            // (v0.3.0) Raise the join screen HERE, not on OnLobbyJoined. Everything below this line is
+            // already the join as far as the player is concerned, but `await target.Join()` is a round trip
+            // to Steam, and OnLobbyJoined only fires on the far side of it. Starting there left roughly a
+            // second of the player's own world on screen after they clicked, which was reported as the
+            // loading screen "only appearing at the very last bit". Idempotent: Begin no-ops if a join
+            // screen is already running, so the OnLobbyJoined call is a harmless fallback for any path
+            // that reaches a lobby without coming through here.
+            UI.JoinProgressScreen.Begin();
+
             try
             {
-                // (v0.2.39) Use Lobby.Join(), NOT SteamMatchmaking.JoinLobbyAsync.
+                // (v0.3.0) Use Lobby.Join(), NOT SteamMatchmaking.JoinLobbyAsync.
                 //
                 // JoinLobbyAsync DISCARDS Steam's EChatRoomEnterResponse and hands back a non-null Lobby
                 // even when the join was REFUSED - a closed lobby, a full one, a lobby that never existed.
@@ -416,6 +425,9 @@ namespace SailwindCoop.Networking
                 if (result != Steamworks.RoomEnter.Success)
                 {
                     Plugin.Log.LogError($"Failed to join lobby {lobbyId}: {result}");
+                    // Down before the notice goes up, and this is also what hands the player their controls
+                    // back - Begin froze them for a join that is not going to happen.
+                    UI.JoinProgressScreen.Abort("Steam refused the lobby join: " + result);
                     Plugin.Notify(DescribeJoinFailure(result), 7f);
                     return;
                 }
@@ -428,6 +440,7 @@ namespace SailwindCoop.Networking
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"Exception joining lobby: {ex.Message}");
+                UI.JoinProgressScreen.Abort("the lobby join threw: " + ex.Message);
             }
         }
 
@@ -663,7 +676,7 @@ namespace SailwindCoop.Networking
                 return;
             }
 
-            // (v0.2.39) An invite that ANSWERS OUR OWN REQUEST is never a stale re-delivery, by definition -
+            // (v0.3.0) An invite that ANSWERS OUR OWN REQUEST is never a stale re-delivery, by definition -
             // we asked minutes ago and this is the yes. It must therefore skip the de-dupe below, which is
             // otherwise permanent: ask, get declined, ask the same captain again later, and the second
             // acceptance would be swallowed as "already seen" with no way to ever undo that. This is also
@@ -675,38 +688,71 @@ namespace SailwindCoop.Networking
             // one old invite. De-dupe by lobby id, persisted across launches: a lobby we've already recorded
             // is a stale re-delivery -> suppress silently. Only a genuinely NEW invite (new lobby) reaches
             // the toast + the traceable main-log line.
+            // (v0.3.0) ...unless the lobby is demonstrably STILL ALIVE. The de-dupe above cannot tell a dead
+            // lobby's re-offer from a live one, because a lobby id is just a lobby id - and a host who leaves
+            // their session open across a guest's relaunch keeps the SAME id. The guest's re-delivered invite
+            // then looked exactly like a stale one and was swallowed: no toast, nothing in the friends list,
+            // and accepting through Steam launched the game and then sat there. Reported as "still not
+            // getting invites to show, not since the first time joining".
+            //
+            // Rich presence settles it. A friend advertising that they are sailing in this very lobby is
+            // proof it exists, so the invite is worth surfacing however many times we have seen the id.
+            bool lobbyIsLive = CoopPresence.IsLobbyLive(lobby.Id.Value);
+
             EnsureSeenInvitesLoaded();
             bool alreadySeen = !_seenInviteLobbies.Add(lobby.Id.Value);
-            if (alreadySeen && !answersOurRequest)
-            {
-                VerboseLogger.LobbyEvent($"Invite to lobby {lobby.Id} already seen; suppressing stale re-delivery");
-                return;
-            }
             if (!alreadySeen) PersistSeenInvite(lobby.Id.Value);
 
-            // Mirror to the main BepInEx log with the sender's SteamID (once per unique invite), so an
-            // unwanted invite can be traced to an exact account and blocked - persona names are changeable
-            // and can collide, so the name alone can't positively identify the account.
-            Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
-
-            // Belt-and-suspenders throttle (the de-dupe already caps one toast per lobby). An answer to our
-            // own request is exempt: it is the one invite the player is actively waiting for, and silently
-            // eating it because an unrelated invite arrived 14 seconds ago would be indefensible.
+            // (v0.3.0) THE DE-DUPE SILENCES THE TOAST, IT NO LONGER DISCARDS THE INVITE. It used to return
+            // here, before _pendingInvite was recorded at the bottom of this method - so a re-delivered
+            // invite left nothing for the friends screen to offer and nothing for a Steam "accept" to act
+            // on. That is why accepting from Steam launched the game and then did nothing, and why the
+            // friends list stayed empty after the first join of a session.
+            //
+            // The two concerns are genuinely different. Nagging about the same lobby on every launch is the
+            // problem the de-dupe was built for; forgetting the lobby exists is not a milder version of the
+            // same thing, it is a different bug. Recording it costs one struct and leaves the player able to
+            // act whenever they choose to look.
             float now = UnityEngine.Time.realtimeSinceStartup;
-            if (!answersOurRequest && now - _lastInviteToastTime < 15f) return;
-            _lastInviteToastTime = now;
+            bool announce = !alreadySeen || answersOurRequest || lobbyIsLive;
 
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
             string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
-            // (v0.2.39) Say where to act. The old toast announced the invite and left the player to accept
-            // it through Steam's own UI - which shows nothing at all when the sender is not a Steam friend
-            // or the overlay is off, so the message was frequently a dead end.
-            if (answersOurRequest)
-                Plugin.NotifyWithHint($"{name} says come aboard.", "Open the menu to join", 8f);
-            else
-                Plugin.NotifyWithHint($"{name} invited you to co-op.", "Open the menu to join", 6f);
 
-            // (v0.2.39) KEEP the invite instead of discarding it, so the pause menu can offer it. A single
+            if (announce)
+            {
+                // Mirror to the main BepInEx log with the sender's SteamID, so an unwanted invite can be
+                // traced to an exact account and blocked - persona names are changeable and can collide, so
+                // the name alone can't positively identify the account.
+                Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
+
+                // Belt-and-suspenders throttle. An answer to our own request is exempt: it is the one invite
+                // the player is actively waiting for, and silently eating it because an unrelated invite
+                // arrived 14 seconds ago would be indefensible.
+                if (answersOurRequest || now - _lastInviteToastTime >= 15f)
+                {
+                    _lastInviteToastTime = now;
+                    // (v0.3.0) Say where to act. The old toast announced the invite and left the player to
+                    // accept it through Steam's own UI - which shows nothing at all when the sender is not a
+                    // Steam friend or the overlay is off, so the message was frequently a dead end.
+                    if (answersOurRequest)
+                    {
+                        // The invite IS the answer, so stop advertising the question. Without this the
+                        // friends screen showed "Waiting on X" and "X invited you to co-op" at once, which
+                        // reads as though the request had not been seen.
+                        CoopPresence.CancelAsk();
+                        Plugin.NotifyWithHint($"{name} says come aboard.", "Open the menu to join", 8f);
+                    }
+                    else
+                        Plugin.NotifyWithHint($"{name} invited you to co-op.", "Open the menu to join", 6f);
+                }
+            }
+            else
+            {
+                VerboseLogger.LobbyEvent($"Invite to lobby {lobby.Id} already seen; keeping it for the friends screen but not announcing it again");
+            }
+
+            // (v0.3.0) KEEP the invite instead of discarding it, so the pause menu can offer it. A single
             // slot rather than a list: the toast is throttled to one per 15s anyway, and a queue of stale
             // invitations is a worse thing to present than the newest one. The most recent invite wins.
             _pendingInvite = new PendingInvite
@@ -861,7 +907,7 @@ namespace SailwindCoop.Networking
         }
 
         /// <summary>
-        /// (v0.2.39) The most recent invite we could still act on, or null.
+        /// (v0.3.0) The most recent invite we could still act on, or null.
         ///
         /// Invites used to be announced and then thrown away: HandleLobbyInvite logged one, toasted it, and
         /// dropped the lobby handle, leaving Steam's own invite UI as the only way to accept. That UI shows

@@ -5,7 +5,7 @@ using UnityEngine;
 namespace SailwindCoop.Patches
 {
     /// <summary>
-    /// (v0.2.39) Makes vanilla's Synty character part activation total instead of assuming every entry in
+    /// (v0.3.0) Makes vanilla's Synty character part activation total instead of assuming every entry in
     /// a part group is a single skinned mesh.
     ///
     /// THE BUG, in vanilla:

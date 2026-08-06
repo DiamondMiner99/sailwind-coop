@@ -60,7 +60,7 @@ namespace SailwindCoop.Patches
                 if (!(Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.F10) || Input.GetKeyDown(KeyCode.JoystickButton6)))
                     return true;
 
-                // (v0.2.39) Our own IMGUI screens own the pause key while one is up, and for the remainder
+                // (v0.3.0) Our own IMGUI screens own the pause key while one is up, and for the remainder
                 // of the frame in which it swallowed one. Both terms are load-bearing:
                 //   IsOpen - Plugin.Update returns early when Steam never initialised, which is ABOVE the
                 //     screens' Tick calls, so Tick can be dead while the screen is drawn. The vanilla
@@ -73,7 +73,12 @@ namespace SailwindCoop.Patches
                 if (SailwindCoop.UI.CharacterScreen.IsOpen ||
                     SailwindCoop.UI.CharacterScreen.ConsumedPauseKeyThisFrame ||
                     SailwindCoop.UI.FriendsScreen.IsOpen ||
-                    SailwindCoop.UI.FriendsScreen.ConsumedPauseKeyThisFrame) return false;
+                    SailwindCoop.UI.FriendsScreen.ConsumedPauseKeyThisFrame ||
+                    // (v0.3.0) The message panel plays by the same rules. It was the one screen missing from
+                    // this list, so dismissing a refusal with Escape closed the panel and opened the pause
+                    // menu with the very same press - on a session that was already quitting.
+                    SailwindCoop.UI.CoopMessagePanel.IsShowing ||
+                    SailwindCoop.UI.CoopMessagePanel.ConsumedPauseKeyThisFrame) return false;
 
                 // OnEscape returns true if it handled it (resume / settings-back-to-pause) -> skip vanilla.
                 if (SailwindCoop.UI.CoopPauseMenu.OnEscape(__instance)) return false;

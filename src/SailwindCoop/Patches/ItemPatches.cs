@@ -695,5 +695,43 @@ namespace SailwindCoop.Patches
         }
 
         #endregion
+
+        #region Placement preview
+
+        /// <summary>
+        /// (v0.3.0) Keep the green wall-placement ghost LOCAL.
+        ///
+        /// Reported from the playtest: a crewmate holding a placeable item (a map, say) painted a bright
+        /// green translucent copy of it on EVERY other player's screen, as though they were placing it. The
+        /// preview is an aiming affordance for whoever is holding the thing - nobody else has a use for it,
+        /// and it hangs in the world where the item is not.
+        ///
+        /// Vanilla gates the preview on `held != null` (ShipItem.Update) and paints it through
+        /// `held.GetTargeter()` (ShipItem.SetUpTargeter). "Held" is the only ownership notion it has, and it
+        /// is not really one: DisarmRemoteHeldItemPhysics has to put SOMETHING in `held` to stop the item
+        /// behaving like a loose physics object while a remote player carries it, and what it puts there is
+        /// a GoPointer found on THIS machine. So a remotely carried wall item drives a local targeter, and a
+        /// targeter is a plain world GameObject, so the local camera renders it.
+        ///
+        /// The honest ownership test is on the pointer side. GoPointer.PickUpItem assigns `heldItem = item`
+        /// and `item.held = this` together, and DropItem clears both, so the round trip only closes for an
+        /// item this machine's player actually picked up. The disarm sets one side and never the other.
+        ///
+        /// Skipping SetUpTargeter suppresses the ghost and nothing else: it has a single call site, and its
+        /// entire body is four local computations plus the DisplayTargeter call. `inRangeOfWall`,
+        /// `attachPos` and `attachRot` are still computed by Update, which the drop path needs. Stateless,
+        /// so nothing is left broken if an item is destroyed or a peer drops mid-carry - the next frame
+        /// simply answers correctly again.
+        /// </summary>
+        [HarmonyPatch(typeof(ShipItem), "SetUpTargeter")]
+        [HarmonyPrefix]
+        public static bool SuppressRemotePlacementTargeter(ShipItem __instance)
+        {
+            if (!Plugin.IsMultiplayer) return true;
+            var pointer = __instance.held;
+            return pointer != null && (object)pointer.GetHeldItem() == __instance;
+        }
+
+        #endregion
     }
 }

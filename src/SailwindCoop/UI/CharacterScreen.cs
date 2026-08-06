@@ -4,7 +4,7 @@ using SailwindCoop.Player;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) The character screen: pick which Synty modular parts your avatar wears.
+    /// (v0.3.0) The character screen: pick which Synty modular parts your avatar wears.
     ///
     /// OPENED FROM THE PAUSE MENU and nowhere else. CoopMenu (the title screen) is a documented no-op in
     /// this mod - co-op lives only in the in-game pause menu - and that constraint is convenient rather

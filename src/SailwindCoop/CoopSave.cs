@@ -131,7 +131,27 @@ namespace SailwindCoop
             int soloSlot = PickSoloSlot();
             if (soloSlot < 0)
             {
+                // (v0.3.0) A brand-new install with no saves at all. The guest's world is seeded by copying
+                // their own most-recent save, so there is nothing to copy from and the join cannot proceed.
+                // This used to fail with a log line nobody would ever read, leaving the player watching a
+                // join that simply did not happen. It is a narrow case - you have to have never started a
+                // game - but "start a game once first" is a thing a player can act on in ten seconds, and a
+                // silent failure is not.
                 Plugin.Log.LogWarning("[CoopSave] No phantom and no solo save to seed from; cannot enter co-op save context");
+                try
+                {
+                    UI.CoopMessagePanel.Show("Start a game before joining a crew",
+                        new System.Collections.Generic.List<string>
+                        {
+                            "Sailing with a crew needs a world of your own to stand in first, and this " +
+                            "install does not have one yet.",
+                            "Start a new game, sail out of the harbor, then accept the invite again. You " +
+                            "keep that world - co-op never writes to it.",
+                        },
+                        "Nothing has been changed on your end.", 0f, stickyThroughTeardown: true);
+                }
+                catch (Exception e) { Plugin.Log.LogWarning("[CoopSave] could not show the no-save panel: " + e.Message); }
+                Plugin.Notify("Start a game of your own once before joining a crew.", 10f);
                 return false;
             }
 

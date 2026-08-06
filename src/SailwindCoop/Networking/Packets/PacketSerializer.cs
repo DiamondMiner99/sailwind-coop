@@ -924,15 +924,23 @@ namespace SailwindCoop.Networking.Packets
         {
             writer.Write(packet.BoatName);
             writer.Write(packet.InputDelta);
+            writer.Write(packet.Absolute); // (v0.3.0) the helmsman's own resulting wheel angle
         }
 
         public static HelmInputPacket ReadHelmInput(BinaryReader reader)
         {
-            return new HelmInputPacket
+            var packet = new HelmInputPacket
             {
                 BoatName = reader.ReadString(),
                 InputDelta = reader.ReadSingle()
             };
+            // (v0.3.0) Trailing field. Read tolerantly and mark it absent with NaN rather than defaulting to
+            // 0 - zero is a perfectly valid wheel angle (rudder amidships), so a missing field that decoded
+            // as 0 would centre the helm instead of being ignored.
+            packet.Absolute = reader.BaseStream.Position < reader.BaseStream.Length
+                ? reader.ReadSingle()
+                : float.NaN;
+            return packet;
         }
 
         public static void WriteHelmLock(BinaryWriter writer, HelmLockPacket packet)

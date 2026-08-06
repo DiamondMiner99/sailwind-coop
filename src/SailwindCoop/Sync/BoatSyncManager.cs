@@ -50,7 +50,7 @@ namespace SailwindCoop.Sync
             // inter-packet gap and cause false snaps.
             public bool SnapOnNextApply;
             public float LastPacketUnscaledTime;
-            // (v0.2.39) Unscaled time at which the CURRENT sustained divergence began, or 0 when converged.
+            // (v0.3.0) Unscaled time at which the CURRENT sustained divergence began, or 0 when converged.
             // See the persistence escalation in the correction branch: without it the corrector can lose
             // forever without ever qualifying for the teleport that would end it.
             public float DivergenceStartUnscaledTime;
@@ -122,7 +122,7 @@ namespace SailwindCoop.Sync
         // under the locally rendered surface in chop. XZ correction is unchanged (the host stays
         // authoritative for horizontal position).
         //
-        // (v0.2.39) CORRECTION TO A CLAIM THAT STOOD HERE FOR SIX VERSIONS. This comment used to justify the
+        // (v0.3.0) CORRECTION TO A CLAIM THAT STOOD HERE FOR SIX VERSIONS. This comment used to justify the
         // softening by saying "the wave spectrum is seeded deterministically on every client
         // (WeatherPatches.OceanSpectrumSeedPatch), so the boat naturally floats at the same height as the
         // host". That patch was added in v0.2.16 and DELETED in v0.2.19 when ocean sync was retargeted at
@@ -142,7 +142,7 @@ namespace SailwindCoop.Sync
         // boat before it can clip badly through the deck/water; normal float jitter stays well under this).
         private const float VerticalHardCorrectThreshold = 3f; // meters
 
-        // (v0.2.39) Sustained-divergence escalation. The gentle corrector's own clamps keep the error well
+        // (v0.3.0) Sustained-divergence escalation. The gentle corrector's own clamps keep the error well
         // under TeleportThreshold, so without a TIME-based escape it can lose forever. 4m/4s is chosen to sit
         // clearly outside normal play: ordinary correction settles in well under a second, and the observed
         // live failure held 5-8m for 5.5s. Unscaled seconds.
@@ -156,7 +156,7 @@ namespace SailwindCoop.Sync
         private const float PostJoinVerboseSeconds = 60f;
         private static float _lastJoinCompleteUnscaledTime = -999f;
 
-        /// <summary>(v0.2.39) Opens the post-join verbose window. Called at the end of the join coroutine.</summary>
+        /// <summary>(v0.3.0) Opens the post-join verbose window. Called at the end of the join coroutine.</summary>
         public static void NoteJoinComplete() => _lastJoinCompleteUnscaledTime = Time.unscaledTime;
 
         /// <summary>
@@ -517,7 +517,7 @@ namespace SailwindCoop.Sync
                 // VerticalHardCorrectThreshold, in which case we fully correct Y to catch a real desync
                 // before the hull clips through the deck/water. Solo is never multiplayer so never reaches
                 // here; this only runs guest-side.
-                float rawErrorY = positionError.y;   // (v0.2.39) kept for diagnostics, before softening
+                float rawErrorY = positionError.y;   // (v0.3.0) kept for diagnostics, before softening
                 float verticalFactor = (Mathf.Abs(positionError.y) > VerticalHardCorrectThreshold)
                     ? 1f
                     : VerticalCorrectionFactor;
@@ -542,7 +542,7 @@ namespace SailwindCoop.Sync
                 // Clamp the commanded correction so a large-but-sub-teleport error (e.g. after a receive
                 // stall) is chased gently instead of violently. No-op at normal errors (<5m -> <~35 m/s^2).
                 Vector3 correction = Vector3.ClampMagnitude(positionCorrection + velocityCorrection, 30f);
-                Vector3 velBeforeCorrection = rb.velocity; // (v0.2.39) diagnostics: the real hull speed
+                Vector3 velBeforeCorrection = rb.velocity; // (v0.3.0) diagnostics: the real hull speed
                 rb.velocity += correction * dt;
 
                 // Hard speed ceiling relative to the host's authoritative speed - catches any residual
@@ -568,7 +568,7 @@ namespace SailwindCoop.Sync
                     rb.angularVelocity += (rotationCorrection + angularVelocityCorrection) * dt;
                 }
 
-                // (v0.2.39) PERSISTENCE ESCALATION. Without this the corrector can lose indefinitely.
+                // (v0.3.0) PERSISTENCE ESCALATION. Without this the corrector can lose indefinitely.
                 // Its two modes are gentle PD (error < TeleportThreshold) and teleport (error >= it), but its
                 // OWN clamps - ClampMagnitude(...,30f) above and the maxSpeed ceiling - hold the error inside
                 // a roughly 0-10m band, so a 50m threshold is mathematically unreachable from here. The one
@@ -617,7 +617,7 @@ namespace SailwindCoop.Sync
                 }
                 else state.DivergenceStartUnscaledTime = 0f;
 
-                // (v0.2.39) DIAGNOSTICS. The old line printed three quantities that were misleading:
+                // (v0.3.0) DIAGNOSTICS. The old line printed three quantities that were misleading:
                 //  - "velocity" was read AFTER the maxSpeed clamp two statements above, so on any frame the
                 //    clamp fired it printed the ceiling (TargetVelocity + 8) rather than the hull's speed.
                 //    In a live capture it read 8.1-8.5 on 100% of 214 frames while the host streamed
@@ -653,7 +653,7 @@ namespace SailwindCoop.Sync
             new System.Collections.Generic.Dictionary<int, float>();
 
         /// <summary>
-        /// (v0.2.39) Why the hull is where it is, rather than only that it is in the wrong place.
+        /// (v0.3.0) Why the hull is where it is, rather than only that it is in the wrong place.
         ///
         /// The position diagnostic alongside this one reports the boat's transform and the mod's own
         /// commanded numbers, and that turned out to be the wrong half of the story: a hull sitting too high
@@ -921,7 +921,7 @@ namespace SailwindCoop.Sync
             _targetBoatName = null;
             _boatStates.Clear();
             IsJoinInProgress = false;
-            _lastJoinCompleteUnscaledTime = -999f; // (v0.2.39) close the post-join verbose window
+            _lastJoinCompleteUnscaledTime = -999f; // (v0.3.0) close the post-join verbose window
             HasReceivedWorldState = false; // (v0.2.25) re-arm the guest join-state watchdog for the next session
 
             // Clear cache

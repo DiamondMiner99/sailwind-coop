@@ -275,7 +275,7 @@ namespace SailwindCoop.Networking.Packets
         // the author id; host relays.
         BellRing = 219,                  // Ringer -> all (host relays): play the Leopard's bell
 
-        // Avatar appearance (220, v0.2.39): which Synty modular parts each player wears. ADDITIVE and
+        // Avatar appearance (220, v0.3.0): which Synty modular parts each player wears. ADDITIVE and
         // purely cosmetic - a peer that never sends one is shown a deterministic look derived from their
         // SteamId, so an older build degrades to "wrong outfit", never to a broken session.
         // Body: authorId (u64), slotCount (byte), then slotCount variant bytes.
@@ -285,11 +285,25 @@ namespace SailwindCoop.Networking.Packets
         // does not match the sender, and relays the SANITIZED struct rather than the raw bytes.
         PlayerAppearance = 220,          // Any peer -> all (host relays) / host -> joiner (roster replay)
 
-        // Mooring rope carried (221, v0.2.39): who is holding a boat's mooring rope, so a docking manoeuvre
+        // Mooring rope carried (221, v0.3.0): who is holding a boat's mooring rope, so a docking manoeuvre
         // is visible to the rest of the crew instead of a rope silently appearing on a cleat. Addressed as
         // (boatName, ropeIndex) - the same scheme the moor/unmoor packets use - because a mooring rope is a
         // permanent child of one boat and needs none of the ShipItem identity machinery.
         // Body: boatName (string), ropeIndex (byte), holderSteamId (u64; 0 = released).
         MooringRopeHeld = 221,           // Carrier -> all (host relays)
+
+        // Mooring rope length being ADJUSTED (222, v0.3.0): who is holding a moored rope's length adjuster,
+        // the object vanilla hands you when you press R on a rope that is already on a cleat. The rope's
+        // LENGTH is already synced by MooringRopeLength (35); this is the separate latched VISUAL - the pull
+        // rope back to the cleat and the spinning coil - which lives on a second GameObject and cannot be
+        // derived from the length. Same (boatName, ropeIndex) addressing as 221.
+        //
+        // NOT a flag on 221, deliberately. 221 is only ever sent for ropes that are NOT moored (vanilla
+        // unmoors on pickup) and its receiver calls ResetRopePos on release, so an older peer decoding an
+        // adjust as a carry would reset a MOORED rope's position - permanently displacing the rope end at
+        // the cleat and poisoning the distance its sag is computed from. An unknown packet type is logged
+        // and dropped, which is the fail-open behavior wanted here.
+        // Body: boatName (string), ropeIndex (byte), holderSteamId (u64; 0 = released).
+        MooringRopeAdjusting = 222,      // Adjuster -> all (host relays)
     }
 }

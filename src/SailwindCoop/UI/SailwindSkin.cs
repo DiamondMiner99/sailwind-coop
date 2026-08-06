@@ -3,7 +3,7 @@ using UnityEngine;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) Sailwind's own typeface and palette, for IMGUI panels that should not look like a
+    /// (v0.3.0) Sailwind's own typeface and palette, for IMGUI panels that should not look like a
     /// developer console bolted onto a sailing game.
     ///
     /// THE USEFUL SURPRISE: Sailwind contains NO TextMeshPro at all - no TMPro assembly in Managed/, no

@@ -14,14 +14,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
-## v0.2.39 - 2026-08-05
+## v0.3.0 - 2026-08-06
 
-> **All players must update.** The network format changed: two new message types carry your
-> character's appearance and who is carrying a mooring rope. A crew on mixed versions is refused
-> at the handshake as usual.
+> **All players must update.** The network format changed: three new message types carry your
+> character's appearance, who is carrying a mooring rope, and who is adjusting one's length, and
+> steering now sends the helmsman's wheel angle rather than a running total of nudges. A crew on
+> mixed versions is refused at the handshake as usual.
+>
+> The version jumps from 0.2.x because this release changes how you get into a session at all: you
+> can ask to come aboard rather than waiting to be invited, you can join from the main menu without
+> loading a world first, and the join itself is now something you watch rather than something you
+> sit through.
 
 ### Added
 
+- **A loading screen for joining.** Joining used to mean watching your own world load, then standing
+  frozen 50 meters above the sea while the islands around the captain's ship streamed in, then being
+  snapped onto their deck. All of that was working correctly and all of it looked like the game had
+  hung. There is now a proper loading screen over it, and the bar moves on the join's real progress
+  rather than on a timer: it advances when a step genuinely finishes, the label names the step you
+  are on, and the islands step reports actual progress because that is the one the game can measure.
+  It never claims to be finished early, and it only covers the part of the join where you had no
+  control anyway, so it can never black out a screen you could still be walking around behind.
+  If a step takes longer than it should, the screen says so and keeps counting, naming what it is
+  waiting on. That is deliberate. A loading screen makes a working join feel finished and a broken
+  one invisible, so this one is built to tell you which of the two you are looking at, and to tell
+  me where it stopped if you send a log.
 - **A character screen.** Open the pause menu and pick "Character". You set build,
   head, hair, eyebrows, facial hair, torso, hips, legs and a hat, drawn from the same parts library the game dresses its own shopkeepers from. A live model beside the controls rotates, so you can
   see the back of a hat. Your crew sees your choices, and the look is saved for future sessions.
@@ -43,7 +61,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   everyone's screen instead of lying on the dock while they walk away holding nothing.
 - **A readable panel for the things that stop a join.** Version and mod mismatches used to scroll
   past in the corner notification ticker, clipped, in the seconds before the game closed. They now
-  get a panel that stays up until you close it and says which mod differs.
+  get a panel that stays up until you close it, with one line per mod and per setting: which mod,
+  which option, which side has it switched on, which section of the config file it lives under, and
+  whether changing it needs a restart. Mods outside the compatibility check that still differ between
+  you are listed as well, so a mismatch you have to go and fix is a list you can work down rather
+  than a paragraph to decipher.
+- **A Friends button on the title menu.** Co-op used to live only in the in-game pause menu, on the
+  reasoning that both players need a loaded world before a join can work. That stopped being true
+  when joining from the title screen was added, and what was left was a dead end: an invite arriving
+  at the main menu told you to open the menu to join, and there was no menu to open. The title screen
+  now carries the same friends list the pause menu does, so you can see who is sailing, ask to come
+  aboard, and accept an invite without loading a world first.
+- **You can see when a crewmate is adjusting a mooring rope's length.** Pressing R on a moored rope
+  hands you a separate rope and coil to haul on, and none of that was shown to anyone else, so the
+  rope tightened by itself with nobody visibly doing it. The length was already synced; what was
+  missing was the person. Hauling on the rope at the dock cleat and hauling on the one at the ship
+  look different from each other, and now they look different to the crew as well.
 
 ### Fixed
 
@@ -88,11 +121,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   an evening copying files at each other. Refusals now name the setting as the file names it, say which
   section it is under, say whether a restart is needed, and keep that separate from "update the mod" and
   from "this mod is broken on one of your machines".
-- **A mod that crashes on startup was invisible.** When a mod fails to start, the loader drops it from
-  the list of installed mods, so the crew mod-comparison could not see it. That is how Anchor
-  Improvements came to be reported as a co-op problem: it is broken on Sailwind 0.38 whether or not
-  co-op is installed, because it patches two methods the game renamed, but it half-applies before failing
-  and leaves the game changed. Any mod in that state is now reported by name at startup.
 - **Your sailor floated a few inches above the deck.** Two separate causes stacked: the body was
   planted using a hardcoded height instead of the one the mod already measures, and both ends fitted
   the model to the bottom of its render bounds, which hangs below the soles. Feet now sit on the deck and on the ground.
@@ -117,6 +145,102 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   part-swapping routine, triggered by two headwear entries that contain no model.
 - **Guests no longer get a "Leave Lobby" button.** For a guest it did the same thing as Quit Game,
   without saying so.
+
+#### Found in a two-machine playtest
+
+- **A refused join looked like a broken one.** When a captain's mod set did not match yours, their
+  game decided correctly and told you so, and you never heard it. The refusal is sent and the
+  connection closed in the same frame, and closing a Steam connection discards whatever is still
+  waiting to go out on it, so the message died on the way. What you got instead was forty-five
+  seconds of nothing followed by a note suggesting you check whether you were Steam friends, which
+  had nothing to do with it. The connection is now held open long enough for the refusal to leave,
+  while your packets are already being ignored.
+- **Starting a session from the pause menu left the captain's world frozen.** The world is meant to
+  keep running in co-op, and the check that decides that ran a moment before the session existed.
+  Everything the captain owed the crew, the entire join included, was waiting on a clock that was
+  not moving.
+- **Crouching on a dock buried you in it.** Crouching in this game moves the camera and nothing
+  else, and the position sent to your crew was worked out from the camera, so crouching subtracted
+  the crouch a second time and your crewmates watched you sink through the planks. It only happened
+  ashore, because the version used aboard a ship was already measured from the body.
+- **The green placement outline appeared on everyone's screen.** Aiming a wall-mountable item drew a
+  translucent copy of it on every other display, hanging where the item was not. It is an aiming
+  guide for whoever is holding the thing, and it stays with them now.
+- **Crew weight never reached the captain's ship.** A crewmate walking to the rail heeled the boat on
+  their own screen and did nothing on the captain's, which is the one that decides how the ship
+  behaves. The check matching a crewmate to a boat compared two different parts of the same ship, so
+  it never matched anyone and no crew weight was ever added. That has been true in every released
+  version, not only this one. Crew weight also switched off entirely while moored or anchored, to
+  stop a docked ship flooding when driven against its own mooring springs. That risk lasts a single
+  moment, when the rope is first made fast, so it is handled there instead, and your crew now trim
+  the boat whether you are tied up or under way.
+- **Steering as a crewmate jumped half a second after you stopped.** The captain's game kept a
+  running total of your steering nudges, arrived at separately from your own, over a connection
+  allowed to drop messages. The two drifted apart, and when you let go the captain's total was sent
+  back as the authoritative one. Everyone now uses the helmsman's actual wheel angle, so there is no
+  second opinion to drift from and a dropped message costs one frame instead of staying wrong.
+- **Mooring ropes went missing, stuck, or refused to be tied.** Throwing a rope to a cleat made it
+  vanish for half a second on every other screen while it flew, because the throw was reported as a
+  release and everyone put the rope away. Fixing that introduced the opposite problem: a throw that
+  missed was never released at all, so the crew carried it indefinitely, and a machine that believed
+  someone else held a rope would not let that rope be moored, which left two players passing an
+  untieable rope back and forth. All of it is handled now. The throw itself is shown, a throw that
+  misses stows the rope shortly after, and picking a rope up clears any belief that someone else has
+  it. A crewmate who quits while carrying one leaves it stowed rather than hanging in the air.
+- **A message you had to read closed the game before you could read it.** The panel explaining why a
+  session ended waited for a click, and the game quit six seconds later regardless, so a refusal
+  listing several mods vanished mid-sentence into the desktop. It waits now. While it is up the mouse
+  no longer turns the camera behind it, and it grows to fit its text instead of showing a scrollbar
+  for two lines.
+- **Accepting an invite from the title screen froze the game on a menu that stopped responding.** The
+  accept ran the in-game unpause, which restores the speed stored when you paused. Nothing had been
+  stored at the title screen, so the clock was set to zero and the world load then waited on a timer
+  that never advanced. The menu stopped taking clicks because the game counts a load as an animation
+  in progress. A load that fails now hands the menu back and explains itself.
+- **An invite stopped working after the first time you used it.** Steam re-offers a pending invite on
+  every launch, and the check that stops it nagging about a dead one was discarding the invite rather
+  than staying quiet about it. After joining a captain once, their invites no longer appeared
+  anywhere, and accepting through Steam launched the game and then did nothing. The invite is kept
+  now, so it waits in the friends list, and an invite to a session someone is demonstrably still
+  sailing in is announced again rather than treated as stale.
+- **Pause menu and crew list layout.** The button column was anchored at its top while the number of
+  buttons varies, so a crewmate's shorter menu sat high on the parchment and a captain's did not. The
+  crew list capped at four names and a "+4 more" on a full crew. Both fit themselves to the parchment
+  now, and long notifications wrap inside the scroll instead of running off both edges.
+
+#### Found in a code review of this release
+
+- **The friends list on the main menu let clicks through to the menu behind it.** The list is drawn
+  over the title parchment rather than being part of it, and drawing something over the parchment
+  does not stop the parchment being clicked. The game aims at menu buttons with a ray cast from the
+  mouse, and that ray does not care what is painted on top of them. A click meant for a friend's name
+  could land on Continue and start loading your solo save behind the list, or open the quit prompt,
+  or tear the menu down for a new game. The buttons underneath are switched off while the list is up
+  and switched back on when it closes.
+- **Throwing a mooring rope let everyone else's game tie it up first.** The game hides a thrown rope
+  from cleats for the length of the throw, which is what makes it catch only the one you aimed at.
+  The copy of the throw played back on other screens was missing that, so every other machine tied
+  the rope to the first cleat the flight passed over and reported it to the crew as though that
+  player had tied it. With two of you the result was a dockline slightly too tight or too slack. With
+  three or more, each machine reported its own rope length and no two agreed, and a throw that missed
+  on your screen could leave one crewmate's game alone believing the ship was tied to a bollard. The
+  played-back rope is now kept off cleats for the length of the throw, the same way the game already
+  does it for whoever threw it, so only their game decides what it catches.
+- **Clicking a wheel without steering it jolted the ship and took the helm from whoever was
+  steering.** Letting go of a wheel sends the captain the angle you finished on, which is what keeps
+  a lost message from leaving the captain a nudge behind. That was sent for any release at all,
+  including a wheel you only clicked. Someone who is not steering has no angle of their own to
+  report, only a stale one their game has been drifting since anyone last touched the wheel, so an
+  idle click handed the captain that number and put it on the rudder. The same click counted as
+  asking for the helm, which the person actually steering then lost for up to half a second. A wheel
+  you did not turn reports nothing now.
+- **Two crewmates taking the same rope-length adjuster stuck it to one of them.** Nothing stops both
+  of you grabbing it, and the second grab did not clear the belief that the first player still had
+  it. Your own adjuster was dragged to their hands every frame, and when they let go it put yours
+  away while you were still holding it, after which it stopped answering the drop key. Whoever has it
+  in their own hands now keeps it, whichever of you reached for it first.
+- **A refused join left no record of what did not match.** The panel told you the full list was in
+  the log, and it was not. That list was only ever written out for players who were being let in.
 
 ## v0.2.38 - 2026-07-28
 

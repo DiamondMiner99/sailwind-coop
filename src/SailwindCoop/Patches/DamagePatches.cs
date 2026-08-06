@@ -18,7 +18,7 @@ namespace SailwindCoop.Patches
         /// The host stays authoritative for how much water is in a hull. A GUEST, however, must still turn
         /// that number into physics.
         ///
-        /// (v0.2.39) This patch used to return false and stop, and that was a large hole rather than a small
+        /// (v0.3.0) This patch used to return false and stop, and that was a large hole rather than a small
         /// one. `UpdateWaterAndDrag` is TWO things bolted together: it integrates waterLevel from leaks,
         /// rain and bailing, and it then DERIVES the hull's physics from whatever waterLevel now is. It is
         /// the only place in the entire game that writes `BoatProbes._forceMultiplier` (buoyancy),
@@ -58,7 +58,7 @@ namespace SailwindCoop.Patches
                 {
                     // Coop.GuestHullPhysics is a kill switch, not a preference: this whole path is
                     // unreachable without a second machine, so a crew that hits trouble with it needs a way
-                    // out that does not involve waiting for a build. Off = the pre-v0.2.39 behavior exactly.
+                    // out that does not involve waiting for a build. Off = the pre-v0.3.0 behavior exactly.
                     if (Plugin.GuestHullPhysicsConfig == null || Plugin.GuestHullPhysicsConfig.Value)
                         ApplyGuestHullPhysics(__instance);
                     return false; // the host owns the water level itself

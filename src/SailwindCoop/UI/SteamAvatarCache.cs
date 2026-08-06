@@ -5,7 +5,7 @@ using UnityEngine;
 namespace SailwindCoop.UI
 {
     /// <summary>
-    /// (v0.2.39) Steam profile pictures as Unity textures, fetched once per player and kept.
+    /// (v0.3.0) Steam profile pictures as Unity textures, fetched once per player and kept.
     ///
     /// Steam hands avatars over asynchronously, and IMGUI runs many times a second - so the one thing this
     /// class must never do is start work from a draw call. <see cref="Get"/> is therefore a pure lookup: it

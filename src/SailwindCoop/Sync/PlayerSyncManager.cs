@@ -27,7 +27,7 @@ namespace SailwindCoop.Sync
 
         // LOOK-LEAN: cached ref-accessor for MouseLook's PRIVATE clamped vertical-look field `rotationY`
         // (positive = looking UP, clamped ~[-60,60]). The instance is resolved by IDENTITY - see
-        // SampleHeadLookPitchDeg. (v0.2.39: the old scene-wide scan that took the largest |rotationY| is
+        // SampleHeadLookPitchDeg. (v0.3.0: the old scene-wide scan that took the largest |rotationY| is
         // gone; that heuristic was a real bug, not merely a slow lookup, and its rationale is deleted here
         // rather than left sitting next to the code that disproves it.)
         private static readonly AccessTools.FieldRef<MouseLook, float> MouseLookRotationYRef =
@@ -100,7 +100,7 @@ namespace SailwindCoop.Sync
             if (Time.time - _lastSyncTime < SyncInterval * SleepSyncManager.SleepSendIntervalScale) return;
             _lastSyncTime = Time.time;
 
-            // (v0.2.39) DELIBERATELY NOT GATED ON IsJoinInProgress. An earlier cut of this fix added
+            // (v0.3.0) DELIBERATELY NOT GATED ON IsJoinInProgress. An earlier cut of this fix added
             // `if (BoatSyncManager.IsJoinInProgress) return;` here, to stop peers watching a joiner descend
             // the 50m terrain-load perch. Adversarial review killed it, and the reason is the comment block
             // directly above: PlayerPosition is the ONLY writer of RemoteAvatar.LastRemotePacketTime, which
@@ -120,7 +120,7 @@ namespace SailwindCoop.Sync
             SendPlayerPosition(charController);
         }
 
-        // (v0.2.39) Out-of-world rescue. See OutOfWorldRescueTick.
+        // (v0.3.0) Out-of-world rescue. See OutOfWorldRescueTick.
         private const float OutOfWorldProbeInterval = 1f;
         private const float OutOfWorldFloorY = -300f;    // well below the seabed at any island
         private const float OutOfWorldCeilingY = 2000f;  // well above any mast, cliff or storm
@@ -130,7 +130,7 @@ namespace SailwindCoop.Sync
         private int _outOfWorldHits;
 
         /// <summary>
-        /// (v0.2.39) Bring back a crewmate who has fallen out of the world.
+        /// (v0.3.0) Bring back a crewmate who has fallen out of the world.
         ///
         /// A guest currently has NO way back. Vanilla's safety net is WorldBorder, which after two minutes
         /// out of bounds calls Recovery.RecoverPlayer - and this mod disables WorldBorder outright for
@@ -215,7 +215,7 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
-        /// (v0.2.39) Find the ship to put a fallen crewmate back on, using state that SURVIVES falling.
+        /// (v0.3.0) Find the ship to put a fallen crewmate back on, using state that SURVIVES falling.
         ///
         /// The obvious answer, GameState.currentBoat, is the wrong one, and wrong in precisely the case this
         /// rescue exists for. Vanilla nulls that field on every disembark path, and going into the sea IS a
@@ -414,7 +414,7 @@ namespace SailwindCoop.Sync
         /// LOOK-LEAN: the LOCAL player's clamped vertical look angle in degrees (~[-60,60]; positive = looking
         /// UP), read from the vanilla MouseLook.rotationY private field.
         ///
-        /// (v0.2.39) Resolved by IDENTITY - the MouseLook on Refs.ovrCameraRig, which is the player head's
+        /// (v0.3.0) Resolved by IDENTITY - the MouseLook on Refs.ovrCameraRig, which is the player head's
         /// vertical look. It used to scan every MouseLook in the scene and take the LARGEST ABSOLUTE
         /// rotationY, on the stated assumption that only the vertical head instance is ever non-zero. That
         /// assumption is false and it produced a reported bug: a crewmate's avatar was seen folded fully
@@ -535,10 +535,12 @@ namespace SailwindCoop.Sync
                     }
                     else
                     {
-                        // Fallback: camera feet projected into the visual boat frame (already FEET)
-                        const float eyeHeight = 1.7f;
-                        var cameraFeetPos = Camera.main.transform.position - new Vector3(0, eyeHeight, 0);
-                        relativePos = visualBoat.transform.InverseTransformPoint(cameraFeetPos);
+                        // Fallback when observerMirror is missing. (v0.3.0) Was camera minus a constant 1.7m
+                        // eye height, which is the same crouch bug the land branch below had: crouch moves the
+                        // camera rig and nothing else, so a crouched player transmitted feet ~0.95m too low.
+                        // Sourced from the controller instead, to match the primary path above.
+                        relativePos = visualBoat.transform.InverseTransformPoint(charController.transform.position);
+                        relativePos.y -= ControllerFeetGap();
                     }
 
                     VerboseLogger.PlayerSend($"OnBoat (visual), boat={boatName}, relPos={relativePos}", throttle: true);
@@ -559,22 +561,35 @@ namespace SailwindCoop.Sync
             }
             else
             {
-                // Player is on land - use world coordinates at FEET level
-                // Use camera position minus eye height (same approach as on-boat case)
-                // This ensures receiver can add capsuleHalfHeight consistently
+                // Player is on land - world coordinates at FEET level.
                 isOnBoat = false;
                 boatName = "";
-                const float eyeHeight = 1.7f;
-                var cameraFeetPos = Camera.main != null
-                    ? Camera.main.transform.position - new Vector3(0, eyeHeight, 0)
-                    : position; // fallback to charController center if no camera
 
-                // Convert to REAL (offset-independent) position
-                // This ensures correct position when sender/receiver have different FloatingOriginManager offsets
+                // (v0.3.0) CROUCH FIX: feet come from the CONTROLLER, not the camera.
+                //
+                // This used to be `Camera.main.position - 1.7f`, and vanilla crouch is implemented purely as
+                // a camera-rig height lerp: PlayerCrouching lerps currentHeadHeight down to 0.2, and HeadBob
+                // writes that straight into the rig's localPosition. Nothing in the game ever changes the
+                // CharacterController's height or centre. So a crouching player's camera drops ~0.95m while
+                // their capsule does not move at all, the constant 1.7 subtracted the whole crouch a second
+                // time, and the receiver plants the avatar's soles exactly on the point it is sent - burying
+                // a crouched crewmate in the dock.
+                //
+                // The on-boat branch above was always immune because it already sources observerMirror and
+                // subtracts ControllerFeetGap(). This makes land agree with it, so "feet" now means one thing
+                // on the wire instead of two. It also takes head-bob and landing-bob out of the transmitted
+                // position, which were riding along in the old camera-derived value.
+                //
+                // The RECEIVER is correct and must not be touched: its plant offsets and crouch leg IK are
+                // symmetric between land and boat, which is exactly why this bug was land-only.
+                var feetPos = position - new Vector3(0f, ControllerFeetGap(), 0f);
+
+                // Convert to REAL (offset-independent) position, so sender and receiver can disagree about
+                // their FloatingOriginManager offsets.
                 var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
-                relativePos = cameraFeetPos - offset;
+                relativePos = feetPos - offset;
 
-                VerboseLogger.PlayerSend($"OnLand, localFeetPos={cameraFeetPos}, realPos={relativePos}", throttle: true);
+                VerboseLogger.PlayerSend($"OnLand, feetPos={feetPos}, realPos={relativePos}", throttle: true);
             }
 
             // Check if player is holding an item
@@ -599,7 +614,7 @@ namespace SailwindCoop.Sync
                         heldItemId = prefab.instanceId;
                         // Use boat-relative if on boat, otherwise REAL world position.
                         //
-                        // (v0.2.39) The frame is chosen from `visualBoat`, but the isOnBoat FLAG on the wire
+                        // (v0.3.0) The frame is chosen from `visualBoat`, but the isOnBoat FLAG on the wire
                         // is derived separately (from the player's parent). Those two could disagree: when
                         // GameState.currentBoat is null while the player is still parented to a hull, this
                         // sent a REAL-WORLD point under isOnBoat=TRUE, and the receiver - which picks its
