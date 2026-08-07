@@ -178,7 +178,9 @@ namespace SailwindCoop.UI
             _label = new GUIStyle(GUI.skin.label) { fontSize = 19, padding = new RectOffset(4, 4, 6, 6) }.WithFont();
             _label.normal.textColor = SailwindSkin.InkColor;
 
-            _name = new GUIStyle(_label) { fontStyle = FontStyle.Bold };
+            // (v0.3.1) wordWrap, because Steam names are as long as their owner wants them to be.
+            // Without it a name like "Salvatore da Monferrato" runs off the panel and is simply cut.
+            _name = new GUIStyle(_label) { fontStyle = FontStyle.Bold, wordWrap = true };
 
             _small = new GUIStyle(_label) { fontSize = 15, fontStyle = FontStyle.Italic, wordWrap = true };
             _small.normal.textColor = SailwindSkin.InkFaint;
@@ -226,6 +228,20 @@ namespace SailwindCoop.UI
             GUILayout.EndArea();
         }
 
+        /// <summary>
+        /// (v0.3.1) Trim a Steam name to fit inside a button. Only for BUTTONS - labels wrap instead, so
+        /// the full name is always readable somewhere on the panel. Breaks on a space when there is one
+        /// near the limit, so "Salvatore da Monferrato" becomes "Salvatore da..." rather than a word cut
+        /// mid-syllable.
+        /// </summary>
+        private static string Shorten(string name, int max)
+        {
+            if (string.IsNullOrEmpty(name) || name.Length <= max) return name ?? "";
+            int cut = name.LastIndexOf(' ', Mathf.Min(max, name.Length - 1));
+            if (cut < max / 2) cut = max;
+            return name.Substring(0, cut).TrimEnd() + "...";
+        }
+
         private static string FooterHint()
         {
             if (Plugin.IsHost) return "Only you can let anyone aboard.";
@@ -244,7 +260,11 @@ namespace SailwindCoop.UI
             GUILayout.BeginVertical(_band);
             GUILayout.Label(invite.SenderName + " invited you to co-op.", _name);
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Join " + invite.SenderName, _button, GUILayout.Width(220f)))
+            // (v0.3.1) MinWidth, not Width, and the name is shortened. A fixed 220px button with a full
+            // Steam name inside it clipped BOTH ends on a long one, so the reported button read
+            // "n Salvatore da Monferro". The label directly above already gives the name in full, so the
+            // button only has to be unambiguous, not complete.
+            if (GUILayout.Button("Join " + Shorten(invite.SenderName, 16), _button, GUILayout.MinWidth(220f)))
             {
                 ForceClose();
                 // Unpause before joining. ForceClose puts the pause parchment back, which leaves the world

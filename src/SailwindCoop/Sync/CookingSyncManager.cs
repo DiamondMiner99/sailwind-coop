@@ -957,12 +957,76 @@ namespace SailwindCoop.Sync
             try
             {
                 fuelTrigger.InsertFuel(fuelItem);
-                VerboseLogger.CookingApply($"Inserted fuel {packet.FuelInstanceId} into stove {packet.StoveInstanceId}");
+
+                // (v0.3.1) VANILLA InsertFuel IS A SILENT NO-OP WHEN THE STOVE IS FULL. Its whole body is
+                // wrapped in `if (currentFuel < maxFuel)`, with no return value and no error, so a refused
+                // insert is indistinguishable from a successful one at the call site. This line used to log
+                // "Inserted ..." unconditionally, which is why the resulting divergence left no trace in the
+                // log at all.
+                //
+                // That silence is what makes it self-amplifying. currentFuel is a private per-machine count,
+                // and once it drifts high on one machine (burn-down timing is the likely source: StoveFuel's
+                // Update unregisters burnt fuel per frame, and this file already carries a clamp for a
+                // negative-count report from 2026-07-02) EVERY later insert from a peer is silently dropped
+                // there. The machines then disagree about the fuel count permanently, and since the count
+                // decides whether the stove lights, they disagree about whether cooking is happening.
+                // Reported live 2026-08-06: a guest loaded three logs, saw three, while the host and the
+                // other guest saw two and had the smoker light at a count the guest did not have.
+                //
+                // RECONCILE FROM GROUND TRUTH RATHER THAN TRUSTING EITHER COUNT. The number of fuel items
+                // actually sitting inserted in the stove is countable locally, so on a refusal we recount
+                // and, only if the stored count is provably too high, correct it and retry once. Lowering
+                // exclusively to a physically-counted value means this can neither inflate the count past
+                // maxFuel nor drive it negative. If the recount agrees with the stored count the stove is
+                // genuinely full, the refusal was legitimate, and we leave it alone and say so.
+                bool applied = stoveFuel == null || stoveFuel.inserted;
+                if (!applied)
+                {
+                    var currentFuelField = Traverse.Create(fuelTrigger).Field("currentFuel");
+                    int claimed = currentFuelField.GetValue<int>();
+                    int actual = CountInsertedFuel(stove);
+                    if (actual < claimed)
+                    {
+                        Plugin.Log.LogWarning($"[COOKING] Stove {packet.StoveInstanceId} refused fuel " +
+                            $"{packet.FuelInstanceId}: count said {claimed}, only {actual} fuel items are " +
+                            $"actually inserted. Correcting and retrying.");
+                        currentFuelField.SetValue(actual);
+                        fuelTrigger.InsertFuel(fuelItem);
+                        applied = stoveFuel.inserted;
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning($"[COOKING] Stove {packet.StoveInstanceId} is genuinely full " +
+                            $"({actual} inserted); fuel {packet.FuelInstanceId} was NOT inserted here but " +
+                            $"was on the sender. Fuel counts now differ.");
+                    }
+                }
+
+                if (applied)
+                    VerboseLogger.CookingApply($"Inserted fuel {packet.FuelInstanceId} into stove {packet.StoveInstanceId}");
+                else
+                    VerboseLogger.CookingApply($"Fuel {packet.FuelInstanceId} REFUSED by stove {packet.StoveInstanceId}");
             }
             finally
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        /// <summary>
+        /// (v0.3.1) How many fuel items are physically inserted in this stove right now. This is the
+        /// ground truth StoveFuelTrigger.currentFuel is supposed to mirror, and the only value safe to
+        /// correct that counter to. Burnt-but-not-yet-destroyed fuel still reads inserted, so this can
+        /// over-count for a frame - which fails safe, because the caller only ever uses it to lower the
+        /// stored count and an over-count simply leaves the count alone.
+        /// </summary>
+        private static int CountInsertedFuel(ShipItemStove stove)
+        {
+            int n = 0;
+            var fuels = stove.GetComponentsInChildren<StoveFuel>(true);
+            for (int i = 0; i < fuels.Length; i++)
+                if (fuels[i] != null && fuels[i].inserted) n++;
+            return n;
         }
 
         #endregion

@@ -404,6 +404,13 @@ namespace SailwindCoop.Networking
                 return;
             }
 
+            // (v0.3.1) Liveness stamp for HostLinkWatchdog. Placed here, at the single funnel both channels
+            // pass through, and BEFORE the deserialize - a packet that arrives and then fails to parse still
+            // proves the transport is carrying traffic, which is the only thing the watchdog is asking.
+            // Guest-side only; the host has its own peer-timeout handling.
+            if (!Plugin.IsHost && sender == SteamLobbyManager.Instance.HostSteamId)
+                HostLinkWatchdog.NotePacketFromHost();
+
             try
             {
                 using (var stream = new MemoryStream(data))

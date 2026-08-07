@@ -257,7 +257,14 @@ namespace SailwindCoop.UI
                 // drift while the world keeps running; our panel is HIDDEN while a sub-page is up, so gating
                 // only on IsOpen left the sub-pages un-pinned (they floated off at sea). MoveMenuToPlayer
                 // re-aims the whole startMenu root, so re-pinning here covers the panel and the sub-pages.
-                bool pinning = IsOpen || (SubPageFromPause && AnySubPageActive());
+                // (v0.3.1) The character and friends screens BOTH call Hide() as they open, precisely so no
+                // clickable world-space button is left behind their panel. That turns IsOpen FALSE, which
+                // turned pinning off - while vanilla's startMenu root, carrying the logo and the parchment,
+                // was still active in the world. Underway, the boat sails away from it and the logo visibly
+                // flies off. This is the same drift the sub-page clause above already exists to fix; these
+                // two screens were simply never added to the condition.
+                bool pinning = IsOpen || (SubPageFromPause && AnySubPageActive())
+                               || CharacterScreen.IsOpen || FriendsScreen.IsOpen;
                 if (!pinning) return;
                 if (_startMenu != null && Time.timeScale > 0f)
                     Traverse.Create(_startMenu).Method("MoveMenuToPlayer").GetValue();

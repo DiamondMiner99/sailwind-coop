@@ -36,7 +36,7 @@ namespace SailwindCoop
         // load. This is the v0.3.0 build (shipyard sail-sync rope-cache fix, host-settings reconcile +
         // mod manifest report, readable message panel, avatar look/crouch fixes, join sky-fall + toast,
         // held-item smoothing, sustained-divergence escalation); shows as 0.3.0.
-        public const string PluginVersion = "0.3.0";
+        public const string PluginVersion = "0.3.1";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -2597,6 +2597,8 @@ namespace SailwindCoop
             catch (System.Exception e) { Log.LogWarning("[Character] Draw failed: " + e.Message); }
             try { SailwindCoop.UI.FriendsScreen.Draw(); }
             catch (System.Exception e) { Log.LogWarning("[Friends] Draw failed: " + e.Message); }
+            try { SailwindCoop.Networking.HostLinkWatchdog.Draw(); }
+            catch (System.Exception e) { Log.LogWarning("[HostLink] Draw failed: " + e.Message); }
             // Last, so it covers everything above it: while a join is in flight the player should be
             // looking at the join and nothing else.
             try { SailwindCoop.UI.JoinProgressScreen.Draw(); }
@@ -2713,6 +2715,11 @@ namespace SailwindCoop
             NetworkManager?.ResetPacketCounter();
             NetworkManager?.ProcessIncomingPackets();
             Profiler?.EndMeasurePacketProcessing();
+
+            // (v0.3.1) Immediately after the drain, so anything that arrived this frame has already
+            // cleared the counter and no live packet is ever mistaken for silence.
+            try { SailwindCoop.Networking.HostLinkWatchdog.Tick(_joinedAsGuest, _endingGuestSession); }
+            catch (System.Exception e) { Log.LogWarning("[HostLink] Tick failed: " + e.Message); }
 
             // Co-op hosting/joining lives in the main + pause menus (see CoopMenu/CoopPauseMenu);
             // F9 was removed. Keep the menu labels + player list live while a menu is open.
@@ -2870,6 +2877,16 @@ namespace SailwindCoop
             GameState.recovering = false;
             BoatSyncManager.Instance?.SnapBoatToLiveTarget();
         }
+
+        /// <summary>
+        /// (v0.3.1) Public entry to the guest leave path for HostLinkWatchdog, which lives in Networking
+        /// and so cannot reach the private original. Nothing else is exposed: every other caller of the
+        /// leave path is already inside this class, and this keeps the choke point single.
+        /// </summary>
+        public static void EndGuestSessionFromWatchdog(string reason, string title,
+                                                       System.Collections.Generic.List<string> lines,
+                                                       string footer)
+            => EndGuestSessionAndQuit(reason, title, lines, footer);
 
         /// <summary>
         /// End a guest session and quit, showing the player why.
@@ -3123,11 +3140,14 @@ namespace SailwindCoop
             // host-side SEND of current helm state - orthogonal to the N-player helm LEASE (which arbitrates
             // guest INPUT). The broadcast is idempotent on already-settled crew (they re-apply the same value).
             RunJoinStep("ResendHelm", () => ControlSyncManager?.ResendHelmForCurrentBoat());
-            // Stale reef on join: RopeState is edge-triggered like HelmState, so a guest joining after the
-            // host reefed/angled sails would never receive the current rope lengths and would board with sails at
-            // the default trim. Re-send all current rope lengths for the shared boat now (reliable terminals), so
-            // the joiner's reef/angle state matches. Same host-side seed pattern as the helm re-broadcast above.
-            RunJoinStep("ResendRope", () => ControlSyncManager?.ResendRopeForCurrentBoat());
+            // Stale reef on join: RopeState is edge-triggered like HelmState, so a guest joining after
+            // sails were reefed/angled would never receive the current rope lengths and would board with
+            // them at default trim. Re-send EVERY boat's rope set as reliable terminals (v0.3.1: was
+            // current-boat-only, which is why a rejoin fixed a stale background boat for the rejoiner and
+            // nobody else). TARGETED to the joiner, unlike the old broadcast: a crew-wide send would turn
+            // one machine's stale copy of an unoccupied boat into everyone's truth on every join. The
+            // existing crew converges through the host's periodic rope reconcile instead.
+            RunJoinStep("ResendRope", () => ControlSyncManager?.ResendRopeForAllBoatsTo(friend.Id));
             // Set shared boat for host too
             RunJoinStep("SetSharedBoat", () => SleepSyncManager?.SetSharedBoat(GameState.lastBoat?.name ?? ""));
             // INDEPENDENT NEEDS: do not seed the guest's stats on join; the guest keeps its own.

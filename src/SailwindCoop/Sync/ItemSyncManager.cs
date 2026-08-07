@@ -981,6 +981,16 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void ClearSyncedHeldItemById(int itemId)
         {
+            // (v0.3.1) If we hid this item's renderers because its carrier's chart ghost was drawing it,
+            // put them back NOW. The per-frame loop that would normally restore them only walks items
+            // still in _remoteHeldItems, so an item that leaves that set while ghosted - a drop, a
+            // disconnect, a stow - would otherwise stay invisible for the rest of the session.
+            if (_chartGhostedItems.Remove(itemId))
+            {
+                ShipItem hidden;
+                if (_remoteHeldItems.TryGetValue(itemId, out hidden)) SetRenderersEnabled(hidden, true);
+            }
+
             if (_heldItemCarrier.TryGetValue(itemId, out var carrier))
             {
                 _heldItemCarrier.Remove(itemId);
@@ -1020,6 +1030,27 @@ namespace SailwindCoop.Sync
         /// Uses synced position if available, otherwise falls back to capsule offset.
         /// Converts boat-relative to world EACH FRAME to avoid jitter.
         /// </summary>
+        /// <summary>(v0.3.1) Held-item visuals we hid because their carrier's chart ghost is drawing that
+        /// kit instead. Tracked so the renderers are only toggled on the transition, and are put back when
+        /// the ghost goes away.</summary>
+        private readonly HashSet<int> _chartGhostedItems = new HashSet<int>();
+
+        /// <summary>Toggle an item's renderers without touching its transform, colliders or physics.</summary>
+        private static void SetRenderersEnabled(ShipItem item, bool enabled)
+        {
+            try
+            {
+                if (item == null) return;
+                var rends = item.GetComponentsInChildren<Renderer>(true);
+                for (int i = 0; i < rends.Length; i++)
+                    if (rends[i] != null) rends[i].enabled = enabled;
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning("[ITEM] Could not toggle held-item renderers: " + e.Message);
+            }
+        }
+
         private void UpdateRemoteHeldItemVisuals()
         {
             if (_remoteHeldItems.Count == 0) return;
@@ -1040,6 +1071,22 @@ namespace SailwindCoop.Sync
                     // Guard: the carrier's slot may have moved to a different item.
                     if (state != null && state.ItemId != kvp.Key) state = null;
                 }
+
+                // (v0.3.1) DO NOT DRAW A KIT THE CHART GHOST IS ALREADY DRAWING. A charting player is
+                // still holding the real kit, so a bystander saw two of them: the ghost open on the map,
+                // and this held-item visual floating by the drawing player's hands. The ghost is the one
+                // that belongs on screen, since it sits on the table where the work is happening, so this
+                // visual stands down while the ghost is up and returns when they put the kit away.
+                // Renderers only - the item's transform bookkeeping below is left untouched, so nothing
+                // else has to know about this.
+                bool ghosted = ChartKitGhostManager.Instance != null
+                               && ChartKitGhostManager.Instance.IsUserCharting(carrier);
+                if (ghosted)
+                {
+                    if (_chartGhostedItems.Add(kvp.Key)) SetRenderersEnabled(item, false);
+                    continue;
+                }
+                if (_chartGhostedItems.Remove(kvp.Key)) SetRenderersEnabled(item, true);
 
                 // Use synced position if available for this item
                 if (state != null)

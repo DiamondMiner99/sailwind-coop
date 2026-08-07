@@ -41,6 +41,23 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<int, GhostSet> _ghosts = new Dictionary<int, GhostSet>();
         private readonly List<int> _removalScratch = new List<int>();
 
+        /// <summary>
+        /// (v0.3.1) Is this peer currently drawing on a chart, i.e. do we already have a ghost kit on a
+        /// table for them?
+        ///
+        /// The charting player is STILL HOLDING the real kit, so a bystander was shown it twice: once as
+        /// the ghost this class puts on the map, and once as that player's ordinary remote held-item
+        /// visual. Two charting kits, one in mid-air by their hands. ItemSyncManager asks this so it can
+        /// stand down while the ghost has it covered.
+        /// </summary>
+        public bool IsUserCharting(ulong steamId)
+        {
+            if (steamId == 0UL) return false;
+            foreach (var kvp in _ghosts)
+                if (kvp.Value != null && kvp.Value.UserSteamId == steamId) return true;
+            return false;
+        }
+
         private void Awake()
         {
             if (Instance != null)

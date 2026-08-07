@@ -49,13 +49,21 @@ namespace SailwindCoop.UI
         /// <summary>
         /// Slice floors. A step eases toward the NEXT step's floor without reaching it.
         ///
-        /// WEIGHTED FROM A REAL JOIN, not from guesswork. A measured local join ran: 4.8s waiting for the
-        /// host's snapshot, 0.0s placing, 2.0s loading terrain, 0.3s applying boats, then nothing. So the
-        /// snapshot wait is the single biggest slice, which the first cut of this file had at zero because
-        /// it was not even drawn. Terrain keeps a large slice too, since it is bounded by a 30s timeout and
-        /// dominates on a bigger world or a slower disk even though it was quick here.
+        /// WEIGHTED FROM REAL JOINS, not from guesswork. Two measured, one 2-player and one 3-player:
+        ///
+        ///   waiting for snapshot   4.8s (68%)   14.2s (82%)
+        ///   placing                0.0s          0.0s
+        ///   loading terrain        2.0s          0.0s   (already resident on the rejoin)
+        ///   applying boats         0.3s          2.0s
+        ///   applying world         0.0s          1.1s
+        ///   TOTAL                  7.1s         17.3s
+        ///
+        /// The snapshot wait dominates in both, so it owns most of the bar. An earlier cut of this file
+        /// gave it 40% and the bar crawled to a third over fourteen seconds and then did the rest in
+        /// three. Terrain keeps a real slice regardless of measuring 0.0s on a rejoin, because it is
+        /// bounded by a 30s timeout and dominates on a cold world or a slower disk.
         /// </summary>
-        private static readonly float[] StepFloor = { 0.00f, 0.40f, 0.45f, 0.85f, 0.93f, 0.97f };
+        private static readonly float[] StepFloor = { 0.00f, 0.60f, 0.63f, 0.88f, 0.95f, 0.98f };
         private const float Done = 1.00f;
 
         private static readonly string[] StepLabel =

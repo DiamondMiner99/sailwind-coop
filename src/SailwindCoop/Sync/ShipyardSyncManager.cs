@@ -212,6 +212,16 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
+        /// True while a rope-trim restore is in flight for this boat - the one-frame rig-rebuild window
+        /// during which every RopeController sits at its prefab default. Any authoritative rope broadcast
+        /// of the boat must skip it.
+        /// </summary>
+        public static bool IsTrimRestorePending(string boatName)
+        {
+            return !string.IsNullOrEmpty(boatName) && _trimRestorePending.Contains(boatName);
+        }
+
+        /// <summary>
         /// True within a short window after the boat left a shipyard cradle. The discharge is an instant
         /// teleport + physics re-enable (vanilla MoveShip instantMove), and on non-editing peers a forced
         /// snap - either can depenetrate at >1.5 m/s and register phantom hull damage.
@@ -949,6 +959,10 @@ namespace SailwindCoop.Sync
             // must survive the restore. Read after the snapshot, deliberately: see _authoritativeRopeStamp.
             long snapshotSeq = _ropeApplySeq;
 
+            // Same trust suspension as ApplyCustomization: the rebuild defaults every rope until the
+            // restore verifiably completes (see ControlSyncManager's trust gate).
+            ControlSyncManager.SuspendRopeTrust(boatName, "SE rig rebuild");
+
             bool applied = Compat.SECompat.ApplyRigBlob(boat, blob);
 
             // Invalidate UNCONDITIONALLY (F1). MANDATORY, not prudence: SECompat.ApplyRigBlob applies the
@@ -1118,6 +1132,12 @@ namespace SailwindCoop.Sync
 
             PruneAuthoritativeRopeStamps();
 
+            // The restore ran to completion: this machine's copy of the boat's trim is authoritative-grade
+            // again (snapshot values plus any newer peer stamps), so the reconcile may vouch for it. The
+            // stand-down returns above deliberately do NOT lift - a join or a destroyed boat leaves the
+            // copy unverified, and the trust gate must keep the reconcile off it.
+            ControlSyncManager.LiftRopeTrust(boatName, "trim restore completed");
+
             // Not broadcast, and must not be: ControlSyncManager only sends rope changes the local player is
             // OPERATING (IsLocalOperatingRope), so this restore of our own pre-rebuild trim stays local.
             if (restored > 0)
@@ -1270,12 +1290,55 @@ namespace SailwindCoop.Sync
                 partActiveOptions = packet.PartActiveOptions?.ToList() ?? new System.Collections.Generic.List<int>()
             };
 
+            // (v0.3.1) SNAPSHOT THE TRIM BEFORE LoadData, AND PUT IT BACK AFTER.
+            //
+            // Vanilla LoadData destroys and recreates every RopeController on this boat, so every sail comes
+            // back at its PREFAB DEFAULT length. ApplyRigBlobNow has guarded against exactly this since
+            // v0.2.31; this path never did, and it is the path that fires for an ORDINARY structural edit
+            // (packet 43), with or without Shipyard Expansion installed.
+            //
+            // The result was a silent, permanent, one-sided desync. The receiver's sails snap to defaults;
+            // its own poll then suppresses the deltas (IsLocalOperatingRope is false, nobody is touching a
+            // winch), so nothing leaks and nothing complains. The one repair that exists,
+            // ReseedRopesAfterShipyardExit -> ResendRopeForBoat, is host-only INSIDE
+            // (ControlSyncManager: `if (!Plugin.IsHost) return;`) but is triggered by the EDITOR's own
+            // DischargeShip - so when the editor is a GUEST it does nothing at all and the HOST is left
+            // wrong. Whoever next hauls that boat's ropes then broadcasts the defaults as truth.
+            //
+            // NOT gated on SECompat.IsInstalled, unlike the rig-blob path. That gate is correct there
+            // because that whole method is unreachable without SE. This path is vanilla and runs for every
+            // crew, which is precisely why the hole went unnoticed.
+            //
+            // Reuses the existing snapshot/restore pair rather than inventing a second one, so the
+            // _trimRestorePending coalescing, the _ropeApplySeq authoritative-stamp guard and the
+            // one-frame deferral all behave identically to the 215 path. The same
+            // "restore already in flight" test applies for the same reason: a burst of edits must keep the
+            // FIRST snapshot, the only pre-rebuild truth there is, and must not re-snapshot from a rope
+            // array that already contains freshly defaulted controllers.
+            string boatName = boat.gameObject.name;
+            bool preserveTrim = !BoatSyncManager.IsJoinInProgress && !_trimRestorePending.Contains(boatName);
+            var trim = preserveTrim ? SnapshotRopeTrim(boat) : null;
+            long snapshotSeq = _ropeApplySeq;
+
+            // LoadData rebuilds every RopeController at prefab default. Until the restore below verifiably
+            // completes, this machine must not vouch for this boat's rope lengths in any authoritative
+            // broadcast (host reconcile, boarding assert, join seed) - see ControlSyncManager's trust gate.
+            // Lifted by RestoreRopeTrim on completion, or by the next rope a peer authors on this boat.
+            ControlSyncManager.SuspendRopeTrust(boatName, "peer customization rebuild");
+
             customization.LoadData(saveData);
 
             // Invalidate rope cache - LoadData destroys old RopeControllers and creates new ones
             BoatUtility.InvalidateRopeCache(boat);
 
-            VerboseLogger.ShipyardApply($"boat={boat.gameObject.name}, applied masts/sails/parts");
+            if (trim != null)
+            {
+                _trimRestorePending.Add(boatName);
+                StartCoroutine(RestoreRopeTrimNextFrame(boatName, trim, snapshotSeq));
+            }
+
+            VerboseLogger.ShipyardApply($"boat={boat.gameObject.name}, applied masts/sails/parts" +
+                (trim != null ? $", trim snapshot {trim.Count} ropes" : ", no trim snapshot"));
         }
 
         /// <summary>

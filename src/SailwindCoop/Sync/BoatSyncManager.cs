@@ -156,6 +156,13 @@ namespace SailwindCoop.Sync
         private const float PostJoinVerboseSeconds = 60f;
         private static float _lastJoinCompleteUnscaledTime = -999f;
 
+        /// <summary>
+        /// (v0.3.1) Reused ocean-height probe for HULL_STATE. Single instance on purpose - Crest identifies
+        /// a query by the helper's GetHashCode, so one per call would allocate a fresh query slot every
+        /// time. Only ever read from the throttled (1/sec/boat) diagnostic path.
+        /// </summary>
+        private static readonly Crest.SampleHeightHelper _seaSampler = new Crest.SampleHeightHelper();
+
         /// <summary>(v0.3.0) Opens the post-join verbose window. Called at the end of the join coroutine.</summary>
         public static void NoteJoinComplete() => _lastJoinCompleteUnscaledTime = Time.unscaledTime;
 
@@ -637,7 +644,7 @@ namespace SailwindCoop.Sync
                         $"current={boat.position}, target={targetLocalPosition}, " +
                         $"velPre={velBeforeCorrection.magnitude:F2}m/s, velPost={rb.velocity.magnitude:F2}m/s, " +
                         $"clamped={clampFired}, correction={positionCorrection.magnitude:F1}");
-                    LogHullState(boat, rb);
+                    LogHullState(boat, rb, targetLocalPosition.y);
                 }
             }
 
@@ -665,10 +672,26 @@ namespace SailwindCoop.Sync
         ///   com vs keel            - a center of mass wrenched off the keel by a bad lever arm
         ///   rotErr                 - a hull that is heeling or librating rather than translating
         ///   distToLand             - the unreplicated term that sets local wave amplitude
+        ///
+        /// (v0.3.1) seaY/freeboard/hostFreeboard, added after the 2026-08-06 logs were parsed. Those logs
+        /// established that the DOMINANT error term is vertical (median 5.70m, and past
+        /// VerticalHardCorrectThreshold on 74% of frames, which switches the softening off exactly when it
+        /// is most needed) and that the guest's hull sits ABOVE the host's on 88.3% of frames. They could
+        /// not establish WHY, because every quantity logged was the guest's own - there was no way to tell
+        /// a guest floating too high on its own sea from a host sitting too low on its.
+        ///
+        /// The discriminator is the SEA SURFACE, which nothing was measuring. With it:
+        ///   freeboard     = our hull above OUR water. Off-nominal means our buoyancy is wrong.
+        ///   hostFreeboard = the host's hull height (the sync target we are chasing) measured against OUR
+        ///                   water. If our freeboard is nominal while this reads metres submerged, the two
+        ///                   machines disagree about where the sea is, not about where the boat is.
+        /// Those two readings separate a buoyancy fault from a wave-field fault, which is the open question
+        /// in section 8 of docs/plans/2026-08-06-3player-playtest.md.
+        ///
         /// Every read is null-guarded and the whole thing is best-effort: a diagnostic must never be the
         /// reason a frame throws.
         /// </summary>
-        private static void LogHullState(Transform boat, Rigidbody rb)
+        private static void LogHullState(Transform boat, Rigidbody rb, float targetY)
         {
             try
             {
@@ -693,10 +716,28 @@ namespace SailwindCoop.Sync
                         : rb.centerOfMass.ToString();
                 }
 
+                // Local sea surface under the hull. ONE reused helper: Crest keys its query slots off the
+                // helper's GetHashCode, so allocating a fresh one per call would churn a new slot each time.
+                // A failed query returns SeaLevel and false, which is reported honestly rather than silently
+                // logged as if it were a real sample.
+                string seaY = "n/a", freeboard = "n/a", hostFreeboard = "n/a";
+                if (Crest.OceanRenderer.Instance != null)
+                {
+                    _seaSampler.Init(boat.position, 0f);
+                    if (_seaSampler.Sample(out float surfaceY))
+                    {
+                        seaY = surfaceY.ToString("F2");
+                        freeboard = (boat.position.y - surfaceY).ToString("F2");
+                        hostFreeboard = (targetY - surfaceY).ToString("F2");
+                    }
+                    else seaY = "query-failed";
+                }
+
                 VerboseLogger.TeleportDebug($"HULL_STATE '{boat.name}': forceMult={buoy}, waterLevel={water}, " +
                     $"sunk={sunk}, drag={(rb != null ? rb.drag.ToString("F2") : "n/a")}, " +
                     $"mass={(rb != null ? rb.mass.ToString("F0") : "n/a")}, com={com}, " +
-                    $"distToLand={GameState.distanceToLand:F0}");
+                    $"distToLand={GameState.distanceToLand:F0}, " +
+                    $"seaY={seaY}, freeboard={freeboard}, hostFreeboard={hostFreeboard}");
             }
             catch { /* diagnostics must never be the reason a frame fails */ }
         }

@@ -242,7 +242,10 @@ namespace SailwindCoop.UI
             var entryGo = new GameObject("FeedLine");
             entryGo.transform.SetParent(_container, false);
             var text = entryGo.AddComponent<Text>();
-            text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            // (v0.3.1) The game's own face, falling back to built-in Arial only if it cannot be
+            // resolved. This surface was written before SailwindSkin.MenuFont existed and was the last
+            // place in the mod still rendering in Arial.
+            text.font = SailwindSkin.MenuFont ?? Resources.GetBuiltinResource<Font>("Arial.ttf");
             text.fontSize = 14;
             text.alignment = TextAnchor.MiddleRight;
             text.horizontalOverflow = HorizontalWrapMode.Overflow;

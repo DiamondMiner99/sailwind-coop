@@ -545,7 +545,19 @@ namespace SailwindCoop.Patches
 
             // Verify insertion actually happened
             var stoveFuel = item.GetComponent<StoveFuel>();
-            if (stoveFuel == null || !stoveFuel.inserted) return;
+            if (stoveFuel == null) return;
+            if (!stoveFuel.inserted)
+            {
+                // (v0.3.1) Vanilla InsertFuel wraps its whole body in `if (currentFuel < maxFuel)` and
+                // returns nothing, so a stove that is already full swallows the insert without a word. Not
+                // sending is CORRECT here - nothing happened locally, so there is nothing to replicate - but
+                // the silence used to extend to the log too, which made a real symptom unreadable: the
+                // 2026-08-06 session recorded two FuelInserted sends for three logs a player watched
+                // themselves load, and nothing anywhere said the third had been refused. Say it.
+                VerboseLogger.CookingSend($"InsertFuel REFUSED locally (stove full), fuel not sent: " +
+                    $"{item.gameObject.name}");
+                return;
+            }
 
             // Get IDs
             var fuelPrefab = item.GetComponent<SaveablePrefab>();
