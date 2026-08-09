@@ -36,25 +36,47 @@ namespace SailwindCoop.Sync
             public float CursorX;
             public float CursorY;
             public bool HasCursor;
+            // (2026-08-09) The held-item id of the REAL kit this drawer is carrying, captured from their
+            // held-item stream when the session starts (vanilla guarantees the kit is in their hand the
+            // whole session). 0 until captured. The held-item stand-down in ItemSyncManager only ever
+            // hides THIS id - a carrier-wide hide let a stale ghost swallow every item its crew member
+            // picked up (the 2026-08-09 vanishing barrel/bucket/cup report).
+            public int KitItemId;
+            public float CreatedAt;          // unscaled; bounds the late-capture window
+            public float HeldMismatchSince;  // unscaled; 0 = held stream still matches the kit
         }
+
+        // Late capture allowed while the ghost is younger than this (covers the packet race where the
+        // ChartSession lands before the drawer's next held-item sample, incl. the join replay).
+        private const float KitCaptureWindow = 15f;
+        // A drawer HOLDS the kit for the entire vanilla session (player control is locked). If their
+        // held-item stream reports a DIFFERENT item for this long, the end packet was lost and the
+        // session is dead - tear it down so it cannot linger for the rest of the session.
+        private const float StaleSessionSeconds = 10f;
 
         private readonly Dictionary<int, GhostSet> _ghosts = new Dictionary<int, GhostSet>();
         private readonly List<int> _removalScratch = new List<int>();
 
         /// <summary>
-        /// (v0.3.1) Is this peer currently drawing on a chart, i.e. do we already have a ghost kit on a
-        /// table for them?
+        /// (v0.3.1) Is this peer currently drawing on a chart with THIS item as their held kit, i.e. do
+        /// we have a live ghost for them whose captured kit id matches?
         ///
         /// The charting player is STILL HOLDING the real kit, so a bystander was shown it twice: once as
         /// the ghost this class puts on the map, and once as that player's ordinary remote held-item
         /// visual. Two charting kits, one in mid-air by their hands. ItemSyncManager asks this so it can
         /// stand down while the ghost has it covered.
+        ///
+        /// (2026-08-09) Item-scoped on purpose: the carrier-only version of this check let a STALE ghost
+        /// (lost ChartSession end; the tabletop chart never folds, so the Update teardown never fires)
+        /// hide every item its crew member picked up from then on. An uncaptured kit (KitItemId 0)
+        /// matches nothing, so the failure mode is a cosmetic double kit, never invisible cargo.
         /// </summary>
-        public bool IsUserCharting(ulong steamId)
+        public bool IsUserChartingWithKit(ulong steamId, int itemId)
         {
-            if (steamId == 0UL) return false;
+            if (steamId == 0UL || itemId == 0) return false;
             foreach (var kvp in _ghosts)
-                if (kvp.Value != null && kvp.Value.UserSteamId == steamId) return true;
+                if (kvp.Value != null && kvp.Value.UserSteamId == steamId && kvp.Value.KitItemId == itemId)
+                    return true;
             return false;
         }
 
@@ -88,10 +110,16 @@ namespace SailwindCoop.Sync
             if (ghost == null) return;
 
             ghost.UserSteamId = userSteamId;
+            ghost.CreatedAt = Time.unscaledTime;
+            // The drawer is holding the kit right now, so their held-item stream identifies it. If the
+            // sample is not in yet (packet race / join replay), Update() late-captures within
+            // KitCaptureWindow; until then the ghost hides nothing.
+            ghost.KitItemId = ItemSyncManager.Instance != null
+                ? ItemSyncManager.Instance.GetSyncedHeldItemId(userSteamId) : 0;
             PlaceKit(ghost, kitPos);
             _ghosts[itemInstanceId] = ghost;
 
-            VerboseLogger.NavApply($"Chart ghost created, item={itemInstanceId}, user={userSteamId}, kitPos={kitPos}");
+            VerboseLogger.NavApply($"Chart ghost created, item={itemInstanceId}, user={userSteamId}, kitPos={kitPos}, kitItem={ghost.KitItemId}");
         }
 
         public void EndSession(int itemInstanceId)
@@ -146,6 +174,38 @@ namespace SailwindCoop.Sync
                 {
                     _removalScratch.Add(kvp.Key);
                     continue;
+                }
+
+                // (2026-08-09) Stale-session teardown. The ChartSession end is a single reliable packet;
+                // if it is ever lost or unprocessed, nothing above ever fires (a tabletop chart stays
+                // unfolded) and the ghost lived forever. The drawer holds the kit for the whole vanilla
+                // session, so their held-item stream reporting a DIFFERENT item for StaleSessionSeconds
+                // is proof the session ended. Held-stream gaps and lingering post-stow ids only DELAY
+                // this check (fail open); the measured worst host-to-guest gap is 1.6s, far under 10s.
+                int heldId = ItemSyncManager.Instance != null
+                    ? ItemSyncManager.Instance.GetSyncedHeldItemId(ghost.UserSteamId) : 0;
+                if (ghost.KitItemId == 0 && heldId != 0
+                    && Time.unscaledTime - ghost.CreatedAt <= KitCaptureWindow)
+                {
+                    ghost.KitItemId = heldId; // late capture: first held sample after the session packet
+                    VerboseLogger.NavApply($"Chart ghost late-captured kit item {heldId} for user {ghost.UserSteamId}");
+                }
+                if (heldId != 0 && ghost.KitItemId != 0 && heldId != ghost.KitItemId)
+                {
+                    if (ghost.HeldMismatchSince <= 0f)
+                    {
+                        ghost.HeldMismatchSince = Time.unscaledTime;
+                    }
+                    else if (Time.unscaledTime - ghost.HeldMismatchSince > StaleSessionSeconds)
+                    {
+                        VerboseLogger.NavApply($"Chart ghost for user {ghost.UserSteamId} is STALE (carrier moved on to item {heldId}); tearing down");
+                        _removalScratch.Add(kvp.Key);
+                        continue;
+                    }
+                }
+                else
+                {
+                    ghost.HeldMismatchSince = 0f;
                 }
 
                 DriveGhost(ghost);

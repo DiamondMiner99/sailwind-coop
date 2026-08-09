@@ -14,6 +14,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.3.2 - 2026-08-09
+
+> Everyone must update (the version handshake refuses mixed crews as usual), but there is no
+> network-format change - this fixes what other machines show, not what goes over the wire.
+
+### Fixed
+
+- **Items a crewmate picks up no longer vanish from everyone else's game.** Reported as: a guest
+  sailing on the host's boat picked up a water barrel and it disappeared from the host's game, then
+  a bucket, then a cup, all gone for good. The culprit was v0.3.1's chart-drawing polish, which
+  hides a charting crewmate's held kit so bystanders don't see it twice (once as the ghost on the
+  map table, once floating by their hands). That hide was keyed on the player rather than the kit,
+  so if the "currently charting" state ever went stale, every item that crew member picked up from
+  then on was hidden for the rest of the crew. Going stale took exactly one lost session-end
+  signal, because a chart lying open on a table never triggers the fallback teardown. On top of
+  that, the code meant to restore a hidden item's looks when it left the hand could never run (it
+  looked the item up in a map every caller had already emptied), which is why the items never came
+  back. Three repairs: the hide now applies only to the charting kit itself and never to anything
+  else the player holds; hidden items always get their renderers back when they leave the hand or
+  the session ends, whatever order the cleanup runs in; and a charting session whose owner has
+  visibly moved on to carrying other things is shut down after ten seconds. If this bit you: the
+  "lost" items were never destroyed, and reloading the save on the host's side brings them back.
+
 ## v0.3.1 - 2026-08-06
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

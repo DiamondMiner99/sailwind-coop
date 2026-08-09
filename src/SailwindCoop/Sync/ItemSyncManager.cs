@@ -950,6 +950,19 @@ namespace SailwindCoop.Sync
         }
 
         /// <summary>
+        /// (2026-08-09) The item id this carrier's held-item stream last reported, 0 if none is on
+        /// record. ChartKitGhostManager uses it to capture WHICH item is the charting kit when a ghost
+        /// session starts, and to notice a session whose carrier has visibly moved on to other items
+        /// (the stale-ghost signature). Note the slot only updates while the carrier holds something -
+        /// after a stow the last id lingers until the next pickup or a drop apply clears it - so treat
+        /// this as "last known held", not "holding right now".
+        /// </summary>
+        public int GetSyncedHeldItemId(ulong carrier)
+        {
+            return _syncedHeldItems.TryGetValue(carrier, out var state) ? state.ItemId : 0;
+        }
+
+        /// <summary>
         /// Public per-peer held-item visual cleanup, safe on EITHER role. The host's authoritative
         /// OnPeerDisconnected also drops items + inventory; this method only forgets the per-carrier synced
         /// VISUAL slot, so it's the right call for a GUEST that sees a fellow guest leave (the host-only
@@ -985,10 +998,15 @@ namespace SailwindCoop.Sync
             // put them back NOW. The per-frame loop that would normally restore them only walks items
             // still in _remoteHeldItems, so an item that leaves that set while ghosted - a drop, a
             // disconnect, a stow - would otherwise stay invisible for the rest of the session.
-            if (_chartGhostedItems.Remove(itemId))
+            // (2026-08-09) Restore from the reference captured at hide time: EVERY caller removes the
+            // item from _remoteHeldItems before reaching this method, so the old lookup there found
+            // nothing and the restore never ran - dropped items stayed invisible for good.
+            if (_chartGhostedItems.TryGetValue(itemId, out var ghostHidden))
             {
-                ShipItem hidden;
-                if (_remoteHeldItems.TryGetValue(itemId, out hidden)) SetRenderersEnabled(hidden, true);
+                _chartGhostedItems.Remove(itemId);
+                if (ghostHidden == null) _remoteHeldItems.TryGetValue(itemId, out ghostHidden);
+                if (ghostHidden == null) ghostHidden = FindItemByInstanceId(itemId);
+                if (ghostHidden != null) SetRenderersEnabled(ghostHidden, true);
             }
 
             if (_heldItemCarrier.TryGetValue(itemId, out var carrier))
@@ -1032,8 +1050,11 @@ namespace SailwindCoop.Sync
         /// </summary>
         /// <summary>(v0.3.1) Held-item visuals we hid because their carrier's chart ghost is drawing that
         /// kit instead. Tracked so the renderers are only toggled on the transition, and are put back when
-        /// the ghost goes away.</summary>
-        private readonly HashSet<int> _chartGhostedItems = new HashSet<int>();
+        /// the ghost goes away. Maps id -> the hidden ShipItem: every cleanup path removes the item from
+        /// _remoteHeldItems BEFORE calling ClearSyncedHeldItemById, so the restore there must not depend
+        /// on _remoteHeldItems still holding the entry (it never does; that lookup left three items
+        /// permanently invisible on the host in the 2026-08-09 report).</summary>
+        private readonly Dictionary<int, ShipItem> _chartGhostedItems = new Dictionary<int, ShipItem>();
 
         /// <summary>Toggle an item's renderers without touching its transform, colliders or physics.</summary>
         private static void SetRenderersEnabled(ShipItem item, bool enabled)
@@ -1079,11 +1100,21 @@ namespace SailwindCoop.Sync
                 // visual stands down while the ghost is up and returns when they put the kit away.
                 // Renderers only - the item's transform bookkeeping below is left untouched, so nothing
                 // else has to know about this.
+                // KIT-SCOPED (2026-08-09 vanishing-items report): the check matches the ITEM, not just the
+                // carrier. The old carrier-only check meant a stale ghost (one lost ChartSession end, and
+                // the tabletop chart never folds, so nothing else tears it down) hid EVERY item that crew
+                // member picked up from then on - water barrel, bucket, cup, gone on the host at the
+                // moment of pickup. Only the session's captured kit id may be hidden now; an unknown kit
+                // id hides nothing (fail open: a brief double kit beats invisible cargo).
                 bool ghosted = ChartKitGhostManager.Instance != null
-                               && ChartKitGhostManager.Instance.IsUserCharting(carrier);
+                               && ChartKitGhostManager.Instance.IsUserChartingWithKit(carrier, kvp.Key);
                 if (ghosted)
                 {
-                    if (_chartGhostedItems.Add(kvp.Key)) SetRenderersEnabled(item, false);
+                    if (!_chartGhostedItems.ContainsKey(kvp.Key))
+                    {
+                        _chartGhostedItems[kvp.Key] = item;
+                        SetRenderersEnabled(item, false);
+                    }
                     continue;
                 }
                 if (_chartGhostedItems.Remove(kvp.Key)) SetRenderersEnabled(item, true);
@@ -1425,6 +1456,16 @@ namespace SailwindCoop.Sync
             }
             _pendingHoldFreezes.Clear();
             _inCargoRetryApply = false;
+
+            // (2026-08-09) Un-hide anything the chart-ghost stand-down still has renderer-disabled, or
+            // it stays invisible into the post-session world until a save/reload. Same insurance rationale
+            // as the freeze re-arm above: renderer toggles over arbitrary ShipItems during teardown.
+            foreach (var ghosted in _chartGhostedItems)
+            {
+                try { if (ghosted.Value != null) SetRenderersEnabled(ghosted.Value, true); }
+                catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] ghost-hide restore failed for {ghosted.Key}: {e.Message}"); }
+            }
+            _chartGhostedItems.Clear();
 
             _heldItems.Clear();
             _remoteHeldItems.Clear();

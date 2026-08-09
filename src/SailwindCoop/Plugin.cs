@@ -33,10 +33,9 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.3.0 build (shipyard sail-sync rope-cache fix, host-settings reconcile +
-        // mod manifest report, readable message panel, avatar look/crouch fixes, join sky-fall + toast,
-        // held-item smoothing, sustained-divergence escalation); shows as 0.3.0.
-        public const string PluginVersion = "0.3.1";
+        // load. This is the v0.3.2 build (chart-ghost stand-down scoped to the kit item, ordering-proof
+        // renderer restore, stale-session teardown); shows as 0.3.2.
+        public const string PluginVersion = "0.3.2";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
