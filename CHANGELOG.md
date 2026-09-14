@@ -16,8 +16,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## v0.4.0 - 2026-09-14
 
-> Everyone must update. This release changes the network format (crew appearance now carries
-> colors) and it adds a dependency: the **Sailwind Player Model** mod, which is bundled in the zip
+> This release adds a dependency: the **Sailwind Player Model** mod, which is bundled in the zip
 > and installs alongside co-op.
 
 ### Added
@@ -46,7 +45,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
-- **Co-op now requires the Sailwind Player Model mod** (0.1.2 or newer). It is in the zip, under
+- **Co-op now needs the Sailwind Player Model mod** (0.1.2 or newer). It is in the zip, under
   `BepInEx/plugins/SailwindPlayerModel/`. Extract the whole archive as usual and both are installed.
 - **Two settings moved to the Player Model config**
   (`BepInEx/config/com.diamondminer99.playermodel.cfg`): the `[Crouch]` entries are now in section

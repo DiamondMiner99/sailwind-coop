@@ -1,7 +1,5 @@
 Sailwind Co-op v0.4.0  [game v0.38.1]
 
-Everyone in the crew must be on v0.4.0. The mod refuses mixed-version crews.
-
 This version needs the Sailwind Player Model mod. It is included in this zip and installs
 alongside co-op. If you already have Sailwind Player Model installed, this zip overwrites it
 with the version co-op was built against. Older Player Model versions turn themselves off when
