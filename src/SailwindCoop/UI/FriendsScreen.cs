@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Steamworks;
+using SailwindPlayerModel;
 using UnityEngine;
 using SailwindCoop.Networking;
 
@@ -58,8 +59,8 @@ namespace SailwindCoop.UI
                 _open = true;
                 // (v0.3.0) Remember whether we are covering the PAUSE parchment, so closing restores only
                 // what was actually there. See ForceClose.
-                _reopenPauseOnClose = CoopPauseMenu.IsOpen;
-                CoopPauseMenu.Hide();
+                _reopenPauseOnClose = SailwindPlayerModel.ModPauseMenu.IsOpen;
+                SailwindPlayerModel.ModPauseMenu.Hide();
                 SuppressMenuButtons();
                 // The presence sweep skips its work when nothing would read it, and this screen opening is
                 // precisely that "something" - so ask for a fresh one now rather than showing a list up to
@@ -85,7 +86,7 @@ namespace SailwindCoop.UI
             bool restore = _reopenPauseOnClose;
             _reopenPauseOnClose = false;
             RestoreMenuButtons();
-            try { if (restore && GameState.inCursorMenu) CoopPauseMenu.Reopen(); }
+            try { if (restore && GameState.inCursorMenu) SailwindPlayerModel.ModPauseMenu.Reopen(); }
             catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Could not restore the pause menu: " + e.Message); }
         }
 
@@ -98,7 +99,7 @@ namespace SailwindCoop.UI
         /// from reaching what is behind it. Vanilla's only suppressor is GoPointerButton.unclickable.
         ///
         /// From the pause menu, hiding the co-op panel was enough, because that panel IS the parchment there.
-        /// The title menu is a different situation: CoopPauseMenu.Hide() is a no-op, and vanilla's own
+        /// The title menu is a different situation: SailwindPlayerModel.ModPauseMenu.Hide() is a no-op, and vanilla's own
         /// 'start UI' stays live behind us. A click on a friend row landing over Continue starts loading the
         /// player's solo save behind a Friends panel that is still drawn; over Quit Game it opens the confirm
         /// prompt; over New Game it tears the title menu down.
@@ -268,7 +269,7 @@ namespace SailwindCoop.UI
             {
                 ForceClose();
                 // Unpause before joining. ForceClose puts the pause parchment back, which leaves the world
-                // frozen, and a join that starts at timeScale 0 never finishes - see CoopPauseMenu.Resume.
+                // frozen, and a join that starts at timeScale 0 never finishes - see the shared pause menu ResumeGame.
                 //
                 // ONLY IN-GAME, and this is not a tidy-up. ResumeGame routes to vanilla SettingsToGame, which
                 // is the UNPAUSE path and assumes a pause happened: it writes `Time.timeScale =
@@ -278,7 +279,7 @@ namespace SailwindCoop.UI
                 // menu, then TitleJoinManager's LoadGame parked forever on the first scaled WaitForSeconds
                 // inside LoadGameAnimation, which sits before GameState.playing is ever set. The player was
                 // left on a dead menu until the 45s "Load timed out".
-                if (GameState.playing) CoopPauseMenu.ResumeGame();
+                if (GameState.playing) SailwindPlayerModel.ModPauseMenu.ResumeGame();
                 if (Plugin.EnsureCoopReady()) lm.AcceptPendingInvite();
             }
             if (GUILayout.Button("Not now", _button, GUILayout.Width(120f))) lm.DeclinePendingInvite();

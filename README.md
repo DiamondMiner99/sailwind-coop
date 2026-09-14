@@ -7,7 +7,7 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.3.2-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-v0.4.0-blue)](../../releases)
 [![game](https://img.shields.io/badge/Sailwind-v0.38-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -154,8 +154,10 @@ WINEDLLOVERRIDES="winhttp=n,b" %command%
 Don't extract the bundle's `BepInEx` folder over your existing one. Just take the plugin:
 
 1. Make sure you have [BepInEx 5.4.x (x64)](https://github.com/BepInEx/BepInEx/releases) installed and run once.
-2. From the zip, copy the **`BepInEx/plugins/SailwindCoop/`** folder (it holds `SailwindCoop.dll` and
-   `Facepunch.Steamworks.Win64.dll`) into your own `Sailwind/BepInEx/plugins/`.
+2. From the zip, copy BOTH plugin folders into your own `Sailwind/BepInEx/plugins/`:
+   - **`BepInEx/plugins/SailwindCoop/`** (holds `SailwindCoop.dll` and `Facepunch.Steamworks.Win64.dll`)
+   - **`BepInEx/plugins/SailwindPlayerModel/`** (holds `SailwindPlayerModel.dll`; co-op does not load
+     without it, and it must be the version shipped in this zip or newer)
 
 ### Updating
 

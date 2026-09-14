@@ -14,6 +14,45 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.4.0 - 2026-09-14
+
+> Everyone must update. This release changes the network format (crew appearance now carries
+> colors) and it adds a dependency: the **Sailwind Player Model** mod, which is bundled in the zip
+> and installs alongside co-op.
+
+### Added
+
+- **Fog and storms are the same for the whole crew.** Weather region, storm visuals and the active
+  storm set follow the host, so a guest is no longer sailing in clear air while the host is in a
+  squall.
+- **Market prices follow the host.** Every port's supply, the exchange rates and the price book are
+  the host's, and a guest opening a trade screen sees the host's price book for that island rather
+  than their own save's.
+- **Crewmates hold their tools.** A held item is posed in the hand instead of floating beside it.
+  A solo preview for tuning the pose is on `Home` by default.
+- **Recover Boat and the character screen come from the Player Model mod**, along with the bodies
+  and the parchment pause menu. One menu, so two mods never fight over `Esc`.
+- **Crew appearance carries color.** Skin, hair, cloth, trim, leather and metal choices are sent to
+  the crew along with the part choices.
+
+### Fixed
+
+- **Firewood taken from a crate no longer turns invisible** on the machines that did not take it.
+- **Putting an item into a crate no longer leaves a grabbable ghost** sitting on the crate.
+- **Fishing rods show the host's hook state**, not whatever each crewmate's own save happened to
+  have on the line.
+- **NPC boats between 2 and 10 km sit where the host sees them.** Outside the old cache range they
+  were drawn from each machine's own simulation, so the same ship appeared in two places.
+
+### Changed
+
+- **Co-op now requires the Sailwind Player Model mod** (0.1.2 or newer). It is in the zip, under
+  `BepInEx/plugins/SailwindPlayerModel/`. Extract the whole archive as usual and both are installed.
+- **Two settings moved to the Player Model config**
+  (`BepInEx/config/com.diamondminer99.playermodel.cfg`): the `[Crouch]` entries are now in section
+  `1. Pose`, and `[Coop] MenuButtonScale` is in section `4. Menu`. Defaults are unchanged. If you had
+  tuned them, enter your values there once.
+
 ## v0.3.2 - 2026-08-09
 
 > Everyone must update (the version handshake refuses mixed crews as usual), but there is no

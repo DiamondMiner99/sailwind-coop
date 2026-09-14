@@ -14,6 +14,11 @@ using UnityEngine;
 namespace SailwindCoop
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+    // HARD dependency: co-op builds every crewmate's body from this mod's rig, so without it there is
+    // nothing to animate. It ships inside the co-op download, so a player should never see this refuse -
+    // but if the file is missing, BepInEx says so plainly instead of throwing a type-load error out of
+    // whichever class touched it first.
+    [BepInDependency(SailwindPlayerModel.Plugin.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency(Compat.SECompat.SEGuid, BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency(Compat.SCFCompat.SCFGuid, BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency(Compat.NANDTweaksCompat.NTGuid, BepInDependency.DependencyFlags.SoftDependency)]
@@ -35,7 +40,7 @@ namespace SailwindCoop
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
         // load. This is the v0.3.2 build (chart-ghost stand-down scoped to the kit item, ordering-proof
         // renderer restore, stale-session teardown); shows as 0.3.2.
-        public const string PluginVersion = "0.3.2";
+        public const string PluginVersion = "0.4.0";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -65,74 +70,29 @@ namespace SailwindCoop
         // feature that cannot be tested solo needs one. Read by DamagePatches every frame, so it is live.
         public static ConfigEntry<bool> GuestHullPhysicsConfig { get; private set; }
 
-        // Crouch pose tuning (v0.2.25), read live every frame by RemotePlayerManager + LocalPlayerBody so
-        // they can be tuned in-game with Configuration Manager. The crouch is a SQUAT: the hips/body drop and
-        // per-leg 2-bone IK re-plants the feet at their standing spot (feet stay on the deck at any depth), so
-        // the knobs are IK-appropriate (drop depth, torso lean, arm bend, stride cut, knee-forward flip)
-        // rather than raw joint angles. All applied * the 0..1 crouch amount.
-        public static ConfigEntry<float> CrouchDropMetersConfig { get; private set; }
-        public static ConfigEntry<float> CrouchTorsoLeanDegConfig { get; private set; }
-        public static ConfigEntry<float> CrouchArmBendDegConfig { get; private set; }
-        public static ConfigEntry<float> CrouchStrideCutConfig { get; private set; }
-        public static ConfigEntry<float> CrouchKneeForwardConfig { get; private set; }
-        // (v0.3.0) Squat shaping + ground plant - see the Config.Bind calls for the full rationale.
-        public static ConfigEntry<float> CrouchThighLiftDegConfig { get; private set; }
-        public static ConfigEntry<float> CrouchHipSetbackMaxMetersConfig { get; private set; }
-        public static ConfigEntry<float> AvatarSoleOffsetMetersConfig { get; private set; }
-
-        // (v0.3.0) This player's chosen avatar appearance, persisted as a "key=value;..." string.
-        public static ConfigEntry<string> AppearanceConfig { get; private set; }
-        public static ConfigEntry<float> CoopMenuButtonScaleConfig { get; private set; }
-        private static bool _localAppearanceLoaded;
-        private static Player.CoopAppearance _localAppearance;
+        // How a body stands, crouches and leans, and what it looks like, now live in the Sailwind Player
+        // Model mod (BodyTuning / HeldToolPose / PlayerModel.LocalAppearance) - its own config file, its own
+        // Configuration Manager sections. They moved with the body itself: your crewmates' avatars and your
+        // own third-person body are built from ONE rig there, so there is one place to tune and they cannot
+        // disagree. Anyone who had tuned the old [Crouch] section in this file needs to re-enter it once.
 
         /// <summary>
-        /// This machine's chosen look. Parsed once from config; an empty setting resolves to a
-        /// deterministic look derived from the player's own SteamId, so a player who never opens the
-        /// character screen still has a face of their own rather than slot 0 like everyone else.
+        /// This machine's chosen look. Owned by the Sailwind Player Model mod, which persists it and applies
+        /// it to every body it builds; co-op only reads it, puts it on the wire and offers the screen that
+        /// edits it. An empty setting there resolves through the seed we install in Awake, so a player who
+        /// never opens the character screen still has a face of their own rather than slot 0 like everyone else.
         /// </summary>
-        public static Player.CoopAppearance LocalAppearance
+        public static SailwindPlayerModel.PlayerAppearance LocalAppearance
         {
-            get
-            {
-                if (!_localAppearanceLoaded)
-                {
-                    string raw = AppearanceConfig != null ? AppearanceConfig.Value : null;
-                    if (string.IsNullOrEmpty(raw))
-                    {
-                        ulong id = 0UL;
-                        try { if (SteamClient.IsValid) id = SteamClient.SteamId; } catch { }
-                        // Only LATCH once we could actually read our own id. A first read before Steam is
-                        // valid would otherwise freeze the all-zero seed look for the whole process, and
-                        // every player in that situation would end up identical - the precise outcome the
-                        // deterministic default exists to avoid. Until then, recompute each read.
-                        if (id != 0UL) _localAppearanceLoaded = true;
-                        _localAppearance = Player.CoopAppearance.DeterministicFor(id);
-                    }
-                    else
-                    {
-                        _localAppearanceLoaded = true;
-                        _localAppearance = Player.CoopAppearance.Deserialize(raw);
-                    }
-                }
-                return _localAppearance;
-            }
+            get { return SailwindPlayerModel.PlayerModel.LocalAppearance; }
         }
 
-        /// <summary>Adopt a new look and persist it. Callers must rebuild the local body to see it - the
-        /// appearance is baked when the clone is activated, not applied live (see CoopAppearance).</summary>
-        public static void SetLocalAppearance(Player.CoopAppearance a)
+        /// <summary>Adopt a new look and persist it. The player-model mod re-dresses our own body in place.</summary>
+        public static void SetLocalAppearance(SailwindPlayerModel.PlayerAppearance a)
         {
-            _localAppearance = a;
-            _localAppearanceLoaded = true;
-            if (AppearanceConfig != null) AppearanceConfig.Value = a.Serialize();
+            SailwindPlayerModel.PlayerModel.LocalAppearance = a;
         }
 
-        // LOOK-LEAN pose tuning (torso pitches on the hips toward where the player looks vertically, like a
-        // Phasmophobia player model). Read live every frame by RemotePlayerManager + LocalPlayerBody. Applies
-        // in ALL states (standing, walking, crouched) and COMPOSES additively with the crouch torso fold.
-        public static ConfigEntry<float> LookPitchScaleConfig { get; private set; }
-        public static ConfigEntry<float> LookPitchMaxDegConfig { get; private set; }
 
         // Crew weight: kg each REMOTE crew member adds to the boat they stand on (vanilla models every
         // person, host included, at 160). HOST-ONLY physics (BoatMass.UpdateMass patch early-returns on
@@ -348,64 +308,53 @@ namespace SailwindCoop
                 "everyone else, and a hull that loaded sunk stayed weightless forever. Turn this off only " +
                 "if boats start behaving worse than that for your crew; it restores the old behavior.");
             Log.LogInfo($"GuestHullPhysics: {GuestHullPhysicsConfig.Value}");
-            // Crouch pose tuning - live-editable (Configuration Manager). The crouch is a SQUAT: the body
-            // drops and 2-bone leg IK re-plants the feet at their standing spot. All applied * the 0..1 crouch
-            // amount. Shared by remote avatars and your own third-person (orbit-cam) body.
-            CrouchDropMetersConfig = Config.Bind("Crouch", "CrouchDropMeters", 0.6f,
-                new ConfigDescription("Squat depth: how far the hips/body drop at full crouch. The leg IK keeps the feet planted on the deck at any depth, so the head comes down toward the camera without the feet clipping through.",
-                    new AcceptableValueRange<float>(0f, 1.2f)));
-            CrouchTorsoLeanDegConfig = Config.Bind("Crouch", "CrouchTorsoLeanDeg", 28f,
-                new ConfigDescription("Forward torso fold at full crouch (about the body's world right axis) - brings the chest/head down and forward toward the camera. Negative leans back.",
-                    new AcceptableValueRange<float>(-80f, 80f)));
-            CrouchArmBendDegConfig = Config.Bind("Crouch", "CrouchArmBendDeg", 45f,
-                new ConfigDescription("Elbow flex for a ready/tactical arm pose at full crouch (composed on top of the walk arm swing; the upper arms also raise slightly). Negative flexes the other way.",
-                    new AcceptableValueRange<float>(-120f, 120f)));
-            CrouchStrideCutConfig = Config.Bind("Crouch", "CrouchStrideCut", 0.5f,
-                new ConfigDescription("Fraction the walk stride shrinks while crouched (crouch-walk).",
-                    new AcceptableValueRange<float>(0f, 0.95f)));
-            CrouchKneeForwardConfig = Config.Bind("Crouch", "CrouchKneeForward", 1f,
-                new ConfigDescription("Knee-forward pole sign for the leg IK. +1 bends the knees FORWARD (a squat). If the knees bend the wrong way (backward), set this to -1 to flip the pole live.",
-                    new AcceptableValueRange<float>(-1f, 1f)));
+            // The body's pose, held-tool and appearance config live in the Sailwind Player Model mod.
+            // Only the preview window onto them is ours.
+            PosePreviewConfig.Bind(Config);
 
-            // (v0.3.0) SQUAT vs SEIZA. The crouch used to drop the hips straight down while the feet stayed
-            // planted directly beneath them, which is kneeling geometry, not squatting - the reported "looks
-            // like I'm sitting on my own feet". A real squat sends the hips BACKWARD as they drop. That is
-            // also the ONLY lever available: with the hip above the foot the knee lies on a horizontal
-            // circle, so the IK pole sets the knee's compass direction but never its height, and with
-            // roughly equal thigh/shin bones the knee can never rise above the hip at all. Moving the hip
-            // back is what opens the thigh angle up; the shins and ankles then re-solve to follow.
-            CrouchThighLiftDegConfig = Config.Bind("Crouch", "CrouchThighLiftDeg", 8f,
-                new ConfigDescription("How far the thigh lifts toward the chest at full crouch, in degrees above the hip-to-ankle line. The hip setback needed to achieve it is solved from your rig's own measured bone lengths, so the same angle looks the same on any character - which is why this is an angle and not a distance. 0 keeps the old straight-down drop.",
-                    new AcceptableValueRange<float>(-30f, 25f)));
-            CrouchHipSetbackMaxMetersConfig = Config.Bind("Crouch", "CrouchHipSetbackMaxMeters", 0.35f,
-                new ConfigDescription("Safety clamp (metres) on how far back the hips may travel for CrouchThighLiftDeg. SET THIS TO 0 to disable the squat setback entirely and get the previous straight-down crouch back, without needing a new build.",
-                    new AcceptableValueRange<float>(0f, 0.6f)));
+            // ONE-TIME MIGRATION. A player's character used to be saved in THIS mod's config; it is the
+            // player-model mod's now. Without this every existing crew member would load into a face they
+            // did not choose the first time they ran this build. The old entry is re-bound (not deleted) so
+            // it survives, and is only copied when the new one is still empty, so it can never overwrite a
+            // choice made since. Downgrading therefore still finds the old value where it was.
+            var legacyAppearance = Config.Bind("Appearance", "Character", "",
+                "Superseded: your character now lives in the Sailwind Player Model mod's config. This copy is kept up to date so that removing or downgrading this mod still finds your current character.");
+            if (!string.IsNullOrEmpty(legacyAppearance.Value)
+                && string.IsNullOrEmpty(SailwindPlayerModel.BodyTuning.Appearance.Value))
+            {
+                SailwindPlayerModel.BodyTuning.Appearance.Value = legacyAppearance.Value;
+                Log.LogInfo("[Appearance] Carried your saved character over to the Sailwind Player Model mod: " + legacyAppearance.Value);
+            }
 
-            // (v0.3.0) Avatar ground plant. The body used to be planted with a hardcoded 0.9m guess at the
-            // distance from the player root down to the ground; the real distance is read live from the
-            // vanilla CharacterController instead (PlayerSyncManager.ControllerFeetGap), which is the same
-            // number the network send path has always used. This knob is only the residual nudge on top.
-            AvatarSoleOffsetMetersConfig = Config.Bind("Crouch", "AvatarSoleOffsetMeters", 0f,
-                new ConfigDescription("Fine adjustment (metres) to how high avatars stand relative to the surface under them. POSITIVE raises, NEGATIVE sinks. Leave at 0 unless bodies visibly hover above or sink into decks; the base value is now measured from the game rather than assumed. Takes effect on the next avatar build (leave and re-enter third person, or rejoin).",
-                    new AcceptableValueRange<float>(-0.5f, 0.5f)));
-
-            CoopMenuButtonScaleConfig = Config.Bind("Coop", "MenuButtonScale", 1f,
-                new ConfigDescription("Size of the buttons on the co-op pause menu, relative to vanilla. Default 1.0 is vanilla-sized; the parchment is made taller to fit them rather than the buttons being shrunk to fit the parchment. Lower it if you would rather have a shorter scroll. Applies the next time the menu lays out (open the pause menu again).",
-                    new AcceptableValueRange<float>(0.5f, 1f)));
-
-            AppearanceConfig = Config.Bind("Appearance", "Character", "",
-                "Your character's appearance, as \"slot=variant\" pairs (e.g. \"gender=0;hair=3;torso=7\"). Normally written by the in-game character screen rather than edited here. Leave EMPTY to get a look derived from your Steam ID - stable across sessions, and different from your crewmates' rather than everyone sharing one face. Unknown slot names are ignored and out-of-range variants fall back to that slot's default, so a hand-edited value can never produce an invisible or broken character.");
-
-            // LOOK-LEAN tuning - live-editable (Configuration Manager). The avatar's upper body (Spine_01 ->
-            // chest/head/arms) pitches on the hips toward where the player looks vertically, in every state
-            // (standing/walking/crouched), composed on top of the crouch fold. Shared by remote avatars and
-            // your own third-person (orbit-cam) body.
-            LookPitchScaleConfig = Config.Bind("Crouch", "LookPitchScale", 0.9f,
-                new ConfigDescription("Torso look-lean: fraction of your vertical look angle the upper body pitches on the hips (1.0 = follows your look 1:1). Looking DOWN folds the torso forward, looking UP leans it back. Set NEGATIVE to flip the direction if it bends the wrong way in-game.",
-                    new AcceptableValueRange<float>(-2f, 2f)));
-            LookPitchMaxDegConfig = Config.Bind("Crouch", "LookPitchMaxDeg", 55f,
-                new ConfigDescription("Clamp (degrees) on the torso look-lean so it never over-bends up or down. Must exceed the crouch fold (~28 deg) for the torso to lean BACK past vertical while crouched + looking up.",
-                    new AcceptableValueRange<float>(0f, 90f)));
+            // A player who has never opened the character screen gets a look derived from their own Steam id,
+            // so a crew is a set of individuals rather than identical triplets. Returning null means "Steam is
+            // not up yet, ask again" - latching the all-zero seed would make everyone in that situation look
+            // the same, which is the outcome this exists to prevent.
+            SailwindPlayerModel.PlayerModel.DefaultAppearanceProvider = () =>
+            {
+                ulong id = 0UL;
+                try { if (SteamClient.IsValid) id = SteamClient.SteamId; } catch { }
+                if (id == 0UL) return null;
+                return SailwindPlayerModel.PlayerAppearance.DeterministicFor(id);
+            };
+            // Label our own third-person body the way crewmates are labelled. Solo, the player-model mod
+            // leaves it blank - nobody needs a name tag over their own head.
+            try { if (SteamClient.IsValid) SailwindPlayerModel.PlayerModel.LocalDisplayName = SteamClient.Name; } catch { }
+            SailwindPlayerModel.PlayerModel.LocalAppearanceChanged += () =>
+            {
+                // MIRROR the new look back into the superseded key above. Without this it stays frozen at
+                // whatever the migration copied, so a player who restyles today and later downgrades - or
+                // loses the player-model config - gets handed the character they had BEFORE the change.
+                // Writing it here rather than owning it keeps one source of truth: the player-model mod
+                // still decides what the character is, this is only a breadcrumb for finding the way back.
+                try { legacyAppearance.Value = SailwindPlayerModel.PlayerModel.LocalAppearance.Serialize(); }
+                catch (System.Exception e) { Log.LogWarning("[Appearance] Could not mirror the character to the legacy setting: " + e.Message); }
+                // The crew has to be told when we restyle, wherever the change came from.
+                Player.AppearanceSync.BroadcastLocal();
+            };
+            // Our buttons and crew roster go onto the shared parchment pause menu, which the player-model
+            // mod owns. Registering is safe this early: the menu rebuilds its column from the registry.
+            UI.CoopPauseButtons.Install();
 
             CrewMemberWeightConfig = Config.Bind("Coop", "CrewMemberWeightKg", 90f,
                 new ConfigDescription("Weight (kg) each REMOTE crew member adds to the boat they stand on. Vanilla models every person (the host too) at 160, so several people crowding one side of a small hull pile up a big tipping moment and can flip it. Lower this to reduce that heel/flip. HOST-ONLY: only the host computes crew weight (clients just receive the resulting boat motion), so only the host's value matters - safe to tune live mid-session.",
@@ -482,8 +431,10 @@ namespace SailwindCoop
                 Log.LogInfo("DebugOverlay added");
                 RemotePlayerManager = gameObject.AddComponent<RemotePlayerManager>();
                 Log.LogInfo("RemotePlayerManager added");
-                gameObject.AddComponent<SailwindCoop.Player.LocalPlayerBody>();
-                Log.LogInfo("LocalPlayerBody added (your own body in third person)");
+                // Your own third-person body is the Sailwind Player Model mod's job now - it shows one solo
+                // too, without co-op installed. All we add is the preview of what your CREW sees.
+                gameObject.AddComponent<SailwindCoop.Player.PosePreviewPuppet>();
+                Log.LogInfo($"PosePreviewPuppet added ({PosePreviewConfig.PreviewKey.Value} toggles the pose preview)");
                 BoatSyncManager = gameObject.AddComponent<BoatSyncManager>();
                 Log.LogInfo("BoatSyncManager added");
                 ControlSyncManager = gameObject.AddComponent<ControlSyncManager>();
@@ -2224,6 +2175,24 @@ namespace SailwindCoop
                 TradingSyncManager?.OnIslandSupplySyncReceived(packet);
             });
 
+            NetworkManager.RegisterHandler(PacketType.CurrencyRates, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadCurrencyRates(reader);
+                TradingSyncManager?.OnCurrencyRatesReceived(packet);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.PriceBookRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadPriceBookRequest(reader);
+                TradingSyncManager?.OnPriceBookRequestReceived(sender, packet);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.PriceBook, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadPriceBook(reader);
+                TradingSyncManager?.OnPriceBookReceived(packet);
+            });
+
             NetworkManager.RegisterHandler(PacketType.MarketTradeRequest, (sender, reader) =>
             {
                 var packet = PacketSerializer.ReadMarketTradeRequest(reader);
@@ -2577,7 +2546,6 @@ namespace SailwindCoop
             // Re-pin the world-space co-op pause menu AFTER the camera has followed the bobbing observerMirror
             // this frame (Camera.main moves in LateUpdate). Doing this in Update lagged the menu one frame, so
             // it bobbed/drifted on screen while the boat moved. Cheap + self-guards on IsOpen.
-            SailwindCoop.UI.CoopPauseMenu.LatePin();
 
             // (v0.3.0) Park remotely-carried mooring ropes on their carriers. LateUpdate so the boat and
             // the avatar are both placed for this frame - the same ordering the held-item visuals need.
@@ -2592,8 +2560,6 @@ namespace SailwindCoop
         /// <summary>(v0.3.0) IMGUI surface for our own screens. Draws nothing while they are closed.</summary>
         private void OnGUI()
         {
-            try { SailwindCoop.UI.CharacterScreen.Draw(); }
-            catch (System.Exception e) { Log.LogWarning("[Character] Draw failed: " + e.Message); }
             try { SailwindCoop.UI.FriendsScreen.Draw(); }
             catch (System.Exception e) { Log.LogWarning("[Friends] Draw failed: " + e.Message); }
             try { SailwindCoop.Networking.HostLinkWatchdog.Draw(); }
@@ -2687,7 +2653,6 @@ namespace SailwindCoop
             // initialised (a state the mod explicitly supports - the pause parchment still replaces vanilla
             // pause solo). Below the gate, the watchdog and the pause-key handling were both dead code
             // exactly where a stranded panel would be hardest to escape.
-            SailwindCoop.UI.CharacterScreen.Tick();
             // Same reasoning for the friends screen: its watchdog is what makes a stranded, cursor-holding
             // panel impossible, and that has to run whether or not Steam ever came up.
             SailwindCoop.UI.FriendsScreen.Tick();
@@ -2723,7 +2688,6 @@ namespace SailwindCoop
             // Co-op hosting/joining lives in the main + pause menus (see CoopMenu/CoopPauseMenu);
             // F9 was removed. Keep the menu labels + player list live while a menu is open.
             SailwindCoop.UI.CoopMenu.Tick();
-            SailwindCoop.UI.CoopPauseMenu.Tick();
 
             // 2s ping loop for the F8 overlay: each machine probes its DIRECT peers (star topology,
             // so a guest's ConnectedPeers is just the host, and the host's is every guest). Unreliable

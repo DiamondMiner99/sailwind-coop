@@ -11,8 +11,19 @@ namespace SailwindCoop.Networking.Packets
         public float WeatherLerp;          // 0-1 blend progress
         public float RainIntensity;
         public int RegionIndex;
+        // REAL (offset-independent) coords since 2026-09-10: the host sends position minus its
+        // FloatingOriginManager offset and the guest adds its own back. Raw local positions were off by the
+        // offset difference whenever the two machines sat in different origin cells, which the shift's
+        // hysteresis allows even for players standing side by side.
         public Vector3[] StormPositions;
         public int ActiveStormIndex;       // Index of active storm in StormPositions, -1 if none
+        // (2026-09-10) Bit i = storms[i].active on the host. Vanilla lets several storms be active at once
+        // (WanderingStorm.UpdateActiveInRegion) and the guest's own FindClosestStorm needs the whole set.
+        // Replaces the single-index apply, which switched every storm off whenever the index was -1.
+        public int ActiveStormMask;
+        // (2026-09-10) Name of the host's RegionBlender.currentTargetRegion GameObject, "" if unknown. The
+        // region picks the preset WeatherSets, fog density included, and nothing synced it before this.
+        public string RegionName;
 
         // WavesInertia sync - controls wave height/direction independent of wind
         public Quaternion WaveDirection;   // WavesInertia.transform.rotation

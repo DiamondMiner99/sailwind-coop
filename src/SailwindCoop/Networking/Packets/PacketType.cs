@@ -280,7 +280,7 @@ namespace SailwindCoop.Networking.Packets
         // SteamId, so an older build degrades to "wrong outfit", never to a broken session.
         // Body: authorId (u64), slotCount (byte), then slotCount variant bytes.
         // Indices are NEVER trusted to index anything: the receiver clamps each against its OWN live
-        // part-list count at apply time (CoopAppearance.Apply), so a corrupt or hostile value can only
+        // part-list count at apply time (PlayerAppearance.Apply), so a corrupt or hostile value can only
         // ever yield that slot's default variant. The HOST additionally drops any packet whose authorId
         // does not match the sender, and relays the SANITIZED struct rather than the raw bytes.
         PlayerAppearance = 220,          // Any peer -> all (host relays) / host -> joiner (roster replay)
@@ -305,5 +305,20 @@ namespace SailwindCoop.Networking.Packets
         // and dropped, which is the fail-open behavior wanted here.
         // Body: boatName (string), ropeIndex (byte), holderSteamId (u64; 0 = released).
         MooringRopeAdjusting = 222,      // Adjuster -> all (host relays)
+
+        // (2026-09-11) Market prices. CurrencyMarket.currentPrices (the exchange rates every displayed
+        // price is converted through) random-walk once a day and move on every exchange, and nothing
+        // synced them: each guest ran its own daily MarketCycle from its own solo save's starting rates.
+        // Host sends the whole array on change, on join, and once per supply round-robin cycle. Body:
+        // count (int), then that many floats.
+        CurrencyRates = 223,             // Host -> all / host -> joiner
+
+        // (2026-09-11) Island price book: the "other ports" columns on a trade screen come from
+        // IslandMarket.knownPrices, which each machine's own trader-boat agents fill on their own routes.
+        // A guest opening a market asks for the host's book for that island and merges it (vanilla
+        // ReceivePriceReports: newer report wins, host wins a tie). Request body: portIndex (int).
+        // Response body: portIndex (int), then the PriceKnowledgeSync report list.
+        PriceBookRequest = 224,          // Guest -> host
+        PriceBook = 225,                 // Host -> requesting guest
     }
 }
