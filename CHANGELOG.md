@@ -16,8 +16,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## v0.4.0 - 2026-09-14
 
-> This release adds a dependency: the **Sailwind Player Model** mod, which is bundled in the zip
-> and installs alongside co-op.
+> The **Sailwind Player Model** mod is now included in the zip and installs alongside co-op.
+> Extract the whole archive as usual and you have both. Nothing extra to download.
 
 ### Added
 
@@ -45,8 +45,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
-- **Co-op now needs the Sailwind Player Model mod** (0.1.2 or newer). It is in the zip, under
-  `BepInEx/plugins/SailwindPlayerModel/`. Extract the whole archive as usual and both are installed.
+- **The Sailwind Player Model mod is included in the zip** and lands in
+  `BepInEx/plugins/SailwindPlayerModel/` when you extract it. Co-op runs on it now, so it is part of
+  the download rather than something to fetch separately. If you already had it, the zip brings it up
+  to the version co-op was built against.
 - **Two settings moved to the Player Model config**
   (`BepInEx/config/com.diamondminer99.playermodel.cfg`): the `[Crouch]` entries are now in section
   `1. Pose`, and `[Coop] MenuButtonScale` is in section `4. Menu`. Defaults are unchanged. If you had
