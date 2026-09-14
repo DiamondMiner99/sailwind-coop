@@ -185,30 +185,6 @@ namespace SailwindCoop.Networking.Packets
     }
 
     /// <summary>
-    /// (2026-09-11) Host's CurrencyMarket.currentPrices, the exchange rates. See PacketType.CurrencyRates.
-    /// </summary>
-    [Serializable]
-    public struct CurrencyRatesPacket
-    {
-        public float[] Rates;
-    }
-
-    /// <summary>(2026-09-11) Guest asks the host for one island's price book. See PacketType.PriceBookRequest.</summary>
-    [Serializable]
-    public struct PriceBookRequestPacket
-    {
-        public int PortIndex;
-    }
-
-    /// <summary>(2026-09-11) The host's IslandMarket.knownPrices for one island. See PacketType.PriceBook.</summary>
-    [Serializable]
-    public struct PriceBookPacket
-    {
-        public int PortIndex;
-        public NetworkPriceReport[] Reports; // 34 ports
-    }
-
-    /// <summary>
     /// Market trade request (buy or sell goods).
     /// </summary>
     [Serializable]

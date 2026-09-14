@@ -1,4 +1,3 @@
-using SailwindPlayerModel;
 using UnityEngine;
 using SailwindCoop.UI;
 

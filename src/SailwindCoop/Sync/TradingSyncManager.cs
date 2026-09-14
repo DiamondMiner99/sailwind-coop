@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using UnityEngine;
 using HarmonyLib;
 using SailwindCoop.Debug;
@@ -19,30 +18,6 @@ namespace SailwindCoop.Sync
         private const float SUPPLY_POLL_INTERVAL = 1f; // 1Hz
         private int _lastDockedPortIndex = -1;
 
-        // ===== Market prices (2026-09-11) =====
-        // A displayed price is a pure function of that island's currentSupply and CurrencyMarket.currentPrices
-        // (IslandMarket.GetGoodPriceAtSupply / GetBuyPrice / GetSellPrice; every other input is a scene
-        // constant). Before this, guests ran their own random EconCycle, their own trader boats and their
-        // own daily currency walk, starting from their own solo save, and supply was only sent for the port
-        // the HOST had a trade screen open at. So the host now owns both: every port's supply goes out one
-        // port per second, all of it to a joiner, and the rates on change. A guest stops simulating a port
-        // (EconCycle, trader buys/sells) only once it holds host data for it, and stops the daily currency
-        // walk only once it holds host rates: until then it keeps its own sim, wrong but alive.
-        private float _marketRoundRobinTimer = 0f;
-        private const float MARKET_ROUND_ROBIN_INTERVAL = 1f; // one port per second, on unscaled time
-        private int _nextRoundRobinPort = 0;
-        private bool _currencyRatesDirty;
-        private static readonly HashSet<int> _hostSyncedPorts = new HashSet<int>();
-        private static bool _hasHostCurrencyRates;
-
-        /// <summary>Guest only: true once the host's supply for this port has been applied, so the guest's
-        /// own economy sim for it must stay off.</summary>
-        public static bool IsPortHostSynced(int portIndex) =>
-            Plugin.IsMultiplayer && !Plugin.IsHost && _hostSyncedPorts.Contains(portIndex);
-
-        /// <summary>Guest only: true once the host's exchange rates have been applied.</summary>
-        public static bool HasHostCurrencyRates => Plugin.IsMultiplayer && !Plugin.IsHost && _hasHostCurrencyRates;
-
         private void Awake()
         {
             if (Instance != null)
@@ -62,8 +37,6 @@ namespace SailwindCoop.Sync
             if (Plugin.IsHost)
             {
                 PollIslandSupply();
-                RoundRobinMarketSupply();
-                if (_currencyRatesDirty) SendCurrencyRates();
             }
 
             Plugin.Profiler?.EndMeasure("Trading");
@@ -104,9 +77,12 @@ namespace SailwindCoop.Sync
             return null;
         }
 
-        private void SendIslandSupplySync(int portIndex, IslandMarket market, SteamId? target = null, bool quiet = false)
+        private void SendIslandSupplySync(int portIndex, IslandMarket market)
         {
-            var supply = market.currentSupply;
+            var supply = Traverse.Create(market)
+                .Field("currentSupply")
+                .GetValue<float[]>();
+
             if (supply == null) return;
 
             var packet = new IslandSupplySyncPacket
@@ -115,202 +91,10 @@ namespace SailwindCoop.Sync
                 Supply = (float[])supply.Clone()
             };
 
-            if (!quiet)
-                VerboseLogger.Log("TRADING", "SEND", $"IslandSupply, port={portIndex}{(target.HasValue ? $" (to {target.Value})" : "")}");
+            VerboseLogger.Log("TRADING", "SEND", $"IslandSupply, port={portIndex}");
 
-            if (target.HasValue)
-                Plugin.NetworkManager.SendReliable(target.Value, PacketType.IslandSupplySync, w =>
-                    PacketSerializer.WriteIslandSupplySync(w, packet));
-            else
-                Plugin.NetworkManager.SendToAllReliable(PacketType.IslandSupplySync, w =>
-                    PacketSerializer.WriteIslandSupplySync(w, packet));
-        }
-
-        /// <summary>
-        /// Host: broadcast one port's supply per second, cycling through every port, so no guest's view of any
-        /// market is ever more than one cycle old. Unscaled time on purpose: during the 16x sleep warp a
-        /// scaled timer would send 16x faster in real time, the send flood behind the v0.2.35 guest freeze.
-        /// Rates ride along once per full cycle as a backstop for a lost on-change send.
-        /// </summary>
-        private void RoundRobinMarketSupply()
-        {
-            _marketRoundRobinTimer += Time.unscaledDeltaTime;
-            if (_marketRoundRobinTimer < MARKET_ROUND_ROBIN_INTERVAL) return;
-            _marketRoundRobinTimer = 0f;
-
-            if (Port.ports == null || Port.ports.Length == 0) return;
-
-            // Skip ports with no market, but never spin a whole frame looking for one
-            for (int tries = 0; tries < Port.ports.Length; tries++)
-            {
-                if (_nextRoundRobinPort >= Port.ports.Length)
-                {
-                    _nextRoundRobinPort = 0;
-                    _currencyRatesDirty = true;
-                    VerboseLogger.Log("TRADING", "SEND", "Market round-robin completed a full cycle");
-                }
-
-                int portIndex = _nextRoundRobinPort++;
-                var market = Port.ports[portIndex] != null ? Port.ports[portIndex].GetComponent<IslandMarket>() : null;
-                if (market == null) continue;
-
-                SendIslandSupplySync(portIndex, market, quiet: true);
-                return;
-            }
-        }
-
-        /// <summary>Host: every port's supply to one joiner. Their world was seeded from their own solo save,
-        /// so without this every market they visit before the round-robin reaches it shows their prices.</summary>
-        private void SendAllMarketSupplyTo(SteamId target)
-        {
-            if (Port.ports == null) return;
-            int sent = 0;
-            for (int i = 0; i < Port.ports.Length; i++)
-            {
-                var market = Port.ports[i] != null ? Port.ports[i].GetComponent<IslandMarket>() : null;
-                if (market == null) continue;
-                SendIslandSupplySync(i, market, target, quiet: true);
-                sent++;
-            }
-            VerboseLogger.Log("TRADING", "SEND", $"All market supply to {target}: {sent} ports");
-        }
-
-        /// <summary>Host: flag the exchange rates for a send on the next Update. Coalesces the two calls one
-        /// exchange makes (SellCurrency then BuyCurrency) into one packet.</summary>
-        public void MarkCurrencyRatesDirty()
-        {
-            if (Plugin.IsMultiplayer && Plugin.IsHost) _currencyRatesDirty = true;
-        }
-
-        private void SendCurrencyRates(SteamId? target = null)
-        {
-            if (!target.HasValue) _currencyRatesDirty = false;
-
-            var rates = CurrencyMarket.instance != null ? CurrencyMarket.instance.currentPrices : null;
-            if (rates == null) return;
-
-            var packet = new CurrencyRatesPacket { Rates = (float[])rates.Clone() };
-            VerboseLogger.Log("TRADING", "SEND", $"CurrencyRates [{string.Join(", ", rates)}]{(target.HasValue ? $" (to {target.Value})" : "")}");
-
-            if (target.HasValue)
-                Plugin.NetworkManager.SendReliable(target.Value, PacketType.CurrencyRates, w =>
-                    PacketSerializer.WriteCurrencyRates(w, packet));
-            else
-                Plugin.NetworkManager.SendToAllReliable(PacketType.CurrencyRates, w =>
-                    PacketSerializer.WriteCurrencyRates(w, packet));
-        }
-
-        // ===== Island price book (2026-09-11) =====
-
-        /// <summary>Guest: ask the host for its price book for the island whose market we just opened.</summary>
-        public void RequestPriceBook(int portIndex)
-        {
-            if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
-            var packet = new PriceBookRequestPacket { PortIndex = portIndex };
-            VerboseLogger.Log("TRADING", "SEND", $"PriceBookRequest, port={portIndex}");
-            Plugin.NetworkManager.SendToAllReliable(PacketType.PriceBookRequest, w =>
-                PacketSerializer.WritePriceBookRequest(w, packet));
-        }
-
-        /// <summary>Host: reply to one guest with this island's IslandMarket.knownPrices.</summary>
-        public void OnPriceBookRequestReceived(SteamId sender, PriceBookRequestPacket request)
-        {
-            if (!Plugin.IsHost) return;
-
-            var market = GetMarket(request.PortIndex);
-            var book = market != null ? market.knownPrices : null;
-            if (book == null) return;
-
-            var reports = new NetworkPriceReport[book.Length];
-            for (int i = 0; i < book.Length; i++)
-            {
-                var pr = book[i];
-                reports[i] = pr == null
-                    ? new NetworkPriceReport { PortIndex = i }
-                    : new NetworkPriceReport
-                    {
-                        PortIndex = i,
-                        BuyPrices = pr.buyPrices != null ? (int[])pr.buyPrices.Clone() : new int[0],
-                        SellPrices = pr.sellPrices != null ? (int[])pr.sellPrices.Clone() : new int[0],
-                        Day = pr.day,
-                        Approved = pr.approved
-                    };
-            }
-
-            var packet = new PriceBookPacket { PortIndex = request.PortIndex, Reports = reports };
-            VerboseLogger.Log("TRADING", "SEND", $"PriceBook, port={request.PortIndex} (to {sender})");
-            Plugin.NetworkManager.SendReliable(sender, PacketType.PriceBook, w =>
-                PacketSerializer.WritePriceBook(w, packet));
-        }
-
-        /// <summary>
-        /// Guest: merge the host's book into ours with vanilla's own IslandMarket.ReceivePriceReports, which
-        /// takes a report when ours is missing or not newer (so a newer first-hand report of our own survives,
-        /// and the host wins a tie). If that market's screen is open, re-point the player's book at the island's
-        /// the way vanilla OpenUI does, and redraw.
-        /// </summary>
-        public void OnPriceBookReceived(PriceBookPacket packet)
-        {
-            if (Plugin.IsHost || packet.Reports == null) return;
-
-            var market = GetMarket(packet.PortIndex);
-            if (market == null || market.knownPrices == null) return;
-
-            var reports = new PriceReport[market.knownPrices.Length];
-            for (int i = 0; i < reports.Length && i < packet.Reports.Length; i++)
-            {
-                var nr = packet.Reports[i];
-                if (nr.BuyPrices == null || nr.BuyPrices.Length == 0 || nr.SellPrices == null) continue;
-                reports[i] = new PriceReport
-                {
-                    buyPrices = nr.BuyPrices,
-                    sellPrices = nr.SellPrices,
-                    day = nr.Day,
-                    approved = nr.Approved
-                };
-            }
-
-            market.ReceivePriceReports(reports);
-            VerboseLogger.Log("TRADING", "APPLY", $"PriceBook merged for port {packet.PortIndex}");
-
-            if (EconomyUI.instance != null && EconomyUI.instance.uiActive)
-            {
-                var openIsland = Traverse.Create(EconomyUI.instance).Field("currentIsland").GetValue<IslandMarket>();
-                if (openIsland == market)
-                {
-                    GameState.playerKnownPrices = market.knownPrices;
-                    EconomyUI.instance.RefreshPage();
-                }
-            }
-        }
-
-        private static IslandMarket GetMarket(int portIndex)
-        {
-            if (Port.ports == null || portIndex < 0 || portIndex >= Port.ports.Length || Port.ports[portIndex] == null)
-                return null;
-            return Port.ports[portIndex].GetComponent<IslandMarket>();
-        }
-
-        public void OnCurrencyRatesReceived(CurrencyRatesPacket packet)
-        {
-            if (Plugin.IsHost) return;
-
-            var market = CurrencyMarket.instance;
-            if (market == null || market.currentPrices == null || packet.Rates == null) return;
-
-            int n = Mathf.Min(market.currentPrices.Length, packet.Rates.Length);
-            for (int i = 0; i < n; i++)
-                market.currentPrices[i] = packet.Rates[i];
-
-            if (!_hasHostCurrencyRates)
-                Plugin.Log.LogInfo($"[TRADING] Exchange rates now follow the host ([{string.Join(", ", packet.Rates)}])");
-            _hasHostCurrencyRates = true;
-
-            // Every displayed goods price is converted through these, and so is the exchange screen
-            if (CurrencyExchangeUI.instance != null)
-                CurrencyExchangeUI.instance.RefreshUI();
-            if (EconomyUI.instance != null && EconomyUI.instance.uiActive)
-                EconomyUI.instance.RefreshPage();
+            Plugin.NetworkManager.SendToAllReliable(PacketType.IslandSupplySync, w =>
+                PacketSerializer.WriteIslandSupplySync(w, packet));
         }
 
         /// <summary>
@@ -348,8 +132,6 @@ namespace SailwindCoop.Sync
 
             SendPriceKnowledgeSync(target);
             SendDayLogsSync(target);
-            SendAllMarketSupplyTo(target);
-            SendCurrencyRates(target);
         }
 
         // N-player (Phase 3): optional `target` routes to ONE joining guest; null => broadcast (unchanged).
@@ -547,13 +329,6 @@ namespace SailwindCoop.Sync
                     currentSupply[i] = packet.Supply[i];
                 }
             }
-
-            // From here on this port's economy is the host's: the EconCycle and trader-boat prefixes stop
-            // our own sim for it. Rebuild the self price report now, because the screen reads prices from
-            // that report, and the EconCycle that used to rebuild it several times a second no longer runs.
-            if (_hostSyncedPorts.Add(packet.PortIndex))
-                VerboseLogger.Log("TRADING", "APPLY", $"Port {packet.PortIndex} market now follows the host");
-            market.UpdateSelfPriceReportForPlayer();
 
             // TRADE-REFRESH: just updating currentSupply isn't enough - whoever has THIS
             // market's trade screen open keeps showing the stale buy/sell prices (vanilla only recomputes them
@@ -1413,11 +1188,6 @@ namespace SailwindCoop.Sync
         {
             _supplyPollTimer = 0f;
             _lastDockedPortIndex = -1;
-            _marketRoundRobinTimer = 0f;
-            _nextRoundRobinPort = 0;
-            _currencyRatesDirty = false;
-            _hostSyncedPorts.Clear();
-            _hasHostCurrencyRates = false;
         }
     }
 }

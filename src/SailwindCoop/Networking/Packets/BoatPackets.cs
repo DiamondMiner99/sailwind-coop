@@ -166,10 +166,7 @@ namespace SailwindCoop.Networking.Packets
         // Guest needs this to properly shift their world to match host's coordinate frame
         public Vector3 HostOffset;
 
-        // BUG-018 fix: Host's current region name for forcing RegionBlender switch.
-        // (2026-09-10) Never consumed: the apply side was never written. The region now rides in
-        // WeatherStatePacket.RegionName, which reaches the guest both at join (WeatherState above) and every
-        // periodic broadcast. Left in place only to avoid churning the join snapshot layout.
+        // BUG-018 fix: Host's current region name for forcing RegionBlender switch
         public string HostRegionName;
 
         // BUG-018 fix: Nearest port to host for cross-region recovery teleport

@@ -204,30 +204,6 @@ namespace SailwindCoop.Patches
         }
 
         /// <summary>
-        /// (2026-09-11, invisible-firewood report) Backstop for RefreshOpenCrateUI. CrateInventoryButton.PutItemBack,
-        /// run for every button when the crate window closes, moves the button's item to layer 26 (ItemInCrate,
-        /// not drawn by the main camera) and teleports it onto the crate. It only belongs to items still in the
-        /// crate. A button holding anything else, a stale reference to an item that has since been withdrawn,
-        /// would hide a live item lying out in the world or sitting in someone's hands. Drop the stale reference
-        /// and skip. Traverse rather than a FieldRef so a renamed vanilla field fails open to vanilla behavior.
-        /// </summary>
-        [HarmonyPatch(typeof(CrateInventoryButton), "PutItemBack")]
-        [HarmonyPrefix]
-        public static bool OnCrateButtonPutItemBack(CrateInventoryButton __instance, CrateInventory crate)
-        {
-            if (!Plugin.IsMultiplayer) return true;
-
-            var field = Traverse.Create(__instance).Field("currentItem");
-            var item = field.GetValue<ShipItem>();
-            if (item == null) return true;
-            if (crate != null && crate.containedItems != null && crate.containedItems.Contains(item)) return true;
-
-            field.SetValue(null);
-            VerboseLogger.Log("ITEM", "CRATE", $"crate window close: skipped hiding {item.gameObject.name}, it is no longer in the crate");
-            return false;
-        }
-
-        /// <summary>
         /// Patch CrateInventory.WithdrawItem to sync crate withdrawals.
         /// </summary>
         [HarmonyPatch(typeof(CrateInventory), "WithdrawItem")]

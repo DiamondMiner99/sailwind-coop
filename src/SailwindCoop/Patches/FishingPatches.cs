@@ -340,24 +340,6 @@ namespace SailwindCoop.Patches
             var rod = Traverse.Create(__instance).Field("rod").GetValue<ShipItemFishingRod>();
             if (rod == null) return true;
 
-            // (2026-09-11) Only the rod's owner may collect. Every other fishing patch in this file gates on
-            // ownership and this one did not; no path to a non-owner collect is known, so this is a guard, and
-            // it logs if it ever fires ("two fish, one real" report). Blocks a KNOWN remote owner only, the same
-            // test as the K5 FixedUpdate prefix: an unclaimed rod (owner 0) still collects, so a lost ownership
-            // record can never eat a real catch.
-            var rodPrefab = rod.GetComponent<SaveablePrefab>();
-            var fishingMgr = FishingSyncManager.Instance;
-            if (rodPrefab != null && fishingMgr != null)
-            {
-                ulong owner = fishingMgr.GetRodOwner(rodPrefab.instanceId);
-                if (owner != 0 && !fishingMgr.IsLocalPlayerOwner(rodPrefab.instanceId))
-                {
-                    Plugin.Log.LogWarning($"[FISHING] Blocked a fish collect on rod {rodPrefab.instanceId}, owned by {owner}");
-                    __result = null;
-                    return false;
-                }
-            }
-
             // Get fish prefab index before clearing
             var currentFish = __instance.currentFish;
             int prefabIndex = GetFishPrefabIndex(currentFish);

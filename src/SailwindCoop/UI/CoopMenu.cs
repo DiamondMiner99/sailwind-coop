@@ -118,16 +118,35 @@ namespace SailwindCoop.UI
         }
 
         // --- shared helpers ---
-        // One copy, in the Sailwind Player Model mod, so a button this mod clones onto the title screen and
-        // a button it registers on the shared pause menu are built exactly the same way.
 
         public static void EnsureButton(Transform panel, Transform template, string name, Vector3 localPos)
-            => SailwindPlayerModel.MenuUtil.EnsureButton(panel, template, name, localPos);
+        {
+            if (FindChild(panel, name) != null) return;
+            var clone = Object.Instantiate(template.gameObject, panel); // keeps native StartMenuButton + layer 5
+            clone.name = name;
+            clone.transform.localRotation = template.localRotation;
+            clone.transform.localScale = template.localScale;
+            clone.transform.localPosition = localPos;
+        }
 
         public static void SetLabel(Transform button, string text)
-            => SailwindPlayerModel.MenuUtil.SetLabel(button, text);
+        {
+            var t = button.Find("text");
+            if (t == null) return;
+            var tm = t.GetComponent<TextMesh>();
+            if (tm != null) tm.text = text;
+        }
 
         public static Transform FindChild(Transform root, string name)
-            => SailwindPlayerModel.MenuUtil.FindChild(root, name);
+        {
+            var d = root.Find(name);
+            if (d != null) return d;
+            for (int i = 0; i < root.childCount; i++)
+            {
+                var r = FindChild(root.GetChild(i), name);
+                if (r != null) return r;
+            }
+            return null;
+        }
     }
 }

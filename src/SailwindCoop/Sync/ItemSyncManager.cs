@@ -1170,18 +1170,6 @@ namespace SailwindCoop.Sync
                         worldRot = state.SmoothRot;
                     }
 
-                    // (2026-09-11) Held-tool pose: the carrier's avatar raises its arm toward this pose, and in
-                    // ItemInHand mode draws the item in its hand itself (after its own arm solve, in its Tick),
-                    // in which case writing it here would fight that. See HeldToolPose.
-                    var carrierAvatar = Plugin.RemotePlayerManager?.GetAvatar(carrier);
-                    if (carrierAvatar != null)
-                    {
-                        carrierAvatar.SetHeldItemPose(item.transform,
-                            item.itemRigidbodyC != null ? item.itemRigidbodyC.transform : null,
-                            worldPos, worldRot, item.big);
-                        if (carrierAvatar.PlacesHeldItemInHand) continue;
-                    }
-
                     item.transform.position = worldPos;
                     item.transform.rotation = worldRot;
 
@@ -1734,22 +1722,6 @@ namespace SailwindCoop.Sync
             if (hangable != null && hangable.IsHanging())
             {
                 VerboseLogger.ItemLocal($"Skipping drop sync for item {prefab.instanceId} - hanging on hook");
-                return;
-            }
-
-            // Skip drop sync if the item just went INTO a crate (2026-09-11). CrateInventoryButton.OnActivate
-            // runs InsertItem and then DropItem to empty the hand, and InsertItem is the only thing that sets
-            // currentCrateId (WithdrawItem clears it before any pickup), so a real world drop never gets here
-            // with it set. The insert already went out as ItemCrateInsert, which releases the item on
-            // receivers. Also broadcasting the drop re-armed it at the hand pose on every other machine while
-            // it stayed listed in the crate: visible, shrunk, colliders live, and snapped back onto the crate
-            // every frame by CrateInventory.LateUpdate, so anyone grabbing it fought the crate for it.
-            if (prefab.currentCrateId != 0)
-            {
-                VerboseLogger.ItemLocal($"Skipping drop sync for item {prefab.instanceId} - just inserted into crate {prefab.currentCrateId}");
-                // The one bit of local bookkeeping SendDropPacket would have done
-                _heldItems.Remove(prefab.instanceId);
-                ClearSyncedHeldItemById(prefab.instanceId);
                 return;
             }
 
@@ -3835,33 +3807,6 @@ namespace SailwindCoop.Sync
                 existing = FindInactiveItemByInstanceId(packet.ItemInstanceId);
             if (existing != null)
             {
-                // (2026-09-11, rod tackle) The dedup keeps OUR copy's state, and for boat default items that
-                // copy came from our own save: every machine spawns a boat's cached items locally when it comes
-                // into range, so the host's broadcast of the same ids lands here. For a rod, health IS the hook
-                // (vanilla: attach sets 1, DetachHook sets 0), and nothing else ever reconciles it, so crewmates
-                // with different saves kept seeing different tackle on the same rods (2026-08-06 playtest,
-                // section 6). Take the host's hook state for rods only; a general state reconcile on dedup
-                // would touch every item type and is a separate decision.
-                if (!Plugin.IsHost && existing is ShipItemFishingRod && Mathf.Abs(existing.health - packet.Health) > 0.01f)
-                {
-                    IsApplyingRemoteState = true;
-                    try
-                    {
-                        Plugin.Log.LogInfo($"OnRemoteItemSpawned: rod {packet.ItemInstanceId} already exists; taking the host's hook state ({existing.health} -> {packet.Health})");
-                        existing.health = packet.Health;
-                        HarmonyLib.Traverse.Create(existing).Method("UpdateHook").GetValue();
-                    }
-                    catch (System.Exception e)
-                    {
-                        Plugin.Log.LogWarning($"[ITEM] Could not reconcile hook state on rod {packet.ItemInstanceId}: {e.Message}");
-                    }
-                    finally
-                    {
-                        IsApplyingRemoteState = false;
-                    }
-                    return;
-                }
-
                 // Info, not warning: this is the expected no-op on every healthy join, where the post-join
                 // mission-cargo resync resends crates the snapshot already applied and each one dedups here.
                 Plugin.Log.LogInfo($"OnRemoteItemSpawned: item {packet.ItemInstanceId} already exists, skipping");
@@ -4658,33 +4603,12 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            // (2026-09-11) An insert from the crate window is also the item leaving its holder's hand, and the
-            // inserter no longer sends an ItemDropped for it (see OnLocalDrop). Release it here the way
-            // OnRemoteItemHung does for click-to-hang, or it stays remote-held on this machine: fake held
-            // reference, colliders and own trigger off, ItemRigidbody disabled, and UpdateRemoteHeldItemVisuals
-            // still dragging it toward the holder's hand against CrateInventory.LateUpdate.
-            bool wasRemoteHeld = _remoteHeldItems.ContainsKey(packet.ItemInstanceId);
-            _heldItems.Remove(packet.ItemInstanceId);
-            _remoteHeldItems.Remove(packet.ItemInstanceId);
-            ClearSyncedHeldItemById(packet.ItemInstanceId);
-            RemoveFromGuestInventory(packet.ItemInstanceId);
-            // Same as the drop path: the insert supersedes a pending withdraw freeze, whose fail-open timeout
-            // would otherwise find the item unheld and rearm it to layer 0, visible on top of the crate.
-            ReleaseHoldFreeze(packet.ItemInstanceId);
-
             IsApplyingRemoteState = true;
             try
             {
-                // Rearm BEFORE the insert: rearm resets the root layer to 0, and InsertItem then puts the whole
-                // hierarchy on layer 26 and sets the crate's own collider/attach flags on a normal item, which is
-                // the state vanilla's own InsertItem-then-DropItem sequence starts from.
-                if (wasRemoteHeld)
-                    RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
-
                 crate.InsertItem(item);
                 // Diag: capture scale after the crate insert (a crate item should be shrunk; full ~1.0 flags a scale desync).
                 VerboseLogger.ItemApply($"Inserted item {packet.ItemInstanceId} into crate {packet.CrateInstanceId} (scale={item.transform.localScale.x:F3})");
-                RefreshOpenCrateUI(crate);
             }
             finally
             {
@@ -4719,36 +4643,10 @@ namespace SailwindCoop.Sync
                 crate.WithdrawItem(item);
                 // Diag: a withdrawn item should return to full scale (~1.0); a stuck shrunk/huge scale here flags a desync.
                 VerboseLogger.ItemApply($"Removed item {packet.ItemInstanceId} from crate {packet.CrateInstanceId} (scale={item.transform.localScale.x:F3})");
-                RefreshOpenCrateUI(crate);
             }
             finally
             {
                 IsApplyingRemoteState = false;
-            }
-        }
-
-        /// <summary>
-        /// (2026-09-11, invisible-firewood report) Re-sync this machine's crate window after a REMOTE insert or
-        /// withdraw into the crate it is showing. Vanilla only ever changes containedItems from its own button
-        /// clicks, and every one of those ends in RefreshButtons; the remote handlers skipped it. A button left
-        /// holding a crewmate's withdrawn item keeps pinning it to the window (UpdateItemPos, every frame), and
-        /// when the window closes PutItemBack moves it to layer 26 (ItemInCrate, not drawn by the main camera)
-        /// and teleports it onto the crate - out of the crate, invisible, still clickable. Picking it up and
-        /// setting it down restored it, which is how the reporter found it.
-        /// </summary>
-        private static void RefreshOpenCrateUI(CrateInventory crate)
-        {
-            var ui = CrateInventoryUI.instance;
-            if (ui == null || !ui.showingUI || ui.currentCrate != crate) return;
-            try
-            {
-                ui.RefreshButtons();
-                VerboseLogger.ItemApply($"Refreshed the open crate window after a remote change ({crate.containedItems.Count} items)");
-            }
-            catch (System.Exception e)
-            {
-                // Vanilla RefreshButtons indexes buttons[j] without a bounds check; never let that escape a packet handler.
-                Plugin.Log.LogWarning($"[ITEM] Could not refresh the open crate window after a remote change: {e.Message}");
             }
         }
 

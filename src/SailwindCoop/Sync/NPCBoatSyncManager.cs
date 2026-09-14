@@ -152,22 +152,9 @@ namespace SailwindCoop.Sync
             }
         }
 
-        // Full-rate sync radius (meters): 5Hz polling with the 1s keepalive.
+        // Max distance to sync NPC boats (meters) - beyond this they're not visible anyway
         private const float MaxSyncDistance = 2000f;
         private const float MaxSyncDistanceSqr = MaxSyncDistance * MaxSyncDistance;
-
-        // (2026-09-11) The old comment here said boats past 2000m are "not visible anyway". They are: vanilla
-        // sinks an NPC boat below the horizon progressively out to BoatHorizon.fullySunkDistance (10000m).
-        // Guests never simulate NPC boats (NPCBoatPatches), and the host only simulates within 1000m of a
-        // crew member, so past 2km nothing moves on either machine - but a boat nobody had been near since
-        // the join sat wherever each player's OWN save left it, and was never corrected. Tiered rather than a
-        // flat increase: the far band is evaluated once a second and resent only on a real change or a slow
-        // keepalive, which for a host-frozen boat means one correction and then a trickle.
-        private const float VisibleSyncDistance = 10000f;
-        private const float VisibleSyncDistanceSqr = VisibleSyncDistance * VisibleSyncDistance;
-        private const float FarNPCKeepaliveInterval = 10f;
-        private const int FarNPCPollDivider = 5; // far band evaluated every 5th 5Hz poll = 1Hz
-        private int _npcPollCount;
 
         /// <summary>
         /// Host: Send all visible NPC boat states at 5Hz.
@@ -209,7 +196,6 @@ namespace SailwindCoop.Sync
                 }
             if (playerPositions.Count == 0) playerPositions.Add(Vector3.zero);
             int sentCount = 0;
-            bool evaluateFarBand = (++_npcPollCount % FarNPCPollDivider) == 0;
 
             foreach (var npc in npcBoats)
             {
@@ -222,9 +208,7 @@ namespace SailwindCoop.Sync
                     float d = (npc.transform.position - playerPositions[i]).sqrMagnitude;
                     if (d < minDistSqr) minDistSqr = d;
                 }
-                if (minDistSqr > VisibleSyncDistanceSqr) continue;
-                bool far = minDistSqr > MaxSyncDistanceSqr;
-                if (far && !evaluateFarBand) continue;
+                if (minDistSqr > MaxSyncDistanceSqr) continue;
 
                 // Broadcast authoritative NPC damage/sink on change or sink transition. Shares
                 // this loop's crew-relative cull + 5Hz cadence, so a guest near a host-damaged/sunk NPC
@@ -235,7 +219,7 @@ namespace SailwindCoop.Sync
                 var packet = CollectNPCBoatState(npc, offset);
 
                 // Dedupe: skip near-unchanged states unless the keepalive window elapsed.
-                if (!NPCStateChanged(packet, far ? FarNPCKeepaliveInterval : NPCKeepaliveInterval)) continue;
+                if (!NPCStateChanged(packet)) continue;
 
                 Plugin.NetworkManager.SendToAllUnreliable(PacketType.NPCBoatState, writer =>
                 {
@@ -260,12 +244,12 @@ namespace SailwindCoop.Sync
         /// keepalive window elapsed? Returns true (send) if we've never sent it, or pos/rot/sails moved
         /// past their thresholds, or it's been longer than NPCKeepaliveInterval since the last send.
         /// </summary>
-        private bool NPCStateChanged(NPCBoatStatePacket packet, float keepaliveInterval)
+        private bool NPCStateChanged(NPCBoatStatePacket packet)
         {
             if (!_lastSentNPC.TryGetValue(packet.HierarchyPath, out var last)) return true;
             // (v0.2.37) Same warp scale as the poll gate above, so the keepalive stays on its intended REAL
             // interval during a co-op sleep instead of firing 16x too often.
-            if (Time.time - last.SentTime >= keepaliveInterval * SleepSyncManager.HostSleepSendIntervalScale) return true;
+            if (Time.time - last.SentTime >= NPCKeepaliveInterval * SleepSyncManager.HostSleepSendIntervalScale) return true;
             if ((packet.Position - last.Position).sqrMagnitude > NPCPosThreshold * NPCPosThreshold) return true;
             if (Quaternion.Angle(packet.Rotation, last.Rotation) > NPCRotThreshold) return true;
             var a = packet.SailLengths; var b = last.SailLengths;
@@ -435,10 +419,9 @@ namespace SailwindCoop.Sync
             {
                 if (npc == null) continue;
 
-                // Every boat a joiner could see (see VisibleSyncDistance). The joiner is teleported to the
-                // host, so the host camera stands in for them.
+                // Only sync boats within visible range
                 var distSqr = (npc.transform.position - cameraPos).sqrMagnitude;
-                if (distSqr > VisibleSyncDistanceSqr) continue;
+                if (distSqr > MaxSyncDistanceSqr) continue;
 
                 states.Add(CollectNPCBoatState(npc, offset));
             }

@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using HarmonyLib;
 using SailwindCoop.Networking.Packets;
 using Steamworks;
-using SailwindPlayerModel;
 using UnityEngine;
 using UnityEngine.UI;
 

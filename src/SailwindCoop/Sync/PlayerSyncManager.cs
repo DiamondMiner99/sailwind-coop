@@ -17,10 +17,24 @@ namespace SailwindCoop.Sync
         private float _lastSyncTime;
         private GoPointer _cachedGoPointer;
 
-        // CROUCH and LOOK-LEAN are sampled from vanilla by SailwindPlayerModel.VanillaPlayer, which is
-        // where the cached PlayerCrouching, the MouseLook ref-accessor and their rationale now live. They
-        // moved there because the third-person body reads the same two numbers, and a byte-identical second
-        // copy of this logic is how the look-pitch defect once existed in two places at once.
+        // CROUCH (v0.2.25): cached vanilla PlayerCrouching (lives on Refs.ovrCameraRig) + its private
+        // initialHeight (the camera rig's standing local head height, captured in its Awake). Vanilla
+        // crouch is purely the head height lerping initialHeight <-> 0.2 (t = dt*9), so normalizing
+        // GetCurrentHeadHeight between those endpoints yields a smooth 0..1 crouch amount that already
+        // reflects every vanilla cancel path (bed, jump, swimming) - no extra state to track.
+        private PlayerCrouching _cachedCrouching;
+        private float _crouchStandingHeight = -1f;
+
+        // LOOK-LEAN: cached ref-accessor for MouseLook's PRIVATE clamped vertical-look field `rotationY`
+        // (positive = looking UP, clamped ~[-60,60]). The instance is resolved by IDENTITY - see
+        // SampleHeadLookPitchDeg. (v0.3.0: the old scene-wide scan that took the largest |rotationY| is
+        // gone; that heuristic was a real bug, not merely a slow lookup, and its rationale is deleted here
+        // rather than left sitting next to the code that disproves it.)
+        private static readonly AccessTools.FieldRef<MouseLook, float> MouseLookRotationYRef =
+            AccessTools.FieldRefAccess<MouseLook, float>("rotationY");
+        // (v0.2.25) empty-scan throttle: earliest realtime a missed MouseLook re-scan may run again.
+        private static float _nextMouseLookScanTime;
+        private const float MouseLookRescanInterval = 1.5f;
 
         // A (guest-world-pinned-underway): embark self-heal watchdog state. Vanilla runs TWO parallel
         // embark state machines (PlayerEmbarkDisembarkTrigger + PlayerEmbarkerNew) whose predicates can
@@ -364,7 +378,9 @@ namespace SailwindCoop.Sync
         /// </summary>
         public static float ControllerFeetGap()
         {
-            return SailwindPlayerModel.VanillaPlayer.ControllerFeetGap();
+            var cc = Refs.charController;
+            if (cc == null) return 0f;
+            return cc.height * 0.5f - cc.center.y;
         }
 
         /// <summary>
@@ -373,12 +389,25 @@ namespace SailwindCoop.Sync
         /// AMOUNT (not the bool) lets remote avatars reproduce the smooth stand/crouch transition even at
         /// 20Hz. Returns 0 when the component/height isn't available yet (pre-load, degenerate rig).
         /// </summary>
-        /// <summary>(2026-09-11) The local crouch amount as sent to the crew (used by the pose preview).</summary>
-        public float LocalCrouch01 => SampleCrouch01();
-
         private float SampleCrouch01()
         {
-            return SailwindPlayerModel.VanillaPlayer.Crouch01();
+            if (_cachedCrouching == null)
+            {
+                var rig = Refs.ovrCameraRig;
+                if (rig != null) _cachedCrouching = rig.GetComponent<PlayerCrouching>();
+                if (_cachedCrouching == null) return 0f;
+                // Private field, set once in PlayerCrouching.Awake (= rig localPosition.y while standing).
+                _crouchStandingHeight = Traverse.Create(_cachedCrouching).Field("initialHeight").GetValue<float>();
+            }
+            // Degenerate standing height (component not initialized, or a rig where standing ~ crouched):
+            // treat as not crouching rather than emitting garbage.
+            if (_crouchStandingHeight <= 0.3f) return 0f;
+            float head = _cachedCrouching.GetCurrentHeadHeight();
+            // currentHeadHeight starts at 0 and only lerps while GameState.playing; a raw 0 would
+            // normalize to FULL crouch, so treat the uninitialized band as standing (the real crouched
+            // endpoint is 0.2 and the lerp approaches it from above).
+            if (head < 0.1f) return 0f;
+            return Mathf.Clamp01(Mathf.InverseLerp(_crouchStandingHeight, 0.2f, head));
         }
 
         /// <summary>
@@ -412,14 +441,32 @@ namespace SailwindCoop.Sync
         private float SampleLocalLookPitchDeg() => SampleHeadLookPitchDeg();
 
         /// <summary>
-        /// Shared head-pitch sampler. Public+static so the third-person body and the networked
+        /// Shared head-pitch sampler. Public+static so LocalPlayerBody's third-person body and the networked
         /// avatar cannot diverge - they previously held byte-identical copies of this logic, including the
         /// same wrong comment, which is why the defect existed in two places at once.
         /// </summary>
         public static float SampleHeadLookPitchDeg()
         {
-            return SailwindPlayerModel.VanillaPlayer.HeadLookPitchDeg();
+            if (_headMouseLook == null)
+            {
+                // Throttle the re-resolve: during menus/loading the rig does not exist and this would
+                // otherwise probe every call on the 20Hz path.
+                float now = Time.realtimeSinceStartup;
+                if (now < _nextMouseLookScanTime) return 0f;
+
+                var rig = Refs.ovrCameraRig;
+                _headMouseLook = rig != null ? rig.GetComponent<MouseLook>() : null;
+                if (_headMouseLook == null)
+                {
+                    _nextMouseLookScanTime = now + MouseLookRescanInterval;
+                    return 0f;
+                }
+            }
+            return MouseLookRotationYRef(_headMouseLook);
         }
+
+        /// <summary>The player head's vertical MouseLook. Null until resolved / after a scene change.</summary>
+        private static MouseLook _headMouseLook;
 
         private void SendPlayerPosition(CharacterController charController)
         {

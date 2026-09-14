@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 using HarmonyLib;
@@ -19,7 +18,6 @@ namespace SailwindCoop.Sync
     /// - Wind direction/speed
     /// - Storm positions
     /// - Storm active states
-    /// - Host's target region (weather presets, fog density included)
     ///
     /// Guest applies positions and lets WeatherStorms.Update() run naturally at 20Hz,
     /// which calls ApplyStorm() to calculate blendedSet based on distance to storms.
@@ -74,21 +72,6 @@ namespace SailwindCoop.Sync
         // equal to host's) the active wave would keep the guest's solo-save direction indefinitely.
         // Cleared whenever the cached _oceanUpdaterCrest is (re)fetched or Reset.
         private static bool _crestDirectionSeeded;
-
-        // ===== Region sync (2026-09-10) =====
-        // RegionBlender.SwitchRegion is only reachable from Region.OnTriggerEnter, so a guest who joins by
-        // teleport into the middle of a region keeps whatever region its own save left it in, and the region
-        // picks the preset WeatherSets (fog density included). UpdateBlend does not recover on its own either:
-        // for a distant wrong region its InverseLerp(45000, 43000, dist) is 0 and the blend never moves.
-        private static readonly AccessTools.FieldRef<RegionBlender, Region> CurrentTargetRegionRef =
-            AccessTools.FieldRefAccess<RegionBlender, Region>("currentTargetRegion");
-
-        // Region is location-dependent, unlike wind and storm positions. Adopt the host's only while we are
-        // near the host; a crewmate on their own boat elsewhere keeps what their own triggers give them.
-        private const float RegionAdoptMaxHostDistance = 2000f;
-
-        private static readonly Dictionary<string, Region> _regionsByName = new Dictionary<string, Region>();
-        private static readonly HashSet<string> _unresolvedRegionNames = new HashSet<string>();
 
         private static OceanUpdaterCrest GetOceanUpdaterCrest()
         {
@@ -149,7 +132,7 @@ namespace SailwindCoop.Sync
             var packet = CollectWeatherState();
 
             VerboseLogger.WeatherSend(
-                $"wind={packet.Wind}, storms={packet.StormPositions?.Length ?? 0}, activeStorm={packet.ActiveStormIndex}, activeMask=0x{packet.ActiveStormMask:X}, region={packet.RegionName}",
+                $"wind={packet.Wind}, storms={packet.StormPositions?.Length ?? 0}, activeStorm={packet.ActiveStormIndex}",
                 throttle: true);
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.WeatherState, writer =>
@@ -187,15 +170,9 @@ namespace SailwindCoop.Sync
                 ActiveStormIndex = -1
             };
 
-            // Get storm positions (real coords), the active storm index, and the full active set
-            packet.StormPositions = CollectStormPositions(out int activeIndex, out int activeMask);
+            // Get storm positions and active storm index
+            packet.StormPositions = CollectStormPositions(out int activeIndex);
             packet.ActiveStormIndex = activeIndex;
-            packet.ActiveStormMask = activeMask;
-
-            // Host's target region: picks the weather presets, fog density included
-            var blender = RegionBlender.instance;
-            var targetRegion = blender != null ? CurrentTargetRegionRef(blender) : null;
-            packet.RegionName = targetRegion != null ? targetRegion.gameObject.name : "";
 
             // Collect WavesInertia state for wave sync
             var wavesInertia = GetWavesInertia();
@@ -226,10 +203,9 @@ namespace SailwindCoop.Sync
             return packet;
         }
 
-        private static Vector3[] CollectStormPositions(out int activeStormIndex, out int activeStormMask)
+        private static Vector3[] CollectStormPositions(out int activeStormIndex)
         {
             activeStormIndex = -1;
-            activeStormMask = 0;
 
             var weatherStorms = WeatherStorms.instance;
             if (weatherStorms == null) return new Vector3[0];
@@ -242,17 +218,11 @@ namespace SailwindCoop.Sync
             // Get the current active storm
             var currentStorm = traverse.Field("currentStorm").GetValue<WanderingStorm>();
 
-            // Send REAL coords; the receiver adds its own origin offset (see WeatherStatePacket.StormPositions)
-            var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
-
             var positions = new Vector3[stormArray.Length];
             for (int i = 0; i < stormArray.Length; i++)
             {
                 var storm = stormArray[i];
-                positions[i] = storm != null ? storm.transform.position - offset : Vector3.zero;
-
-                if (storm != null && storm.active && i < 32)
-                    activeStormMask |= 1 << i;
+                positions[i] = storm?.transform.position ?? Vector3.zero;
 
                 // Check if this is the active storm
                 if (storm != null && storm == currentStorm && storm.active)
@@ -289,19 +259,16 @@ namespace SailwindCoop.Sync
             if (PauseSync) return;
 
             VerboseLogger.WeatherRecv(
-                $"wind={packet.Wind}, storms={packet.StormPositions?.Length ?? 0}, activeStorm={packet.ActiveStormIndex}, activeMask=0x{packet.ActiveStormMask:X}, region={packet.RegionName}",
+                $"wind={packet.Wind}, storms={packet.StormPositions?.Length ?? 0}, activeStorm={packet.ActiveStormIndex}",
                 throttle: true);
 
             // Store target wind for interpolation
             _targetWind = packet.Wind;
             _hasReceivedState = true;
 
-            // Region first: it picks the preset sets that WeatherStorms.ApplyStorm blends between
-            ApplyHostRegion(packet.RegionName);
-
             // Apply storm positions and active states
             // WeatherStorms.Update() runs naturally and will use these positions
-            ApplyStormPositions(packet.StormPositions, packet.ActiveStormIndex, packet.ActiveStormMask);
+            ApplyStormPositions(packet.StormPositions, packet.ActiveStormIndex);
 
             // Apply WavesInertia state from host
             ApplyWavesInertia(packet);
@@ -345,7 +312,7 @@ namespace SailwindCoop.Sync
             VerboseLogger.WeatherApply($"wind lerping to {packet.Wind}, activeStorm={packet.ActiveStormIndex}, waveInertia={packet.WaveInertia:F1}", throttle: true);
         }
 
-        private void ApplyStormPositions(Vector3[] positions, int activeStormIndex, int activeStormMask)
+        private void ApplyStormPositions(Vector3[] positions, int activeStormIndex)
         {
             if (positions == null || positions.Length == 0) return;
 
@@ -356,20 +323,16 @@ namespace SailwindCoop.Sync
             var stormArray = traverse.Field("storms").GetValue<WanderingStorm[]>();
             if (stormArray == null || stormArray.Length == 0) return;
 
-            var offset = FloatingOriginManager.instance?.outCurrentOffset ?? Vector3.zero;
-
             for (int i = 0; i < Mathf.Min(stormArray.Length, positions.Length); i++)
             {
                 var storm = stormArray[i];
                 if (storm != null)
                 {
-                    // Update position (storms don't move on their own - WanderingStorm movement is blocked).
-                    // The packet carries REAL coords; add our own origin offset back.
-                    storm.transform.position = positions[i] + offset;
+                    // Update position (storms don't move on their own - WanderingStorm.Update blocked)
+                    storm.transform.position = positions[i];
 
-                    // Mirror the host's full active set. Bits stop at 31; a storm past that falls back to the
-                    // single index.
-                    storm.active = i < 32 ? (activeStormMask & (1 << i)) != 0 : (i == activeStormIndex);
+                    // Set active flag based on host's active storm
+                    storm.active = (i == activeStormIndex);
                 }
             }
 
@@ -377,58 +340,6 @@ namespace SailwindCoop.Sync
             // 1. Call FindClosestStorm() to find nearest active storm
             // 2. Call ApplyStorm() to calculate blendedSet based on distance
             // Since we synced positions and active states, guest calculates same weather as host
-        }
-
-        /// <summary>
-        /// Point this guest's RegionBlender at the host's region. Writes the private currentTargetRegion instead
-        /// of calling SwitchRegion, which is that same assignment plus two Debug.Log lines. Vanilla's own
-        /// UpdateBlend then converges blendedRegion the same way it does after a normal boundary crossing.
-        /// </summary>
-        private static void ApplyHostRegion(string regionName)
-        {
-            if (Plugin.IsHost || string.IsNullOrEmpty(regionName)) return;
-
-            var blender = RegionBlender.instance;
-            if (blender == null) return;
-
-            // Near-host gate. Before the host avatar has streamed (mid-join, pre-teleport) we cannot tell, so
-            // wait; the periodic broadcast lands within half a second of streaming starting.
-            var cam = Camera.main;
-            var hostAvatar = Plugin.RemotePlayerManager?.GetAvatar(Plugin.LobbyManager?.HostSteamId ?? default);
-            if (cam == null || hostAvatar == null || !hostAvatar.HasStreamed) return;
-            if (Vector3.Distance(cam.transform.position, hostAvatar.GetLastKnownPosition()) > RegionAdoptMaxHostDistance) return;
-
-            var current = CurrentTargetRegionRef(blender);
-            if (current != null && current.gameObject.name == regionName) return;
-
-            var region = FindRegionByName(regionName);
-            if (region == null || region == blender.blendedRegion) return;
-
-            CurrentTargetRegionRef(blender) = region;
-            Plugin.Log.LogInfo($"[WEATHER] Region set to the host's '{regionName}' (was '{(current != null ? current.gameObject.name : "none")}')");
-        }
-
-        private static Region FindRegionByName(string regionName)
-        {
-            if (_regionsByName.TryGetValue(regionName, out var cached) && cached != null)
-                return cached;
-            if (_unresolvedRegionNames.Contains(regionName))
-                return null;
-
-            // Miss or stale (scene reload): rebuild once. First instance wins on a duplicate name.
-            _regionsByName.Clear();
-            foreach (var r in Object.FindObjectsOfType<Region>())
-            {
-                if (r != null && !_regionsByName.ContainsKey(r.gameObject.name))
-                    _regionsByName[r.gameObject.name] = r;
-            }
-
-            if (_regionsByName.TryGetValue(regionName, out var found))
-                return found;
-
-            _unresolvedRegionNames.Add(regionName);
-            Plugin.Log.LogWarning($"[WEATHER] Host region '{regionName}' not found in this world; keeping our own region");
-            return null;
         }
 
         /// <summary>
@@ -570,8 +481,6 @@ namespace SailwindCoop.Sync
             _oceanUpdaterCrest = null;
             _wavesInertia = null;
             _crestDirectionSeeded = false;
-            _regionsByName.Clear();
-            _unresolvedRegionNames.Clear();
         }
     }
 }

@@ -17,7 +17,7 @@ are what decide the fix. Everything else below is still unpatched.
 | 8 | Vertical divergence vs correction | MEASURED, instrumented, cause still open |
 | 1 | Sail state on an unoccupied boat | FIXED in code (all-boats poll + host reconcile + boarding assert), deployed, NEEDS PLAYTEST |
 | 2 | Shipyard blocks guest interaction | open, needs the deliberate repro |
-| 6 | Fishing rod tackle unsynced | PARTLY FIXED c77c4c5 (unreleased): a live attach already synced via K4 (ItemHealthChanged, since v0.2.22); the save-divergence path (boat default rods deduped with each guest's own hook state) now takes the host's. Bobber-through-deck half not looked at |
+| 6 | Fishing rod tackle unsynced | open, needs a new packet |
 | 7 | Sea state | superseded by 8, do not act before reading it |
 | 4, 9 | Crate explosion, overnight anchor | open, undiagnosed |
 
