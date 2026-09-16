@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Steamworks;
+using SailwindPlayerModel;
 using UnityEngine;
 using SailwindCoop.Networking;
 
@@ -45,7 +46,17 @@ namespace SailwindCoop.UI
         /// frozen-world failure this prevents.</summary>
         public static bool ConsumedPauseKeyThisFrame { get { return _keyConsumedFrame == Time.frameCount; } }
 
-        public static void Open()
+        /// <summary>The two pages this screen shows: friends in the game, or invites waiting for an answer.
+        /// One screen rather than two, because every rule above (cursor menu, pause keys, the parchment and
+        /// title buttons underneath) applies to both the same way.</summary>
+        private enum Page { Friends, Invites }
+        private static Page _page;
+
+        public static void Open() { Open(Page.Friends); }
+
+        public static void OpenInvites() { Open(Page.Invites); }
+
+        private static void Open(Page page)
         {
             try
             {
@@ -54,12 +65,13 @@ namespace SailwindCoop.UI
                     Plugin.Log.LogWarning("[Friends] Refused to open outside a cursor menu.");
                     return;
                 }
+                _page = page;
                 _scroll = Vector2.zero;
                 _open = true;
                 // (v0.3.0) Remember whether we are covering the PAUSE parchment, so closing restores only
                 // what was actually there. See ForceClose.
-                _reopenPauseOnClose = CoopPauseMenu.IsOpen;
-                CoopPauseMenu.Hide();
+                _reopenPauseOnClose = SailwindPlayerModel.ModPauseMenu.IsOpen;
+                SailwindPlayerModel.ModPauseMenu.Hide();
                 SuppressMenuButtons();
                 // The presence sweep skips its work when nothing would read it, and this screen opening is
                 // precisely that "something" - so ask for a fresh one now rather than showing a list up to
@@ -85,7 +97,7 @@ namespace SailwindCoop.UI
             bool restore = _reopenPauseOnClose;
             _reopenPauseOnClose = false;
             RestoreMenuButtons();
-            try { if (restore && GameState.inCursorMenu) CoopPauseMenu.Reopen(); }
+            try { if (restore && GameState.inCursorMenu) SailwindPlayerModel.ModPauseMenu.Reopen(); }
             catch (System.Exception e) { Plugin.Log.LogWarning("[Friends] Could not restore the pause menu: " + e.Message); }
         }
 
@@ -98,7 +110,7 @@ namespace SailwindCoop.UI
         /// from reaching what is behind it. Vanilla's only suppressor is GoPointerButton.unclickable.
         ///
         /// From the pause menu, hiding the co-op panel was enough, because that panel IS the parchment there.
-        /// The title menu is a different situation: CoopPauseMenu.Hide() is a no-op, and vanilla's own
+        /// The title menu is a different situation: SailwindPlayerModel.ModPauseMenu.Hide() is a no-op, and vanilla's own
         /// 'start UI' stays live behind us. A click on a friend row landing over Continue starts loading the
         /// player's solo save behind a Friends panel that is still drawn; over Quit Game it opens the confirm
         /// prompt; over New Game it tears the title menu down.
@@ -207,15 +219,21 @@ namespace SailwindCoop.UI
 
             GUI.depth = 0;
             GUILayout.BeginArea(new Rect(x, y, w, h), _panel);
-            GUILayout.Label("Friends playing now", _title);
+            GUILayout.Label(_page == Page.Invites ? "Invites" : "Friends playing now", _title);
             GUILayout.Space(8f);
 
             _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
 
-            DrawPendingInvite();
-            DrawIncomingRequests();
-            DrawOutstandingAsk();
-            DrawFriendList();
+            if (_page == Page.Invites)
+            {
+                DrawInvites();
+            }
+            else
+            {
+                DrawIncomingRequests();
+                DrawOutstandingAsk();
+                DrawFriendList();
+            }
 
             GUILayout.EndScrollView();
 
@@ -251,24 +269,56 @@ namespace SailwindCoop.UI
 
         // --- sections ------------------------------------------------------------------------------------
 
-        private static void DrawPendingInvite()
+        private static void DrawInvites()
         {
             var lm = Plugin.LobbyManager;
-            var invite = lm != null ? lm.CurrentInvite : null;
-            if (invite == null) return;
+            var invites = lm != null ? lm.Invites : null;
+            if (invites == null || invites.Count == 0)
+            {
+                GUILayout.Label("No invites right now.", _label);
+                GUILayout.Label("When someone invites you to their co-op voyage, it waits here until you join or " +
+                                "turn it down.", _small);
+                return;
+            }
 
-            GUILayout.BeginVertical(_band);
-            GUILayout.Label(invite.SenderName + " invited you to co-op.", _name);
-            GUILayout.BeginHorizontal();
-            // (v0.3.1) MinWidth, not Width, and the name is shortened. A fixed 220px button with a full
-            // Steam name inside it clipped BOTH ends on a long one, so the reported button read
-            // "n Salvatore da Monferro". The label directly above already gives the name in full, so the
-            // button only has to be unambiguous, not complete.
-            if (GUILayout.Button("Join " + Shorten(invite.SenderName, 16), _button, GUILayout.MinWidth(220f)))
+            // Joining, declining or ignoring changes the live list, so note the click and act after the loop.
+            SteamLobbyManager.PendingInvite join = null, decline = null, ignore = null;
+
+            // Newest first: Steam replays old invites at launch, and the one just sent is the one wanted.
+            for (int i = invites.Count - 1; i >= 0; i--)
+            {
+                var inv = invites[i];
+                GUILayout.BeginVertical(_band);
+                GUILayout.BeginHorizontal();
+                DrawAvatar(inv.SenderId);
+                GUILayout.BeginVertical();
+                GUILayout.Label(inv.SenderName, _name);
+                GUILayout.Label(DescribeInvite(inv), _small);
+                GUILayout.EndVertical();
+                GUILayout.FlexibleSpace();
+                GUILayout.BeginVertical();
+                GUILayout.Space(6f);
+                if (GUILayout.Button("Join", _button, GUILayout.Width(140f))) join = inv;
+                if (GUILayout.Button("Not now", _button, GUILayout.Width(140f))) decline = inv;
+                // For good: someone who keeps inviting and should not.
+                if (GUILayout.Button("Ignore", _button, GUILayout.Width(140f))) ignore = inv;
+                GUILayout.EndVertical();
+                GUILayout.EndHorizontal();
+                GUILayout.EndVertical();
+                GUILayout.Space(6f);
+            }
+
+            if (decline != null) lm.DeclineInvite(decline);
+            if (ignore != null)
+            {
+                lm.IgnoreInviter(ignore);
+                Plugin.Notify("You won't get invites from " + ignore.SenderName + " again.", 5f);
+            }
+            if (join != null)
             {
                 ForceClose();
                 // Unpause before joining. ForceClose puts the pause parchment back, which leaves the world
-                // frozen, and a join that starts at timeScale 0 never finishes - see CoopPauseMenu.Resume.
+                // frozen, and a join that starts at timeScale 0 never finishes - see the shared pause menu ResumeGame.
                 //
                 // ONLY IN-GAME, and this is not a tidy-up. ResumeGame routes to vanilla SettingsToGame, which
                 // is the UNPAUSE path and assumes a pause happened: it writes `Time.timeScale =
@@ -278,14 +328,28 @@ namespace SailwindCoop.UI
                 // menu, then TitleJoinManager's LoadGame parked forever on the first scaled WaitForSeconds
                 // inside LoadGameAnimation, which sits before GameState.playing is ever set. The player was
                 // left on a dead menu until the 45s "Load timed out".
-                if (GameState.playing) CoopPauseMenu.ResumeGame();
-                if (Plugin.EnsureCoopReady()) lm.AcceptPendingInvite();
+                if (GameState.playing) SailwindPlayerModel.ModPauseMenu.ResumeGame();
+                if (Plugin.EnsureCoopReady()) lm.AcceptInvite(join);
             }
-            if (GUILayout.Button("Not now", _button, GUILayout.Width(120f))) lm.DeclinePendingInvite();
-            GUILayout.FlexibleSpace();
-            GUILayout.EndHorizontal();
-            GUILayout.EndVertical();
-            GUILayout.Space(10f);
+        }
+
+        /// <summary>What we know about the voyage behind an invite, from the sender's rich presence.</summary>
+        private static string DescribeInvite(SteamLobbyManager.PendingInvite inv)
+        {
+            var friends = CoopPresence.Friends;
+            for (int i = 0; i < friends.Count; i++)
+            {
+                var f = friends[i];
+                if (f == null || f.LobbyId != inv.LobbyId.Value) continue;
+                string crew = string.IsNullOrEmpty(f.Crew) ? "" : " (" + f.Crew + ")";
+                return (f.Id == inv.SenderId && f.IsCaptain ? "Captain of this voyage" : "Sailing on this voyage") + crew + ".";
+            }
+            if (CoopPresence.AnswersOurRecentAsk(inv.LobbyId.Value)) return "Said yes to your request to come aboard.";
+            // Steam only shares what Steam friends are doing, so for anyone else there is nothing to go on.
+            bool friend = false;
+            try { friend = new Friend(inv.SenderId).IsFriend; } catch { }
+            return friend ? "Not in Sailwind right now, so this voyage may have ended."
+                          : "Steam does not show whether this voyage is still going.";
         }
 
         private static void DrawIncomingRequests()
@@ -340,7 +404,7 @@ namespace SailwindCoop.UI
             GUILayout.BeginVertical(_band);
             GUILayout.Label("Waiting on " + (CoopPresence.OutstandingAskHostName ?? "the captain") + ".", _name);
             GUILayout.Label("They will see your request when they next open their menu. If they say yes, " +
-                            "the invite appears here and on the pause menu.", _small);
+                            "their invite appears under Invites.", _small);
             if (GUILayout.Button("Withdraw", _button, GUILayout.Width(140f))) CoopPresence.CancelAsk();
             GUILayout.EndVertical();
             GUILayout.Space(10f);

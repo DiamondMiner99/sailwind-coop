@@ -570,6 +570,7 @@ namespace SailwindCoop.Networking
         private void HandleLobbyEntered(Lobby lobby)
         {
             _currentLobby = lobby;
+            _invites.Clear();      // aboard a voyage now, whether joined or hosted; older invites are answered
             InvalidateRoleCache(); // role may flip this frame (e.g. we just became a guest)
             VerboseLogger.LobbyEvent($"Entered lobby, id={lobby.Id}, host={lobby.Owner.Name}");
             OnLobbyJoined?.Invoke(lobby);
@@ -719,6 +720,17 @@ namespace SailwindCoop.Networking
             // Friend.Name reads "[unknown]" until Steam loads that user's persona; fall back to a generic name.
             string name = (string.IsNullOrEmpty(friend.Name) || friend.Name == "[unknown]") ? "Someone" : friend.Name;
 
+            // Someone not on your Steam friends list gets no notice: their invite still waits under Invites, where it
+            // can be joined or ignored for good, but a stranger inviting on every launch no longer pops up over the
+            // loading screen.
+            bool isFriend = false;
+            try { isFriend = friend.IsFriend; } catch { }
+            if (announce && !isFriend && !answersOurRequest)
+            {
+                Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}; not a Steam friend, listed under Invites without a notice");
+                announce = false;
+            }
+
             if (announce)
             {
                 // Mirror to the main BepInEx log with the sender's SteamID, so an unwanted invite can be
@@ -726,23 +738,26 @@ namespace SailwindCoop.Networking
                 // the name alone can't positively identify the account.
                 Plugin.Log.LogInfo($"Co-op invite received from {friend.Name} ({friend.Id}), lobby={lobby.Id}");
 
+                // The invite IS the answer, so stop advertising the question. Without this the friends screen
+                // showed "Waiting on X" and "X invited you to co-op" at once, which reads as though the request had
+                // not been seen.
+                if (answersOurRequest) CoopPresence.CancelAsk();
+
+                // Steam's overlay already chimes and pops up an invite from a friend, with its own way to accept, so
+                // a notice of ours on top only doubles it. It is only needed when the overlay is off and Steam can
+                // show nothing in game; the invite waits under Invites either way.
+                bool steamShowsIt = false;
+                try { steamShowsIt = SteamUtils.IsOverlayEnabled; } catch { }
+
                 // Belt-and-suspenders throttle. An answer to our own request is exempt: it is the one invite
                 // the player is actively waiting for, and silently eating it because an unrelated invite
                 // arrived 14 seconds ago would be indefensible.
-                if (answersOurRequest || now - _lastInviteToastTime >= 15f)
+                if (!steamShowsIt && (answersOurRequest || now - _lastInviteToastTime >= 15f))
                 {
                     _lastInviteToastTime = now;
-                    // (v0.3.0) Say where to act. The old toast announced the invite and left the player to
-                    // accept it through Steam's own UI - which shows nothing at all when the sender is not a
-                    // Steam friend or the overlay is off, so the message was frequently a dead end.
+                    // (v0.3.0) Say where to act: with the overlay off there is no Steam invite to click.
                     if (answersOurRequest)
-                    {
-                        // The invite IS the answer, so stop advertising the question. Without this the
-                        // friends screen showed "Waiting on X" and "X invited you to co-op" at once, which
-                        // reads as though the request had not been seen.
-                        CoopPresence.CancelAsk();
                         Plugin.NotifyWithHint($"{name} says come aboard.", "Open the menu to join", 8f);
-                    }
                     else
                         Plugin.NotifyWithHint($"{name} invited you to co-op.", "Open the menu to join", 6f);
                 }
@@ -752,16 +767,17 @@ namespace SailwindCoop.Networking
                 VerboseLogger.LobbyEvent($"Invite to lobby {lobby.Id} already seen; keeping it for the friends screen but not announcing it again");
             }
 
-            // (v0.3.0) KEEP the invite instead of discarding it, so the pause menu can offer it. A single
-            // slot rather than a list: the toast is throttled to one per 15s anyway, and a queue of stale
-            // invitations is a worse thing to present than the newest one. The most recent invite wins.
-            _pendingInvite = new PendingInvite
+            // (v0.3.0) KEEP the invite instead of discarding it, so the Invites screen can offer it. One per
+            // sender: a newer invite from the same captain replaces their older one, since it names the voyage
+            // they are on now.
+            _invites.RemoveAll(i => i.SenderId == friend.Id);
+            _invites.Add(new PendingInvite
             {
                 LobbyId = lobby.Id,
                 SenderId = friend.Id,
                 SenderName = name,
                 ReceivedRealtime = now,
-            };
+            });
         }
 
         /// <summary>
@@ -922,33 +938,69 @@ namespace SailwindCoop.Networking
             public float ReceivedRealtime;
         }
 
-        private PendingInvite _pendingInvite;
+        private readonly List<PendingInvite> _invites = new List<PendingInvite>();
+        private static readonly List<PendingInvite> NoInvites = new List<PendingInvite>();
 
-        /// <summary>The invite offered by the pause menu, or null. Cleared once we are in a lobby.</summary>
-        public PendingInvite CurrentInvite
+        /// <summary>Invites we could still act on, oldest first, one per sender. Empty while in a lobby. This
+        /// is the live list: read it, and act through AcceptInvite / DeclineInvite after drawing.</summary>
+        public IList<PendingInvite> Invites
         {
-            get { return IsInLobby ? null : _pendingInvite; }
+            get { return IsInLobby ? NoInvites : _invites; }
         }
 
-        /// <summary>Take up the pending invite. Same path Steam's own "Join Game" drives, so joining from
-        /// the title menu still loads a save first (TitleJoinManager) rather than joining world-less.</summary>
-        public void AcceptPendingInvite()
+        /// <summary>Take up an invite. Same path Steam's own "Join Game" drives, so joining from the title
+        /// menu still loads a save first (TitleJoinManager) rather than joining world-less. The other invites
+        /// go with it: boarding one voyage answers them.</summary>
+        public void AcceptInvite(PendingInvite inv)
         {
-            var inv = CurrentInvite;
-            if (inv == null) return;
-            _pendingInvite = null;
+            if (inv == null || IsInLobby || !_invites.Contains(inv)) return;
+            _invites.Clear();
             Plugin.Log.LogInfo($"Accepting co-op invite from {inv.SenderName} ({inv.SenderId}), lobby={inv.LobbyId}");
             RouteJoin(inv.LobbyId, inv.SenderId);
         }
 
-        /// <summary>Dismiss the pending invite without joining. Does NOT add the sender to the ignore list -
-        /// declining once is not the same as never wanting to hear from someone again, and that list is a
-        /// blunt, persistent instrument best left to a deliberate config edit.</summary>
-        public void DeclinePendingInvite()
+        /// <summary>Dismiss an invite without joining. Does NOT add the sender to the ignore list - declining
+        /// once is not the same as never wanting to hear from someone again, and that list is a blunt,
+        /// persistent instrument best left to a deliberate config edit.</summary>
+        public void DeclineInvite(PendingInvite inv)
         {
-            if (_pendingInvite == null) return;
-            Plugin.Log.LogInfo($"Declined co-op invite from {_pendingInvite.SenderName} ({_pendingInvite.SenderId}).");
-            _pendingInvite = null;
+            if (inv == null || !_invites.Remove(inv)) return;
+            Plugin.Log.LogInfo($"Declined co-op invite from {inv.SenderName} ({inv.SenderId}).");
+        }
+
+        /// <summary>
+        /// Never hear from this sender again: their invite goes, and their Steam ID is added to
+        /// ~/.sailwind-coop/ignored-inviters.txt with their name as a comment, the same list IgnoredInviters
+        /// reads, so it lasts across launches and can be undone by deleting the line.
+        /// </summary>
+        public void IgnoreInviter(PendingInvite inv)
+        {
+            if (inv == null) return;
+            _invites.RemoveAll(i => i.SenderId == inv.SenderId);
+            IsInviterIgnored(inv.SenderId);   // loads the list, so the add below sees what is already there
+            if (!_ignoredInviters.Add(inv.SenderId.Value)) return;
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".sailwind-coop");
+                string path = Path.Combine(dir, "ignored-inviters.txt");
+                Directory.CreateDirectory(dir);
+                if (!File.Exists(path))
+                {
+                    File.WriteAllText(path,
+                        "# Sailwind co-op: Steam IDs whose invites are ignored silently." + Environment.NewLine +
+                        "# One 64-bit Steam ID per line. Text after '#' is a comment." + Environment.NewLine +
+                        "# The sender's ID is printed in BepInEx/LogOutput.log for every invite you receive." + Environment.NewLine);
+                }
+                string existing = File.ReadAllText(path);
+                string lead = existing.Length > 0 && !existing.EndsWith("\n") ? Environment.NewLine : "";
+                string name = (inv.SenderName ?? "").Replace('\r', ' ').Replace('\n', ' ');
+                File.AppendAllText(path, $"{lead}{inv.SenderId.Value}  # {name}, ignored from the Invites screen {DateTime.Now:yyyy-MM-dd}{Environment.NewLine}");
+                Plugin.Log.LogInfo($"Ignoring co-op invites from {inv.SenderName} ({inv.SenderId}) from now on.");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"[LOBBY] could not save {inv.SenderId} to ignored-inviters.txt, ignored for this session only: {e.Message}");
+            }
         }
 
         private void HandleGameLobbyJoinRequested(Lobby lobby, SteamId friendId)

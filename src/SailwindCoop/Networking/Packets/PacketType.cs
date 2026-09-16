@@ -280,7 +280,7 @@ namespace SailwindCoop.Networking.Packets
         // SteamId, so an older build degrades to "wrong outfit", never to a broken session.
         // Body: authorId (u64), slotCount (byte), then slotCount variant bytes.
         // Indices are NEVER trusted to index anything: the receiver clamps each against its OWN live
-        // part-list count at apply time (CoopAppearance.Apply), so a corrupt or hostile value can only
+        // part-list count at apply time (PlayerAppearance.Apply), so a corrupt or hostile value can only
         // ever yield that slot's default variant. The HOST additionally drops any packet whose authorId
         // does not match the sender, and relays the SANITIZED struct rather than the raw bytes.
         PlayerAppearance = 220,          // Any peer -> all (host relays) / host -> joiner (roster replay)
@@ -305,5 +305,39 @@ namespace SailwindCoop.Networking.Packets
         // and dropped, which is the fail-open behavior wanted here.
         // Body: boatName (string), ropeIndex (byte), holderSteamId (u64; 0 = released).
         MooringRopeAdjusting = 222,      // Adjuster -> all (host relays)
+
+        // (2026-09-11) Market prices. CurrencyMarket.currentPrices (the exchange rates every displayed
+        // price is converted through) random-walk once a day and move on every exchange, and nothing
+        // synced them: each guest ran its own daily MarketCycle from its own solo save's starting rates.
+        // Host sends the whole array on change, on join, and once per supply round-robin cycle. Body:
+        // count (int), then that many floats.
+        CurrencyRates = 223,             // Host -> all / host -> joiner
+
+        // (2026-09-11) Island price book: the "other ports" columns on a trade screen come from
+        // IslandMarket.knownPrices, which each machine's own trader-boat agents fill on their own routes.
+        // A guest opening a market asks for the host's book for that island and merges it (vanilla
+        // ReceivePriceReports: newer report wins, host wins a tie). Request body: portIndex (int).
+        // Response body: portIndex (int), then the PriceKnowledgeSync report list.
+        PriceBookRequest = 224,          // Guest -> host
+        PriceBook = 225,                 // Host -> requesting guest
+
+        // (2026-09-14) Which control a crewmate is operating: the ship's wheel, a rope winch, a bilge pump or
+        // a sail pusher, so the Player Model mod can pose their body on it. The control-state packets carry
+        // lengths, angles and forces but never who is doing it. Visual only on the receiving end.
+        // Body: actor (u64), type (byte: 0 released, 1 wheel, 2 winch, 3 pump, 4 sail pusher), then if not
+        // released: boatName (string), index among that boat's controls of the type (u16).
+        ControlInUse = 226,              // Operator -> all (host relays); re-sent while held
+
+        // (2026-09-15) A crewmate sitting (chair, rail, crate), lying in a bed or knocked down, so the Player Model
+        // mod can pose their body that way. Visual only on the receiving end.
+        // Body: actor (u64), state (byte: 0 none, 1 seated, 2 lying, 3 downed, 4 getting up), smoke, fire, steam (bytes,
+        // tenths), then by state, positions relative to the sender's feet in the position packet's frame (boat model local
+        // aboard, world on land):
+        //   seated, lying: a SeatPose byte and three vectors (3 floats each). Seated: hips, facing, (floor height, 0, 0).
+        //     Lying: head, feet direction, chest direction.
+        //   downed: FallReaction byte, pelvis (vector), 11 ragdoll part rotations in the frame (x, y, z as shorts, w
+        //     rebuilt), floor height (float). Sent up to 10 times a second while the body moves.
+        //   getting up: progress byte (0 to 255), up to 10 times a second.
+        RestState = 227,                 // Player -> all (host relays); re-sent while it lasts
     }
 }

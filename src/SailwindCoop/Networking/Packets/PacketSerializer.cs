@@ -982,8 +982,10 @@ namespace SailwindCoop.Networking.Packets
                 }
             }
 
-            // Active storm index (-1 if none)
+            // Active storm index (-1 if none), full active set, host region
             writer.Write(packet.ActiveStormIndex);
+            writer.Write(packet.ActiveStormMask);
+            writer.Write(packet.RegionName ?? "");
 
             // WavesInertia sync
             WriteQuaternion(writer, packet.WaveDirection);
@@ -1018,8 +1020,10 @@ namespace SailwindCoop.Networking.Packets
                 packet.StormPositions[i] = ReadVector3(reader);
             }
 
-            // Active storm index (-1 if none)
+            // Active storm index (-1 if none), full active set, host region
             packet.ActiveStormIndex = reader.ReadInt32();
+            packet.ActiveStormMask = reader.ReadInt32();
+            packet.RegionName = reader.ReadString();
 
             // WavesInertia sync
             packet.WaveDirection = ReadQuaternion(reader);
@@ -2348,6 +2352,48 @@ namespace SailwindCoop.Networking.Packets
                 packet.Supply[i] = reader.ReadSingle();
 
             return packet;
+        }
+
+        public static void WriteCurrencyRates(BinaryWriter writer, CurrencyRatesPacket packet)
+        {
+            writer.Write(packet.Rates?.Length ?? 0);
+            if (packet.Rates != null)
+            {
+                foreach (var rate in packet.Rates)
+                    writer.Write(rate);
+            }
+        }
+
+        public static CurrencyRatesPacket ReadCurrencyRates(BinaryReader reader)
+        {
+            int count = reader.ReadInt32();
+            var rates = new float[count];
+            for (int i = 0; i < count; i++)
+                rates[i] = reader.ReadSingle();
+            return new CurrencyRatesPacket { Rates = rates };
+        }
+
+        public static void WritePriceBookRequest(BinaryWriter writer, PriceBookRequestPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+        }
+
+        public static PriceBookRequestPacket ReadPriceBookRequest(BinaryReader reader)
+        {
+            return new PriceBookRequestPacket { PortIndex = reader.ReadInt32() };
+        }
+
+        public static void WritePriceBook(BinaryWriter writer, PriceBookPacket packet)
+        {
+            writer.Write(packet.PortIndex);
+            WritePriceKnowledgeSync(writer, new PriceKnowledgeSyncPacket { Reports = packet.Reports });
+        }
+
+        public static PriceBookPacket ReadPriceBook(BinaryReader reader)
+        {
+            int portIndex = reader.ReadInt32();
+            var reports = ReadPriceKnowledgeSync(reader).Reports;
+            return new PriceBookPacket { PortIndex = portIndex, Reports = reports };
         }
 
         #endregion

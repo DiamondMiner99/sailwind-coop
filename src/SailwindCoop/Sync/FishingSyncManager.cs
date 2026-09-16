@@ -1069,7 +1069,13 @@ namespace SailwindCoop.Sync
             try
             {
                 var rod = FindRodByInstanceId(packet.RodInstanceId);
-                if (rod == null) return;
+                if (rod == null)
+                {
+                    // (2026-09-11) Was a silent return. It skips clearing the fish mesh on the line, which would
+                    // leave a fake fish hanging next to the real one ("two fish, one real" report).
+                    Plugin.Log.LogWarning($"[FISHING] FishCollectResponse for rod {packet.RodInstanceId}: rod not found, its fish visual was not cleared");
+                    return;
+                }
 
                 var fish = Traverse.Create(rod).Field("fish").GetValue<FishingRodFish>();
                 if (fish != null)

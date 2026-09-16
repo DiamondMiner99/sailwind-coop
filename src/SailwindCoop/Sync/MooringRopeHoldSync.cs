@@ -350,6 +350,7 @@ namespace SailwindCoop.Sync
                     if (capsule == null) continue;   // carrier not spawned/streamed yet; leave the rope be
 
                     rope.transform.position = capsule.TransformPoint(CarryOffset);
+                    avatar.SetInteraction(SailwindPlayerModel.InteractionKind.Rope, rope.transform);
                 }
 
                 if (stale != null) foreach (var r in stale) _remotelyHeld.Remove(r);

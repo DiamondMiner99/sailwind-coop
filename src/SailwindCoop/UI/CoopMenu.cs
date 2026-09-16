@@ -20,6 +20,10 @@ namespace SailwindCoop.UI
     {
         public const string Primary = "coop_primary"; // retained for click-router back-compat (unused)
         public const string Friends = "coop_title_friends";
+        public const string Invites = "coop_title_invites";
+
+        private static Transform _invitesRow;
+        private static int _invitesShown = -1;
 
         private static readonly AccessTools.FieldRef<StartMenuButton, StartMenuButtonType> ButtonTypeRef =
             AccessTools.FieldRefAccess<StartMenuButton, StartMenuButtonType>("type");
@@ -78,18 +82,30 @@ namespace SailwindCoop.UI
                 clone.transform.localScale = template.localScale;
                 SetLabel(clone.transform, "Friends");
 
+                // Invites sits under Friends: Steam replays pending invites at launch, so the title screen
+                // is where many of them are first seen.
+                var invites = Object.Instantiate(template.gameObject, template.parent);
+                invites.name = Invites;
+                invites.transform.localRotation = template.localRotation;
+                invites.transform.localScale = template.localScale;
+                SetLabel(invites.transform, "Invites");
+                _invitesRow = invites.transform;
+                _invitesShown = -1;
+
                 // Directly above Settings: below New Game as asked, and unambiguous whether or not Continue
                 // is present (an install with no saves hides Continue entirely).
                 int at = rows.IndexOf(settingsRow);
+                rows.Insert(at, invites.transform);
                 rows.Insert(at, clone.transform);
 
-                // Same span, one more entry. Equal spacing, ends unmoved.
+                // Same span, more entries. Equal spacing, ends unmoved.
                 float step = span / (rows.Count - 1);
                 for (int i = 0; i < rows.Count; i++)
                     rows[i].localPosition = new Vector3(x, top - step * i, z);
+                FitPlateHeights(rows, step);
 
                 _installed = true;
-                Plugin.Log.LogInfo($"[CoopMenu] Title Friends button installed ({rows.Count} rows, step={step:F3})");
+                Plugin.Log.LogInfo($"[CoopMenu] Title Friends and Invites buttons installed ({rows.Count} rows, step={step:F3})");
             }
             catch (System.Exception e)
             {
@@ -97,18 +113,93 @@ namespace SailwindCoop.UI
             }
         }
 
-        public static void Tick() { }
+        /// <summary>
+        /// Make the plates shorter when the column is packed tighter than a plate is tall. With six entries
+        /// the step drops to about 0.24 while a plate is about 0.25 tall, so neighbors overlapped and the
+        /// overlapping strips drew lighter. Only the plate (every child but "text") is shortened; the text
+        /// keeps its size. Each row's plate is measured from its own meshes, so a column with room to spare
+        /// (no Continue button on an install without saves) is left alone.
+        /// </summary>
+        private static void FitPlateHeights(List<Transform> rows, float step)
+        {
+            float tallest = 0f;
+            foreach (var row in rows) tallest = Mathf.Max(tallest, PlateHeight(row));
+            float target = step * 0.9f;
+            if (tallest <= target || tallest <= 0f) return;
+
+            float f = target / tallest;
+            foreach (var row in rows)
+            {
+                if (row.GetComponent<MeshFilter>() != null)
+                {
+                    // The plate mesh is on the row itself: shorten the row and give the text its height back.
+                    var rs = row.localScale;
+                    row.localScale = new Vector3(rs.x, rs.y * f, rs.z);
+                    var text = row.Find("text");
+                    if (text != null)
+                    {
+                        var ts = text.localScale;
+                        text.localScale = new Vector3(ts.x, ts.y / f, ts.z);
+                    }
+                    continue;
+                }
+                for (int i = 0; i < row.childCount; i++)
+                {
+                    var child = row.GetChild(i);
+                    if (child.name == "text" || child.GetComponentInChildren<TextMesh>(true) != null) continue;
+                    var s = child.localScale;
+                    child.localScale = new Vector3(s.x, s.y * f, s.z);
+                    var p = child.localPosition;
+                    child.localPosition = new Vector3(p.x, p.y * f, p.z);
+                }
+            }
+            Plugin.Log.LogInfo($"[CoopMenu] Title plates shortened to {f:P0} to fit a step of {step:F3} (plate was {tallest:F3} tall)");
+        }
+
+        /// <summary>A row's plate height in the column's own space, from every mesh under it except the text.</summary>
+        private static float PlateHeight(Transform row)
+        {
+            float lo = float.MaxValue, hi = float.MinValue;
+            foreach (var mf in row.GetComponentsInChildren<MeshFilter>(true))
+            {
+                if (mf.sharedMesh == null || mf.GetComponent<TextMesh>() != null) continue;
+                Bounds b = mf.sharedMesh.bounds;
+                for (int i = 0; i < 8; i++)
+                {
+                    var corner = new Vector3(
+                        (i & 1) == 0 ? b.min.x : b.max.x,
+                        (i & 2) == 0 ? b.min.y : b.max.y,
+                        (i & 4) == 0 ? b.min.z : b.max.z);
+                    float y = row.parent.InverseTransformPoint(mf.transform.TransformPoint(corner)).y;
+                    lo = Mathf.Min(lo, y);
+                    hi = Mathf.Max(hi, y);
+                }
+            }
+            return hi > lo ? hi - lo : 0f;
+        }
+
+        /// <summary>Keep the title Invites label's count current. Writes only when the count changes.</summary>
+        public static void Tick()
+        {
+            if (_invitesRow == null) return;
+            int n = Plugin.LobbyManager != null ? Plugin.LobbyManager.Invites.Count : 0;
+            if (n == _invitesShown) return;
+            _invitesShown = n;
+            try { SetLabel(_invitesRow, n > 0 ? "Invites (" + n + ")" : "Invites"); }
+            catch (System.Exception e) { Plugin.Log.LogWarning("[CoopMenu] Could not update the Invites label: " + e.Message); }
+        }
 
         public static bool HandleClick(string name)
         {
-            if (name != Friends) return false;
+            if (name != Friends && name != Invites) return false;
             try
             {
                 // Same gate the pause menu uses: without Steam there is nothing to show, and the readiness
                 // check is what surfaces WHY (missing native library, Steam not running) instead of opening
                 // an empty list.
                 if (!Plugin.EnsureCoopReady()) return true;
-                FriendsScreen.Open();
+                if (name == Invites) FriendsScreen.OpenInvites();
+                else FriendsScreen.Open();
             }
             catch (System.Exception e)
             {
@@ -118,35 +209,16 @@ namespace SailwindCoop.UI
         }
 
         // --- shared helpers ---
+        // One copy, in the Sailwind Player Model mod, so a button this mod clones onto the title screen and
+        // a button it registers on the shared pause menu are built exactly the same way.
 
         public static void EnsureButton(Transform panel, Transform template, string name, Vector3 localPos)
-        {
-            if (FindChild(panel, name) != null) return;
-            var clone = Object.Instantiate(template.gameObject, panel); // keeps native StartMenuButton + layer 5
-            clone.name = name;
-            clone.transform.localRotation = template.localRotation;
-            clone.transform.localScale = template.localScale;
-            clone.transform.localPosition = localPos;
-        }
+            => SailwindPlayerModel.MenuUtil.EnsureButton(panel, template, name, localPos);
 
         public static void SetLabel(Transform button, string text)
-        {
-            var t = button.Find("text");
-            if (t == null) return;
-            var tm = t.GetComponent<TextMesh>();
-            if (tm != null) tm.text = text;
-        }
+            => SailwindPlayerModel.MenuUtil.SetLabel(button, text);
 
         public static Transform FindChild(Transform root, string name)
-        {
-            var d = root.Find(name);
-            if (d != null) return d;
-            for (int i = 0; i < root.childCount; i++)
-            {
-                var r = FindChild(root.GetChild(i), name);
-                if (r != null) return r;
-            }
-            return null;
-        }
+            => SailwindPlayerModel.MenuUtil.FindChild(root, name);
     }
 }

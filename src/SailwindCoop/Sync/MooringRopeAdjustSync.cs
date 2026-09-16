@@ -324,6 +324,7 @@ namespace SailwindCoop.Sync
                     if (capsule == null) continue;   // holder not spawned/streamed yet; leave it be
 
                     adjuster.transform.position = capsule.TransformPoint(HoldOffset);
+                    avatar.SetInteraction(SailwindPlayerModel.InteractionKind.Rope, adjuster.transform);
                     DriveHeldAnimation(adjuster, rope);
                 }
 

@@ -5,8 +5,11 @@ using UnityEngine;
 namespace SailwindCoop.Patches
 {
     /// <summary>
-    /// Injects the title-menu Host button (CoopMenu) and the custom in-game pause menu (CoopPauseMenu)
-    /// into the game's world-space StartMenu, and wires the pause lifecycle.
+    /// Injects the title-menu Host button (CoopMenu) into the game's world-space StartMenu.
+    ///
+    /// The in-game PAUSE menu is no longer ours: it lives in the Sailwind Player Model mod as the shared
+    /// ModPauseMenu, and co-op registers its buttons and crew roster into it (see CoopPauseButtons). Two
+    /// mods each cloning their own parchment would both answer Escape and draw two scrolls over each other.
     /// </summary>
     public static class MenuPatches
     {
@@ -22,76 +25,24 @@ namespace SailwindCoop.Patches
             {
                 ActiveStartMenu = __instance;
                 SailwindCoop.UI.CoopMenu.Install(__instance);
-                SailwindCoop.UI.CoopPauseMenu.Install(__instance);
             }
         }
 
-        // In-game pause opens via GameToSettings (it does all the pause bookkeeping + opens the vanilla
-        // settings panel). Postfix: hide that and show our custom pause panel instead.
-        [HarmonyPatch(typeof(StartMenu), "GameToSettings")]
-        public static class GameToSettingsPatch
-        {
-            static void Postfix(StartMenu __instance)
-            {
-                SailwindCoop.UI.CoopPauseMenu.OnPauseOpened(__instance);
-            }
-        }
-
-        // Any unpause (Resume button, Esc, settings-Back-to-game) routes through SettingsToGame. The
-        // StartMenu root never deactivates, so we must hide our panel here or it lingers during gameplay.
-        [HarmonyPatch(typeof(StartMenu), "SettingsToGame")]
-        public static class SettingsToGamePatch
-        {
-            static void Postfix()
-            {
-                SailwindCoop.UI.CoopPauseMenu.Hide();
-                SailwindCoop.UI.CoopPauseMenu.SubPageFromPause = false;
-            }
-        }
-
-        // While our panel (or our settings sub-page) is open, route Esc to Resume / back-to-pause instead
-        // of the vanilla open-settings path (which doesn't recognize our panel and would re-pause).
+        // QoL (vanilla parity), unrelated to the pause menu. EnablePortMissionUI arms a 1.1s closeCooldown
+        // that makes vanilla's Esc-to-DisablePortMissionUI a no-op for the first second or so, so the port
+        // mission list feels like it can only be closed by the parchment's Back button. Esc NEVER opens that
+        // list, so clearing the cooldown here just lets the vanilla Esc-close in this same LateUpdate fire
+        // immediately. Narrowly gated on inPortMissionList; the trade and currency menus have no cooldown
+        // and the pause menu is untouched.
         [HarmonyPatch(typeof(StartMenu), "LateUpdate")]
-        public static class StartMenuLateUpdatePatch
+        public static class PortMissionEscPatch
         {
-            static bool Prefix(StartMenu __instance)
+            static void Prefix()
             {
-                if (!GameState.playing) return true;
+                if (!GameState.playing || !GameState.inPortMissionList) return;
                 if (!(Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.F10) || Input.GetKeyDown(KeyCode.JoystickButton6)))
-                    return true;
-
-                // (v0.3.0) Our own IMGUI screens own the pause key while one is up, and for the remainder
-                // of the frame in which it swallowed one. Both terms are load-bearing:
-                //   IsOpen - Plugin.Update returns early when Steam never initialised, which is ABOVE the
-                //     screens' Tick calls, so Tick can be dead while the screen is drawn. The vanilla
-                //     re-pause still has to be blocked there; the panel's Done button remains the way out.
-                //   ConsumedPauseKeyThisFrame - stops the same press from also reaching vanilla and
-                //     unpausing after the screen closed itself.
-                // Without this, vanilla saw no active panel (ours hidden by the screen's Open, its own
-                // settingsUI disabled by OnPauseOpened) and re-entered GameToSettings while ALREADY paused,
-                // latching unpausedTimescale = 0 - a permanent freeze on the next resume.
-                if (SailwindCoop.UI.CharacterScreen.IsOpen ||
-                    SailwindCoop.UI.CharacterScreen.ConsumedPauseKeyThisFrame ||
-                    SailwindCoop.UI.FriendsScreen.IsOpen ||
-                    SailwindCoop.UI.FriendsScreen.ConsumedPauseKeyThisFrame ||
-                    // (v0.3.0) The message panel plays by the same rules. It was the one screen missing from
-                    // this list, so dismissing a refusal with Escape closed the panel and opened the pause
-                    // menu with the very same press - on a session that was already quitting.
-                    SailwindCoop.UI.CoopMessagePanel.IsShowing ||
-                    SailwindCoop.UI.CoopMessagePanel.ConsumedPauseKeyThisFrame) return false;
-
-                // OnEscape returns true if it handled it (resume / settings-back-to-pause) -> skip vanilla.
-                if (SailwindCoop.UI.CoopPauseMenu.OnEscape(__instance)) return false;
-
-                // QoL (vanilla parity): EnablePortMissionUI arms a 1.1s closeCooldown that makes vanilla's
-                // Esc->DisablePortMissionUI a no-op for the first ~second, so the port mission list feels like
-                // it can only be closed by the parchment's Back button. Esc NEVER opens the list, so clearing
-                // that cooldown here just lets the vanilla Esc-close in this same LateUpdate fire immediately.
-                // Narrowly gated on inPortMissionList; trade/currency menus (no cooldown) and pause are untouched.
-                if (GameState.inPortMissionList)
-                    HarmonyLib.Traverse.Create(typeof(MissionListUI)).Field("closeCooldown").SetValue(0f);
-
-                return true; // run vanilla LateUpdate (closes the open cursor-menu, or opens pause)
+                    return;
+                HarmonyLib.Traverse.Create(typeof(MissionListUI)).Field("closeCooldown").SetValue(0f);
             }
         }
 
@@ -120,11 +71,11 @@ namespace SailwindCoop.Patches
                     SailwindCoop.Debug.VerboseLogger.LobbyEvent("Guest Quit: vanilla in-line save suppressed; phantom save started inline at click time");
                     return true; // let vanilla run; it now only quits (our phantom save commits end-of-frame)
                 }
-                return !SailwindCoop.UI.CoopPauseMenu.OnSettingsBack(__instance, __0);
+                return true; // the shared pause menu handles the settings Back itself
             }
         }
 
-        // Route clicks on our cloned buttons (title + pause). The StartMenuButton sits on a 'bg+trigger'
+        // Route clicks on our cloned TITLE buttons. The StartMenuButton sits on a 'bg+trigger'
         // child; our coop marker is on an ANCESTOR, so walk up. A misread would fire the vanilla action.
         [HarmonyPatch(typeof(StartMenuButton), "OnActivate", new Type[0])]
         public static class StartMenuButtonOnActivatePatch
@@ -134,7 +85,6 @@ namespace SailwindCoop.Patches
                 for (var t = __instance.transform; t != null; t = t.parent)
                 {
                     if (SailwindCoop.UI.CoopMenu.HandleClick(t.name)) return false;
-                    if (SailwindCoop.UI.CoopPauseMenu.HandleClick(t.name)) return false;
                 }
                 return true; // not ours -> run the vanilla action
             }
