@@ -1,15 +1,9 @@
-Sailwind Co-op v0.4.0  [game v0.38.1]
+Sailwind Co-op v0.5.0  [game v0.40]
 
 This version needs the Sailwind Player Model mod. It is included in this zip and installs
 alongside co-op. If you already have Sailwind Player Model installed, this zip overwrites it
 with the version co-op was built against. Older Player Model versions turn themselves off when
 they see an older co-op, so keep the two in step.
-
-Settings that moved:
- - The [Crouch] entries in co-op's config now live in the Player Model config
-   (BepInEx\config\com.diamondminer99.playermodel.cfg, section "1. Pose").
- - [Coop] MenuButtonScale moved to the same file, section "4. Menu".
- Defaults are unchanged. If you had tuned them, enter your values there once.
 
 1. Quit Sailwind.
 2. Unzip this WHOLE archive into your Sailwind install folder, the one containing Sailwind.exe

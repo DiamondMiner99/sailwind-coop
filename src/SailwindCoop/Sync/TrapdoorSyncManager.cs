@@ -137,6 +137,124 @@ namespace SailwindCoop.Sync
             });
         }
 
+        // === Hinged doors (Sailwind 0.39 GPButtonHouseDoor) ===
+        //
+        // 0.39 added a second door class: the front door of each buyable house and the five cabin doors of
+        // the new large hull. It is a sibling of GPButtonTrapdoor, not a subclass, so nothing above sees it
+        // and each player had to open their own copy. It rides the same packet: BoatName is the door's own
+        // SaveableObject (a house or a boat) and Key carries the prefix below, which no trapdoor key has.
+
+        private const string HouseDoorKeyPrefix = "housedoor|";
+
+        /// <summary>Every hinged door that belongs to this root, in an order both machines agree on.</summary>
+        private static System.Collections.Generic.List<GPButtonHouseDoor> HouseDoorsOf(SaveableObject root)
+        {
+            var doors = new System.Collections.Generic.List<GPButtonHouseDoor>();
+            if (root == null) return doors;
+
+            // Hierarchy order is prefab-baked, and includes doors under a cabin variant that is switched off.
+            foreach (var d in root.GetComponentsInChildren<GPButtonHouseDoor>(true))
+                if (d != null && d.saveable == root) doors.Add(d);
+            if (doors.Count > 0) return doors;
+
+            // A door that points at this root without sitting under it: order by hierarchy path instead.
+            foreach (var d in Resources.FindObjectsOfTypeAll<GPButtonHouseDoor>())
+                if (d != null && d.saveable == root && d.gameObject.scene.IsValid()) doors.Add(d);
+            doors.Sort((a, b) => string.CompareOrdinal(PathOf(a.transform), PathOf(b.transform)));
+            return doors;
+        }
+
+        private static string PathOf(Transform t)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (; t != null; t = t.parent) sb.Insert(0, "/" + t.name + "#" + t.GetSiblingIndex());
+            return sb.ToString();
+        }
+
+        private static string HouseDoorKeyFor(SaveableObject root, GPButtonHouseDoor door)
+        {
+            int occ = 0;
+            foreach (var d in HouseDoorsOf(root))
+            {
+                if (d.name != door.name) continue;
+                occ++;
+                if (d == door) return HouseDoorKeyPrefix + door.name + "~" + occ;
+            }
+            return null;
+        }
+
+        private static GPButtonHouseDoor FindHouseDoorByKey(SaveableObject root, string key)
+        {
+            int tilde = key.LastIndexOf('~');
+            if (tilde <= HouseDoorKeyPrefix.Length || !int.TryParse(key.Substring(tilde + 1), out int wantOcc)) return null;
+            string name = key.Substring(HouseDoorKeyPrefix.Length, tilde - HouseDoorKeyPrefix.Length);
+            int occ = 0;
+            foreach (var d in HouseDoorsOf(root))
+            {
+                if (d.name != name) continue;
+                occ++;
+                if (occ == wantOcc) return d;
+            }
+            return null;
+        }
+
+        public void OnLocalHouseDoorActivated(GPButtonHouseDoor door, bool stateChanged)
+        {
+            if (!Plugin.IsMultiplayer || door == null) return;
+            if (IsApplyingRemoteState) return;
+            if (!stateChanged) return; // locked, or mid-swing: nothing to sync
+
+            // Same phantom-load gate as trapdoors.
+            if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
+                || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
+
+            var root = door.saveable;
+            if (root == null) return;
+            string key = HouseDoorKeyFor(root, door);
+            if (key == null) return;
+            Send(new TrapdoorStatePacket
+            {
+                BoatName = root.gameObject.name,
+                Key = key,
+                IsOpen = door.IsOpen(),
+                IsGunportGroup = false
+            });
+        }
+
+        /// <summary>One apply attempt for a hinged door. Same contract as TryApply.</summary>
+        private bool TryApplyHouseDoor(TrapdoorStatePacket packet)
+        {
+            var root = BoatUtility.FindPurchasableByName(packet.BoatName);
+            if (root == null)
+            {
+                VerboseLogger.ControlApply($"TrapdoorState FAILED: door owner '{packet.BoatName}' not found");
+                return true; // fatal
+            }
+
+            var door = FindHouseDoorByKey(root, packet.Key);
+            if (door == null)
+            {
+                Plugin.Log.LogWarning($"[TRAPDOOR] No door '{packet.Key}' on '{packet.BoatName}'");
+                return true; // fatal
+            }
+            // A door under a cabin variant this machine has switched off cannot run its coroutine.
+            if (!door.isActiveAndEnabled) return true;
+            if (door.IsOpen() == packet.IsOpen) return true;
+
+            IsApplyingRemoteState = true;
+            try
+            {
+                // No-op while the door is swinging, or while ownership has not arrived here yet (the door
+                // only moves on saveable.extraSetting). Either way the caller retries.
+                door.OnActivate();
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+            return door.IsOpen() == packet.IsOpen;
+        }
+
         private void Send(TrapdoorStatePacket packet)
         {
             VerboseLogger.ControlSend($"TrapdoorState, boat={packet.BoatName}, key={packet.Key}, open={packet.IsOpen}, group={packet.IsGunportGroup}");
@@ -178,6 +296,10 @@ namespace SailwindCoop.Sync
         /// <summary>One apply attempt. True = local state now matches (or target unresolvable-fatal).</summary>
         private bool TryApply(TrapdoorStatePacket packet)
         {
+            if (!packet.IsGunportGroup && packet.Key != null
+                && packet.Key.StartsWith(HouseDoorKeyPrefix, System.StringComparison.Ordinal))
+                return TryApplyHouseDoor(packet);
+
             var boat = BoatUtility.FindBoatByName(packet.BoatName);
             if (boat == null)
             {
@@ -269,6 +391,18 @@ namespace SailwindCoop.Sync
                     }
                 }
             }
+            // Hinged doors (0.39). Their state is not saved, so every machine loads them shut and only the
+            // open ones need sending.
+            foreach (var door in Resources.FindObjectsOfTypeAll<GPButtonHouseDoor>())
+            {
+                if (door == null || !door.gameObject.scene.IsValid() || !door.IsOpen() || door.saveable == null) continue;
+                string key = HouseDoorKeyFor(door.saveable, door);
+                if (key == null) continue;
+                var p = new TrapdoorStatePacket { BoatName = door.saveable.gameObject.name, Key = key, IsOpen = true, IsGunportGroup = false };
+                Plugin.NetworkManager.SendReliable(target, PacketType.TrapdoorState, w => PacketSerializer.WriteTrapdoorState(w, p));
+                sent++;
+            }
+
             Plugin.Log.LogInfo($"[TRAPDOOR] Join replay: sent {sent} trapdoor states to {target}");
         }
     }

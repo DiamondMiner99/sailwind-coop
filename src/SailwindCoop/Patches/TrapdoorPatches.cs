@@ -30,4 +30,27 @@ namespace SailwindCoop.Patches
             TrapdoorSyncManager.Instance?.OnLocalTrapdoorActivated(__instance, stateChanged);
         }
     }
+
+    /// <summary>
+    /// Sailwind 0.39 hinged doors (house front doors, the large hull's cabin doors). Same shape as the
+    /// trapdoor patch: GPButtonHouseDoor.OnActivate returns silently while the door is swinging or the
+    /// owner has not been bought, and its coroutine flips `open` before its first yield.
+    /// </summary>
+    [HarmonyPatch(typeof(GPButtonHouseDoor), "OnActivate", new System.Type[0])]
+    public static class HouseDoorOnActivatePatch
+    {
+        [HarmonyPrefix]
+        public static void Prefix(GPButtonHouseDoor __instance, out bool __state, bool __runOriginal)
+        {
+            __state = __instance != null && __instance.IsOpen();
+        }
+
+        [HarmonyPostfix]
+        public static void Postfix(GPButtonHouseDoor __instance, bool __state)
+        {
+            if (!Plugin.IsMultiplayer || __instance == null) return;
+            bool stateChanged = __instance.IsOpen() != __state;
+            TrapdoorSyncManager.Instance?.OnLocalHouseDoorActivated(__instance, stateChanged);
+        }
+    }
 }

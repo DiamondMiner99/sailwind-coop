@@ -47,9 +47,10 @@ namespace SailwindCoop.Sync
 
         // ===== Crest wave drive sync =====
         // The LIVE ocean is the Crest stack: OceanUpdaterCrest crossfades two inertia
-        // ShapeGerstnerBatched waves + a wind wave. Wave PHASES are already deterministic
-        // (scene-serialized _randomSeed) and TIME is synced via the guest time provider, so the only
-        // divergence is OceanUpdaterCrest's per-client crossfade state. We sync those INPUTS and let
+        // ShapeGerstnerBatched waves + a wind wave. TIME is synced via the guest time provider and the
+        // crossfade state below. Wave PHASES were long assumed deterministic (scene-serialized
+        // _randomSeed); they are not, each machine's carry its own floating-origin history, which
+        // Patches.OceanPhasePatches corrects. We sync the crossfade INPUTS and let
         // the guest's own DCTInertiaUpdate recompute weights locally (keeps per-player
         // distanceToLand/eyesFullyClosed damping).
         private static readonly AccessTools.FieldRef<OceanUpdaterCrest, float> CurrentMultRef =
@@ -122,6 +123,9 @@ namespace SailwindCoop.Sync
             if (!Plugin.IsMultiplayer) return;
 
             Plugin.Profiler?.StartMeasure();
+
+            // Shared sea: once per session, on host and guest alike.
+            Patches.OceanPhasePatches.EnsureCanonical();
 
             if (Plugin.IsHost)
             {
@@ -221,6 +225,19 @@ namespace SailwindCoop.Sync
                 packet.HostTargetInertiaAngle = TargetInertiaAngleRef(updater);
                 var windWaves = WindWavesRef(updater);
                 packet.HostWindWavesWeight = windWaves != null ? windWaves._weight : 0f;
+                // The angle each inertia wave actually has. targetInertiaAngle keeps drifting after a wave
+                // was given its direction, and a shared sea needs the two machines' directions equal.
+                var hostInertiaWaves = InertiaWavesRef(updater);
+                if (hostInertiaWaves != null && hostInertiaWaves.Length >= 2
+                    && hostInertiaWaves[0] != null && hostInertiaWaves[1] != null)
+                {
+                    packet.HostInertiaAngle0 = hostInertiaWaves[0]._windDirectionAngle;
+                    packet.HostInertiaAngle1 = hostInertiaWaves[1]._windDirectionAngle;
+                }
+                else
+                {
+                    packet.HostInertiaAngle0 = packet.HostInertiaAngle1 = float.NaN;
+                }
             }
 
             return packet;
@@ -485,6 +502,19 @@ namespace SailwindCoop.Sync
             }
             CurrentMultRef(updater) = packet.HostCurrentMult;
 
+            // SHARED SEA: give both inertia waves the exact direction the host's have, and re-derive the
+            // phases of any wave whose direction changed (see Patches.OceanPhasePatches). The seeding above
+            // only reaches the wave that is fading in, and uses an angle that has drifted since.
+            if (Plugin.SharedSeaConfig == null || Plugin.SharedSeaConfig.Value)
+            {
+                var sharedWaves = InertiaWavesRef(updater);
+                if (sharedWaves != null && sharedWaves.Length >= 2)
+                {
+                    AdoptHostWaveDirection(sharedWaves[0], packet.HostInertiaAngle0);
+                    AdoptHostWaveDirection(sharedWaves[1], packet.HostInertiaAngle1);
+                }
+            }
+
             // Snap the wind-wave weight lerp state to the host's; the guest's own lerp continues from here.
             var windWaves = WindWavesRef(updater);
             if (windWaves != null)
@@ -494,6 +524,14 @@ namespace SailwindCoop.Sync
                 // reasoning as the ocean-time slew.
                 windWaves._weight = Mathf.MoveTowards(windWaves._weight, packet.HostWindWavesWeight, 0.25f);
             }
+        }
+
+        private static void AdoptHostWaveDirection(ShapeGerstnerBatched wave, float hostAngle)
+        {
+            if (wave == null || float.IsNaN(hostAngle) || float.IsInfinity(hostAngle)) return;
+            if (wave._windDirectionAngle == hostAngle) return;
+            wave._windDirectionAngle = hostAngle;
+            Patches.OceanPhasePatches.Canonicalize(wave, Patches.OceanPhasePatches.OceanOffset());
         }
 
         /// <summary>
@@ -551,6 +589,7 @@ namespace SailwindCoop.Sync
             _targetWind = Vector3.zero;
             _oceanTimeSlewError = 0f;
             Patches.WeatherPatches.LocalWeatherOverride = false;
+            Patches.OceanPhasePatches.ResetSession();
 
             // Clean up ocean time provider
             if (_oceanTimeProvider != null)

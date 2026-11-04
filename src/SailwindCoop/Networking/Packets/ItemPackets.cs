@@ -23,6 +23,29 @@ namespace SailwindCoop.Networking.Packets
         public Quaternion Rotation;
         public string ParentBoatName; // Empty if world/dock
         public bool IsLocalPosition;  // True if Position is boat-local
+        public bool Attached;         // A wall-attachable item (hook) that snapped to a wall on the sender
+    }
+
+    /// <summary>Guest asks for the contents of a boat or house that just streamed in.</summary>
+    [Serializable]
+    public struct BoatItemsRequestPacket
+    {
+        public string BoatName;
+    }
+
+    /// <summary>Full save data for items filed under a boat or house. Long lists span several packets.</summary>
+    [Serializable]
+    public struct BoatItemsPacket
+    {
+        public string BoatName;
+        public NetworkSaveData[] Items;
+    }
+
+    /// <summary>Guest asks for one item it was told about and does not have.</summary>
+    [Serializable]
+    public struct ItemResyncRequestPacket
+    {
+        public int ItemInstanceId;
     }
 
     [Serializable]

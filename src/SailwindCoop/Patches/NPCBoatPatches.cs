@@ -166,6 +166,16 @@ namespace SailwindCoop.Patches
             [HarmonyPrefix]
             public static void Prefix(BoatImpactSounds __instance, Collision collision)
             {
+                // Diagnostic, host and guest: an ITEM hitting the hull. This is what the "ship jerks and
+                // booms when a crewmate sets something down" reports looked like from the inside.
+                if (Plugin.IsMultiplayer && collision != null && collision.collider != null
+                    && collision.collider.GetComponentInParent<ItemRigidbody>() != null)
+                {
+                    SailwindCoop.Debug.VerboseLogger.Log("BOAT", "IMPACT",
+                        $"'{__instance.transform.parent?.name}' hit by item collider '{collision.collider.name}' " +
+                        $"relVel={collision.relativeVelocity.magnitude:F2} aboard={GameState.lastBoat == __instance.transform.parent}");
+                }
+
                 if (!Plugin.IsMultiplayer || Plugin.IsHost) return;
                 if (collision == null) return;
                 if (Plugin.NetworkManager == null) return;

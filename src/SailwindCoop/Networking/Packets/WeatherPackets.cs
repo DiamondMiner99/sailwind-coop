@@ -40,5 +40,7 @@ namespace SailwindCoop.Networking.Packets
         public byte HostWavesUp;               // OceanUpdaterCrest.wavesUp (inertia wave slot 0/1)
         public float HostTargetInertiaAngle;   // OceanUpdaterCrest.targetInertiaAngle
         public float HostWindWavesWeight;      // OceanUpdaterCrest.windWaves._weight (lerp state)
+        public float HostInertiaAngle0;        // inertiaWaves[0]._windDirectionAngle, the angle that wave really has
+        public float HostInertiaAngle1;        // inertiaWaves[1]._windDirectionAngle
     }
 }

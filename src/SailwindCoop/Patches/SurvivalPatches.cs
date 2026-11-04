@@ -30,6 +30,9 @@ namespace SailwindCoop.Patches
 
             private static bool _resting;
             private static float _preSleep, _preFood, _preWater, _preProtein, _preVitamins;
+            // A co-op HOUSE sleep (0.39) is in progress on this machine: hold food and water for its length.
+            private static bool _houseNight;
+            private static float _houseFood, _houseWater, _houseProtein, _houseVitamins;
 
             // (v0.2.37) WARP-CLIP REST TOP-UP: Time.realtimeSinceStartup at the previous frame's postfix
             // while a co-op sleep warp is active on this GUEST. 0 when not in a warp (re-baselines on entry
@@ -41,6 +44,7 @@ namespace SailwindCoop.Patches
             public static bool Prefix()
             {
                 _resting = false;
+                _houseNight = false;
 
                 // GUEST FAINT: while a local faint is mid-blackout, suppress vanilla decay so stats
                 // can't be pushed back to 0 and re-fire PassOut during the fade (re-entrancy storm).
@@ -57,6 +61,21 @@ namespace SailwindCoop.Patches
                     _preVitamins = PlayerNeeds.vitamins;
                 }
 
+                // A tavern night pins the needs (vanilla sets them to 100 while sleepingInTavern). A house night
+                // in vanilla drains them and lets thirst or hunger wake you; co-op blocks that wake, exactly as
+                // it does for a tavern, so without this a long house night ran the needs down to the floor.
+                // Hold them where they were: a house costs nothing per night and feeds nobody.
+                _houseNight = Plugin.IsMultiplayer && GameState.sleeping
+                    && SleepSyncManager.Instance != null && SleepSyncManager.Instance.IsHouseSleep
+                    && SleepSyncManager.Instance.CurrentState == SleepSyncManager.SleepState.Sleeping;
+                if (_houseNight)
+                {
+                    _houseFood = PlayerNeeds.food;
+                    _houseWater = PlayerNeeds.water;
+                    _houseProtein = PlayerNeeds.protein;
+                    _houseVitamins = PlayerNeeds.vitamins;
+                }
+
                 // INDEPENDENT NEEDS: each player ticks their OWN needs decay (food/water/sleep).
                 // Previously the guest's LateUpdate was suppressed and stats were mirrored from the
                 // host. Now we ALWAYS run the vanilla LateUpdate so every client decays locally.
@@ -64,10 +83,51 @@ namespace SailwindCoop.Patches
                 return true;
             }
 
+            // A rate comparison between machines needs the same line from each of them, unconditionally: nothing
+            // in the normal log shows the awake drain.
+            private const float NeedsLogInterval = 30f;
+            private static float _nextNeedsLog;
+            private static float _needsLogFrames, _needsLogStart;
+
+            private static void LogNeedsRate()
+            {
+                if (!Plugin.IsMultiplayer) return;
+
+                _needsLogFrames++;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (now < _nextNeedsLog) return;
+
+                if (_needsLogStart > 0f)
+                {
+                    float fps = _needsLogFrames / UnityEngine.Mathf.Max(now - _needsLogStart, 0.001f);
+                    Plugin.Log.LogInfo($"[NEEDS] food={PlayerNeeds.food:F2} water={PlayerNeeds.water:F2} sleep={PlayerNeeds.sleep:F2} " +
+                        $"alcohol={PlayerNeeds.alcohol:F2} foodDebt={PlayerNeeds.foodDebt:F2} sleepDebt={PlayerNeeds.sleepDebt:F2} " +
+                        $"timeScale={UnityEngine.Time.timeScale:F2} sunTimescale={Sun.sun?.timescale ?? 0f:F2} initialTimescale={Sun.sun?.initialTimescale ?? 0f:F2} " +
+                        $"timeskipSleep={Sleep.timeskipSleep} fps={fps:F0} resting={SleepSyncManager.Instance?.IsLocalPlayerRestingInBed ?? false} " +
+                        $"onBoat={GameState.currentBoat != null} instances={UnityEngine.Object.FindObjectsOfType<PlayerNeeds>().Length} " +
+                        $"role={(Plugin.IsHost ? "host" : "guest")}");
+                }
+
+                _nextNeedsLog = now + NeedsLogInterval;
+                _needsLogStart = now;
+                _needsLogFrames = 0f;
+            }
+
             [HarmonyPostfix]
             public static void Postfix()
             {
+                LogNeedsRate();
                 TopUpClampedWarpRest();
+
+                if (_houseNight)
+                {
+                    _houseNight = false;
+                    // Never lower a value vanilla left higher this frame.
+                    PlayerNeeds.food = UnityEngine.Mathf.Max(PlayerNeeds.food, _houseFood);
+                    PlayerNeeds.water = UnityEngine.Mathf.Max(PlayerNeeds.water, _houseWater);
+                    PlayerNeeds.protein = UnityEngine.Mathf.Max(PlayerNeeds.protein, _houseProtein);
+                    PlayerNeeds.vitamins = UnityEngine.Mathf.Max(PlayerNeeds.vitamins, _houseVitamins);
+                }
 
                 if (!_resting) return;
                 _resting = false;

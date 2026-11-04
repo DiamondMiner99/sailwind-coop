@@ -88,8 +88,12 @@ namespace SailwindCoop.Patches
             }
 
             [HarmonyPostfix]
-            public static void Postfix(BoatMass __instance, Rigidbody ___body, float ___selfMass, float ___leverageMult)
+            public static void Postfix(BoatMass __instance, Rigidbody ___body, float ___selfMass, float ___leverageMult,
+                System.Collections.Generic.List<ItemRigidbody> ___itemsOnBoat)
             {
+                // Read before the restore below: this is the answer vanilla's own guard just gave.
+                bool vanillaCountedPlayer = GameState.currentBoat != null && GameState.currentBoat.parent == __instance.transform;
+
                 // Put it back FIRST and unconditionally - every early return below must not leak the
                 // suppression into the rest of the frame, where currentBoat means "the boat I am on".
                 if (_suppressedCurrentBoat != null)
@@ -97,6 +101,8 @@ namespace SailwindCoop.Patches
                     GameState.currentBoat = _suppressedCurrentBoat;
                     _suppressedCurrentBoat = null;
                 }
+
+                CorrectRemoteHeldItems(__instance, ___body, ___selfMass, ___leverageMult, ___itemsOnBoat, vanillaCountedPlayer);
 
                 // Only run on host in multiplayer
                 if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
@@ -173,6 +179,76 @@ namespace SailwindCoop.Patches
                     ___body.centerOfMass += offset;
                 }
             }
+
+            /// <summary>
+            /// Vanilla weighs a held item at the local player's position, because a held item could only ever be
+            /// in the local player's hand. A crewmate's item carries a stand-in held reference on this machine, so
+            /// it was weighed at the wrong person, or not at all with the local player ashore. Then the drop moved
+            /// its whole lever in one physics step. That is a jerk on every machine but the dropper's, and the
+            /// lever scales with the item's mass. Runs on host and guest alike: each has its own hull.
+            /// </summary>
+            private static void CorrectRemoteHeldItems(BoatMass boatMass, Rigidbody body, float selfMass, float leverageMult,
+                System.Collections.Generic.List<ItemRigidbody> items, bool vanillaCountedPlayer)
+            {
+                if (!Plugin.IsMultiplayer || items == null) return;
+                if (Plugin.RemoteHeldMassConfig != null && !Plugin.RemoteHeldMassConfig.Value) return;
+
+                var manager = Sync.ItemSyncManager.Instance;
+                if (manager == null) return;
+
+                Transform boatModel = null;
+                foreach (var itemBody in items)
+                {
+                    if (itemBody == null || itemBody.GetCurrentInventorySlot() != null) continue;
+                    var ship = itemBody.GetShipItem();
+                    if (ship == null || ship.held == null || !manager.IsRemoteHeld(ship)) continue;
+
+                    if (boatModel == null) boatModel = boatMass.GetComponent<BoatRefs>()?.boatModel;
+                    if (boatModel == null) return;
+
+                    float mass = itemBody.GetBody().mass;
+                    float ratio = mass / selfMass;
+                    Quaternion frame = Quaternion.Euler(0f, -90f, 0f);
+
+                    // A carried item keeps its boat latch for the whole carry, so it stays on this list after the
+                    // holder walks down the dock with it, or after the ship sails off without them. Weigh it only
+                    // while the holder is standing on this boat, the same test the crew weight loop uses. An item
+                    // on the holder's belt weighs nothing here either, as it does on their machine.
+                    Vector3 local = boatModel.InverseTransformPoint(ship.transform.position);
+                    bool aboard = ship.gameObject.activeSelf && manager.HolderIsAboard(ship, boatMass.gameObject.name)
+                        && IsFinite(local) && local.magnitude <= MaxCrewLeverMeters;
+
+                    if (_holderWasAboard.Count > MaxTrackedCarries) _holderWasAboard.Clear();
+                    if (_holderWasAboard.TryGetValue(itemBody, out bool wasAboard) && wasAboard != aboard)
+                        BoatMassBalanceEasePatch.NoteItemSetDown(boatMass);
+                    _holderWasAboard[itemBody] = aboard;
+
+                    if (!aboard)
+                    {
+                        if (vanillaCountedPlayer && Refs.observerMirror != null)
+                        {
+                            body.mass -= mass;
+                            body.centerOfMass -= frame * Refs.observerMirror.transform.localPosition * ratio * leverageMult;
+                        }
+                        continue;
+                    }
+
+                    if (vanillaCountedPlayer)
+                    {
+                        if (Refs.observerMirror == null) continue;
+                        body.centerOfMass -= frame * Refs.observerMirror.transform.localPosition * ratio * leverageMult;
+                    }
+                    else
+                    {
+                        body.mass += mass;
+                    }
+                    body.centerOfMass += frame * local * ratio * leverageMult;
+                }
+            }
+
+            private const int MaxTrackedCarries = 64;
+            private static readonly System.Collections.Generic.Dictionary<ItemRigidbody, bool> _holderWasAboard =
+                new System.Collections.Generic.Dictionary<ItemRigidbody, bool>();
 
             /// <summary>Seconds of silence after which a crewmate stops contributing trim. They may have
             /// dropped without a clean disconnect, and a boat held in a heel by a player who is gone reads as
@@ -273,6 +349,44 @@ namespace SailwindCoop.Patches
                     if (body != null) body.mass += __state;
                 }
                 catch { /* UpdateMass rewrites body.mass next FixedUpdate anyway */ }
+            }
+        }
+
+        /// <summary>
+        /// Eases the center of mass for a moment after a crewmate sets an item down or carries one off. An item
+        /// carried aboard from a dock has no weight until it is put down, however it is weighed, so that step
+        /// still has to go somewhere. Last of the UpdateMass postfixes, so it sees the finished value.
+        /// </summary>
+        [HarmonyPatch(typeof(BoatMass), "UpdateMass")]
+        public static class BoatMassBalanceEasePatch
+        {
+            private const float EaseSeconds = 1.5f;
+            private const float EaseRate = 4f;
+            private static readonly System.Collections.Generic.Dictionary<BoatMass, float> _easeUntil =
+                new System.Collections.Generic.Dictionary<BoatMass, float>();
+            private static readonly System.Collections.Generic.Dictionary<BoatMass, Vector3> _lastCenter =
+                new System.Collections.Generic.Dictionary<BoatMass, Vector3>();
+
+            public static void NoteItemSetDown(BoatMass boatMass)
+            {
+                if (boatMass != null) _easeUntil[boatMass] = Time.time + EaseSeconds;
+            }
+
+            [HarmonyPostfix]
+            [HarmonyPriority(Priority.Last)]
+            public static void Postfix(BoatMass __instance, Rigidbody ___body)
+            {
+                if (!Plugin.IsMultiplayer) return;
+                if (Plugin.RemoteHeldMassConfig != null && !Plugin.RemoteHeldMassConfig.Value) return;
+
+                Vector3 target = ___body.centerOfMass;
+                if (_easeUntil.TryGetValue(__instance, out float until) && Time.time < until
+                    && _lastCenter.TryGetValue(__instance, out Vector3 last))
+                {
+                    target = Vector3.Lerp(last, target, 1f - Mathf.Exp(-EaseRate * Time.deltaTime));
+                    ___body.centerOfMass = target;
+                }
+                _lastCenter[__instance] = target;
             }
         }
 

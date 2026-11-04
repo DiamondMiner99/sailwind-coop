@@ -78,11 +78,35 @@ namespace SailwindCoop.Sync
             ApplyGuestPumpDrain();
         }
 
+        // Boats other than the host's own that currently hold water (or held it at the last send).
+        private readonly System.Collections.Generic.HashSet<string> _wetBoats = new System.Collections.Generic.HashSet<string>();
+
         private void SendDamageState()
         {
-            var boat = GameState.lastBoat;
-            if (boat == null) return;
+            var primary = GameState.lastBoat;
+            if (primary != null) SendDamageStateFor(primary);
 
+            // Every OTHER boat with water in it. Their water used to reach a guest only in the join snapshot:
+            // the host keeps draining and leaking them, while a guest (which never integrates water itself)
+            // kept the value it joined with, so a boat the host was not standing on could sit flooded for the
+            // crew and dry for the host. One last packet goes out when a boat dries, then it drops off.
+            foreach (var kvp in BoatUtility.FindAllBoats())
+            {
+                var saveable = kvp.Value;
+                if (saveable == null || saveable.transform == primary) continue;
+                var otherDamage = saveable.GetComponent<BoatDamage>();
+                if (otherDamage == null) continue;
+
+                bool wet = otherDamage.waterLevel > 0f || otherDamage.sunk;
+                if (wet) _wetBoats.Add(kvp.Key);
+                else if (!_wetBoats.Remove(kvp.Key)) continue;
+
+                SendDamageStateFor(saveable.transform);
+            }
+        }
+
+        private void SendDamageStateFor(Transform boat)
+        {
             var damage = boat.GetComponent<BoatDamage>();
             if (damage == null) return;
 
@@ -442,6 +466,7 @@ namespace SailwindCoop.Sync
             _lastSentPumpInput = 0f;
             _guestPumps.Clear();
             _pumpInputByBoat.Clear();
+            _wetBoats.Clear();
         }
     }
 }

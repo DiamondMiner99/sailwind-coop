@@ -54,12 +54,135 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Find a boat by name.
         /// </summary>
+        /// <summary>
+        /// Re-measure every boat's distance to the player as a join ends. A far boat only re-checks every 10 to
+        /// 20 seconds, so a hull that was out of range at the joiner's saved position can still read as out of
+        /// range after the joiner has been moved onto it. The first frame after the join would then pack its
+        /// items away.
+        /// </summary>
+        public static void RefreshHorizonsAfterJoin()
+        {
+            if (Plugin.IsHost || !Plugin.IsMultiplayer) return;
+
+            try
+            {
+                if (Refs.observerMirror == null) return;
+                foreach (var horizon in Object.FindObjectsOfType<BoatHorizon>())
+                    HarmonyLib.Traverse.Create(horizon).Method("DistanceCheck").GetValue();
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[JOIN] Could not refresh boat distances: {e.Message}");
+            }
+        }
+
         public static SaveableObject FindBoatByName(string name)
         {
             if (string.IsNullOrEmpty(name)) return null;
             var boats = FindAllBoats();
             boats.TryGetValue(name, out var boat);
             return boat;
+        }
+
+        /// <summary>
+        /// Resolve any PURCHASABLE object by name - boats and, since Sailwind 0.39, houses. Houses are sold
+        /// through the same PurchasableBoat component but carry no BoatRefs (they are BoatHorizon +
+        /// BoatLocalItems + PurchasableBoat + SaveableObject), so FindAllBoats cannot see them and every
+        /// ownership path that went through it silently dropped them. Deliberately NOT cached into
+        /// _cachedBoats: that dictionary feeds the whole boat sync, and a house must never enter it.
+        /// </summary>
+        public static SaveableObject FindPurchasableByName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+
+            var boat = FindBoatByName(name);
+            if (boat != null) return boat;
+
+            var allObjects = SaveLoadManager.instance?.GetCurrentObjects();
+            if (allObjects == null) return null;
+
+            foreach (var obj in allObjects)
+            {
+                if (obj != null && obj.gameObject.name == name && obj.GetComponent<PurchasableBoat>() != null)
+                {
+                    return obj;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Every purchasable object that is NOT a boat - i.e. Sailwind 0.39 houses. Used to replay house
+        /// ownership to a joiner, since the join snapshot is built from the BoatRefs-keyed set.
+        /// </summary>
+        public static List<SaveableObject> FindNonBoatPurchasables()
+        {
+            var result = new List<SaveableObject>();
+
+            var allObjects = SaveLoadManager.instance?.GetCurrentObjects();
+            if (allObjects == null) return result;
+
+            foreach (var obj in allObjects)
+            {
+                if (obj == null) continue;
+                if (obj.GetComponent<BoatRefs>() != null) continue;
+                if (obj.GetComponent<PurchasableBoat>() == null) continue;
+                result.Add(obj);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// The house whose SaveableObject has this sceneIndex, or null when the index belongs to a boat,
+        /// to nothing, or is one of vanilla's negative sentinels. This is how an item's
+        /// SaveablePrefab.parentObject is told apart: a house index means "filed under that house".
+        /// </summary>
+        public static SaveableObject FindHouseBySceneIndex(int sceneIndex)
+        {
+            if (sceneIndex < 0) return null;
+
+            var allObjects = SaveLoadManager.instance?.GetCurrentObjects();
+            if (allObjects == null || sceneIndex >= allObjects.Length) return null;
+
+            var obj = allObjects[sceneIndex];
+            if (obj == null) return null;
+            if (obj.GetComponent<BoatRefs>() != null) return null;
+            if (obj.GetComponent<PurchasableBoat>() == null) return null;
+            return obj;
+        }
+
+        /// <summary>
+        /// The house whose trigger volume contains this world position, or null. Vanilla files an item
+        /// under a house from the item's own trigger entering the house's "House" collider; a remote drop
+        /// cannot rely on that event having fired here, so the drop apply asks by position instead.
+        /// </summary>
+        public static SaveableObject FindHouseContaining(Vector3 worldPos)
+        {
+            foreach (var house in FindNonBoatPurchasables())
+            {
+                foreach (var col in house.GetComponents<Collider>())
+                {
+                    if (col == null || !col.enabled || !col.isTrigger) continue;
+
+                    var box = col as BoxCollider;
+                    if (box != null)
+                    {
+                        // Exact for a rotated or scaled box (house 205 is scaled, five of the six are yawed).
+                        Vector3 local = box.transform.InverseTransformPoint(worldPos) - box.center;
+                        Vector3 half = box.size * 0.5f;
+                        if (Mathf.Abs(local.x) <= half.x && Mathf.Abs(local.y) <= half.y && Mathf.Abs(local.z) <= half.z)
+                            return house;
+                    }
+                    else if ((col.ClosestPoint(worldPos) - worldPos).sqrMagnitude < 0.0001f)
+                    {
+                        return house;
+                    }
+                }
+            }
+
+            return null;
         }
 
         /// <summary>

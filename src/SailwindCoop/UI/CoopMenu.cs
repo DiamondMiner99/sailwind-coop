@@ -20,10 +20,6 @@ namespace SailwindCoop.UI
     {
         public const string Primary = "coop_primary"; // retained for click-router back-compat (unused)
         public const string Friends = "coop_title_friends";
-        public const string Invites = "coop_title_invites";
-
-        private static Transform _invitesRow;
-        private static int _invitesShown = -1;
 
         private static readonly AccessTools.FieldRef<StartMenuButton, StartMenuButtonType> ButtonTypeRef =
             AccessTools.FieldRefAccess<StartMenuButton, StartMenuButtonType>("type");
@@ -82,20 +78,12 @@ namespace SailwindCoop.UI
                 clone.transform.localScale = template.localScale;
                 SetLabel(clone.transform, "Friends");
 
-                // Invites sits under Friends: Steam replays pending invites at launch, so the title screen
-                // is where many of them are first seen.
-                var invites = Object.Instantiate(template.gameObject, template.parent);
-                invites.name = Invites;
-                invites.transform.localRotation = template.localRotation;
-                invites.transform.localScale = template.localScale;
-                SetLabel(invites.transform, "Invites");
-                _invitesRow = invites.transform;
-                _invitesShown = -1;
+                // No Invites row here. The title screen had one and players found it confusing; invites are
+                // answered from the pause menu's Invites button once a world is loaded.
 
                 // Directly above Settings: below New Game as asked, and unambiguous whether or not Continue
                 // is present (an install with no saves hides Continue entirely).
                 int at = rows.IndexOf(settingsRow);
-                rows.Insert(at, invites.transform);
                 rows.Insert(at, clone.transform);
 
                 // Same span, more entries. Equal spacing, ends unmoved.
@@ -105,7 +93,7 @@ namespace SailwindCoop.UI
                 FitPlateHeights(rows, step);
 
                 _installed = true;
-                Plugin.Log.LogInfo($"[CoopMenu] Title Friends and Invites buttons installed ({rows.Count} rows, step={step:F3})");
+                Plugin.Log.LogInfo($"[CoopMenu] Title Friends button installed ({rows.Count} rows, step={step:F3})");
             }
             catch (System.Exception e)
             {
@@ -114,9 +102,8 @@ namespace SailwindCoop.UI
         }
 
         /// <summary>
-        /// Make the plates shorter when the column is packed tighter than a plate is tall. With six entries
-        /// the step drops to about 0.24 while a plate is about 0.25 tall, so neighbors overlapped and the
-        /// overlapping strips drew lighter. Only the plate (every child but "text") is shortened; the text
+        /// Make the plates shorter when the column is packed tighter than a plate is tall, so neighbors do
+        /// not overlap (the overlapping strips drew lighter). Only the plate (every child but "text") is shortened; the text
         /// keeps its size. Each row's plate is measured from its own meshes, so a column with room to spare
         /// (no Continue button on an install without saves) is left alone.
         /// </summary>
@@ -178,28 +165,16 @@ namespace SailwindCoop.UI
             return hi > lo ? hi - lo : 0f;
         }
 
-        /// <summary>Keep the title Invites label's count current. Writes only when the count changes.</summary>
-        public static void Tick()
-        {
-            if (_invitesRow == null) return;
-            int n = Plugin.LobbyManager != null ? Plugin.LobbyManager.Invites.Count : 0;
-            if (n == _invitesShown) return;
-            _invitesShown = n;
-            try { SetLabel(_invitesRow, n > 0 ? "Invites (" + n + ")" : "Invites"); }
-            catch (System.Exception e) { Plugin.Log.LogWarning("[CoopMenu] Could not update the Invites label: " + e.Message); }
-        }
-
         public static bool HandleClick(string name)
         {
-            if (name != Friends && name != Invites) return false;
+            if (name != Friends) return false;
             try
             {
                 // Same gate the pause menu uses: without Steam there is nothing to show, and the readiness
                 // check is what surfaces WHY (missing native library, Steam not running) instead of opening
                 // an empty list.
                 if (!Plugin.EnsureCoopReady()) return true;
-                if (name == Invites) FriendsScreen.OpenInvites();
-                else FriendsScreen.Open();
+                FriendsScreen.Open();
             }
             catch (System.Exception e)
             {

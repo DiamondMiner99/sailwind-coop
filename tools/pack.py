@@ -14,7 +14,7 @@ ver = sys.argv[1]
 here = os.path.dirname(os.path.abspath(__file__))
 repo = os.path.dirname(here)
 downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-base = sys.argv[2] if len(sys.argv) > 2 else os.path.join(downloads, "SailwindCoop-v0.3.2.zip")
+base = sys.argv[2] if len(sys.argv) > 2 else os.path.join(downloads, "SailwindCoop-v0.4.0.zip")
 out = os.path.join(downloads, "SailwindCoop-v%s.zip" % ver)
 
 coop_dll = os.path.join(repo, "src", "SailwindCoop", "bin", "Release", "net472", "SailwindCoop.dll")

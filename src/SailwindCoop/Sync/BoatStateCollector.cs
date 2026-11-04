@@ -208,7 +208,7 @@ namespace SailwindCoop.Sync
                 Rotation = boat.transform.rotation,
 
                 // Customization
-                MastsEnabled = customData?.masts ?? new bool[30],
+                MastsEnabled = customData?.masts ?? new bool[48],
                 Sails = CollectSails(customData),
                 PartActiveOptions = customData?.partActiveOptions?.ToArray() ?? new int[0],
 
@@ -470,11 +470,102 @@ namespace SailwindCoop.Sync
                 ExtraValue3 = saveData.extraValue3,
                 ExtraValue4 = saveData.extraValue4,
 
+                IsNailed = saveData.isNailed,
+
                 HasChartData = saveData.chartData != null,
                 ChartData = ConvertChartData(saveData.chartData)
             };
 
             return networkData;
+        }
+
+        /// <summary>
+        /// Everything live that is filed under a boat or house, by the same test vanilla uses to cache it
+        /// (parentObject), with the same exclusions as the join snapshot: nothing in a hand or a pocket. Those
+        /// reach a crewmate through the drop backfill.
+        /// </summary>
+        public static NetworkSaveData[] CollectFiledItems(SaveableObject owner)
+        {
+            var items = new List<NetworkSaveData>();
+            var registered = SaveLoadManager.instance?.GetCurrentPrefabs();
+            if (owner == null || registered == null) return items.ToArray();
+
+            foreach (var prefab in registered)
+            {
+                if (prefab == null || prefab.GetParentObject() != owner.sceneIndex) continue;
+                var shipItem = prefab.GetComponent<ShipItem>();
+                if (shipItem == null || shipItem.held != null || !shipItem.gameObject.activeInHierarchy) continue;
+
+                int slot = shipItem.GetCurrentInventorySlot();
+                if (slot >= 0 && slot < 100) continue;
+
+                if (prefab.instanceId == 0) continue;
+                items.Add(ConvertToNetworkSaveData(prefab, owner, false));
+            }
+            return items.ToArray();
+        }
+
+        /// <summary>One live item filed under a boat or house.</summary>
+        public static NetworkSaveData ConvertFiledItem(SaveablePrefab prefab, SaveableObject owner)
+        {
+            return ConvertToNetworkSaveData(prefab, owner, false);
+        }
+
+        /// <summary>
+        /// Drop items whose crate is not in the list, such as the contents of a crate someone is carrying. On load an
+        /// item with a crate id freezes itself and looks for the crate once, so it would stay frozen for good.
+        /// </summary>
+        public static NetworkSaveData[] OmitOrphanedCrateContents(NetworkSaveData[] items)
+        {
+            var ids = new HashSet<int>(items.Select(i => i.InstanceId));
+            return items.Where(i => i.CrateId <= 0 || ids.Contains(i.CrateId)).ToArray();
+        }
+
+        /// <summary>
+        /// A boat or house's cached contents as network data. Vanilla stores a filed item's position relative to
+        /// its parent object and its rotation in the world, which is what SpawnItem expects.
+        /// </summary>
+        public static NetworkSaveData[] ConvertCachedItems(List<SavePrefabData> cached, SaveableObject owner)
+        {
+            var items = new List<NetworkSaveData>();
+            if (cached == null || owner == null) return items.ToArray();
+
+            foreach (var data in cached)
+            {
+                if (data == null || data.instanceId == 0) continue;
+                if (data.inventorySlot >= 0 && data.inventorySlot < 100) continue;
+
+                items.Add(new NetworkSaveData
+                {
+                    InstanceId = data.instanceId,
+                    PrefabIndex = data.prefabIndex,
+                    Position = data.position,
+                    Rotation = data.rotation,
+                    IsWorldPosition = false,
+                    ParentBoatName = owner.gameObject.name,
+
+                    IsSold = data.isSold,
+                    Health = data.itemHealth,
+                    Amount = data.itemAmount,
+                    InventorySlot = data.inventorySlot,
+                    CrateId = data.crateId,
+                    MissionIndex = data.itemMissionIndex,
+                    ParentObject = data.itemParentObject,
+                    DaysInStorage = data.daysInStorage,
+
+                    ExtraValue0 = data.extraValue0,
+                    ExtraValue1 = data.extraValue1,
+                    ExtraValue2 = data.extraValue2,
+                    ExtraValue3 = data.extraValue3,
+                    ExtraValue4 = data.extraValue4,
+
+                    IsNailed = data.isNailed,
+
+                    HasChartData = data.chartData != null,
+                    ChartData = ConvertChartData(data.chartData)
+                });
+            }
+            return items.ToArray();
         }
 
         /// <summary>

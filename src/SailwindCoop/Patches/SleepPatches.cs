@@ -252,7 +252,10 @@ namespace SailwindCoop.Patches
                     // Sleep.WakeUp internally). The guest is !IsHost so this never blocks the guest.
                     // N-player (Phase 4): the boat quorum reads AllCrewRested instead of the single-guest
                     // GuestRested. At N=1 these are equivalent.
-                    bool crewRested = !isTavern && syncManager.AllCrewRested;
+                    // A 0.39 house sleep runs to the morning window like a tavern sleep, so "the crew is
+                    // rested" must not release the auto-wake gate for it either.
+                    bool isHouse = syncManager.IsHouseSleep;
+                    bool crewRested = !isTavern && !isHouse && syncManager.AllCrewRested;
 
                     if (Plugin.IsHost && !isManualWake &&
                         !crewRested && !DurationCapReached() && !GameState.recovering)
@@ -260,12 +263,12 @@ namespace SailwindCoop.Patches
                         if (Time.unscaledTime - _lastBlockingLog > 2f)
                         {
                             _lastBlockingLog = Time.unscaledTime;
-                            VerboseLogger.SleepEvent($"Wake gate BLOCKING auto-wake: tavern={isTavern}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, host_sleep={PlayerNeeds.sleep:F1}%");
+                            VerboseLogger.SleepEvent($"Wake gate BLOCKING auto-wake: tavern={isTavern}, house={isHouse}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, host_sleep={PlayerNeeds.sleep:F1}%");
                         }
                         _blockedThisCall = true;
                         return false;
                     }
-                    VerboseLogger.SleepEvent($"Wake gate RELEASING auto-wake: tavern={isTavern}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, recovering={GameState.recovering}");
+                    VerboseLogger.SleepEvent($"Wake gate RELEASING auto-wake: tavern={isTavern}, house={isHouse}, isManualWake={isManualWake}, crewRested={crewRested}, AllCrewRested={syncManager.AllCrewRested}, DurationCapReached={DurationCapReached()}, recovering={GameState.recovering}");
                     HostManualWake = false;
 
                     // Coverage gap: capture the tavern flag NOW, before OnLocalWakeUp ->
@@ -291,7 +294,12 @@ namespace SailwindCoop.Patches
             {
                 if (Sleep.instance == null) return false;
                 float dur = Traverse.Create(Sleep.instance).Field("currentSleepDuration").GetValue<float>();
-                if (GameState.sleepingInTavern)
+                // Mirror vanilla's own branch exactly. 0.39 routes a house bed down the same morning-window
+                // path as a tavern bed (Sleep.cs:72 is `sleepingInTavern || (bool)currentHouse`), so a house
+                // sleep must be measured against 7-10am, not the 4.5-game-hour boat cap. Read
+                // GameState.currentHouse rather than the crew-wide house flag: this is vanilla's gate for the
+                // sleeper on THIS machine, and it is the same field vanilla itself tests here.
+                if (GameState.sleepingInTavern || GameState.currentHouse != null)
                 {
                     bool tavernCap = Sun.sun != null && Sun.sun.localTime > 7f && Sun.sun.localTime < 10f && dur > 3.3f;
                     if (Time.unscaledTime - _lastCapCheckLog > 2f)

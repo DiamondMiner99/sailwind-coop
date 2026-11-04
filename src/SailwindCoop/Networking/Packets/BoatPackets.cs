@@ -90,6 +90,8 @@ namespace SailwindCoop.Networking.Packets
         public float ExtraValue3;
         public float ExtraValue4;
 
+        public bool IsNailed;
+
         // Chart/map data (null for non-maps)
         public bool HasChartData;
         public NetworkChartData ChartData;

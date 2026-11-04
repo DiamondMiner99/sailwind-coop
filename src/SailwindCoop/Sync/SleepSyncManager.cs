@@ -70,6 +70,18 @@ namespace SailwindCoop.Sync
         public bool IsTavernSleep => _isTavernSleep;
 
         /// <summary>
+        /// True when the CURRENT co-op sleep is a HOUSE sleep (Sailwind 0.39). Vanilla treats a house bed like
+        /// a tavern bed: you may lie down at ANY rest level, the rested auto-wake is suppressed, and the sleep
+        /// runs to the 7-10am morning window (Sleep.cs:60, :64, :72). So co-op must not end it the moment the
+        /// crew is rested, or the whole "sleep in a house even when you're not tired" feature does nothing.
+        /// Decided by the HOST's own bed when the sleep starts: every host-side consumer of this flag is
+        /// really asking "will the host's vanilla Sleep.Update take the morning branch", and that reads the
+        /// host's GameState.currentHouse. A crewmate in a house bed while the host is in a bunk gets an
+        /// ordinary boat sleep. The guest takes the value from SleepApproved.
+        /// </summary>
+        public bool IsHouseSleep => _isHouseSleep;
+
+        /// <summary>
         /// True when the CURRENT co-op sleep is a TIMESKIP sleep (moored/tavern - the vanilla 9x Sun
         /// fast-forward). Exposed read-only so SleepPatches can scope the waitingForCrew suppression of the
         /// vanilla 4.5-game-hour boat cap to timeskip sleeps only: an UNMOORED nap must keep the vanilla cap
@@ -80,6 +92,7 @@ namespace SailwindCoop.Sync
 
         // Context tracking
         private bool _isTavernSleep;
+        private bool _isHouseSleep;
         private bool _isTimeskipEnabled;
         private bool _localPlayerInBed;
 
@@ -385,7 +398,8 @@ namespace SailwindCoop.Sync
                     $"[SLEEP:QUORUM] state={CurrentState} host={Plugin.IsHost} peers={peerCount} " +
                     $"inBed={_inBedPeers.Count} rested={_restedPeers.Count} localInBed={_localPlayerInBed} " +
                     $"timeScale={Time.timeScale:F1} sunTimescale={sunTs:F2} timeskipSleep={Sleep.timeskipSleep} " +
-                    $"timeskipEnabled={_isTimeskipEnabled} tavern={_isTavernSleep} host_sleep={PlayerNeeds.sleep:F1}% " +
+                    $"timeskipEnabled={_isTimeskipEnabled} tavern={_isTavernSleep} house={_isHouseSleep} " +
+                    $"localHouse={GameState.currentHouse != null} host_sleep={PlayerNeeds.sleep:F1}% " +
                     $"allInBed={(Plugin.IsHost ? AllCrewInBed.ToString() : "n/a")} allRested={(Plugin.IsHost ? AllCrewRested.ToString() : "n/a")} " +
                     $"crewSleepAge={crewAge:F0}s sleepingAge={sleepAge:F0}s" +
                     // Triage note: on a NON-host, inBed/rested only count packets this client happened to see
@@ -492,7 +506,7 @@ namespace SailwindCoop.Sync
             // gate regardless of rest), force-mark any peer that blows past its per-peer real-time deadline as
             // rested, then re-evaluate the auto-wake: if that was the last hold-out, OnGuestRested's all-rested
             // path would normally fire it, but it's event-driven, so re-check here. Host owns the quorum.
-            if (Plugin.IsHost && CurrentState == SleepState.Sleeping && !_isTavernSleep)
+            if (Plugin.IsHost && CurrentState == SleepState.Sleeping && !_isTavernSleep && !_isHouseSleep)
             {
                 var peers = Plugin.NetworkManager?.ConnectedPeers;
                 var rpmDl = SailwindCoop.Player.RemotePlayerManager.Instance;
@@ -608,7 +622,7 @@ namespace SailwindCoop.Sync
             // can no longer block, AND force the wake past the symmetric gate via HostManualWake even if the
             // host itself hasn't filled (host-laggard case). At N=1 this reduces to the old single-guest backstop.
             if (Plugin.IsHost && CurrentState == SleepState.Sleeping &&
-                (_isTavernSleep || !AllCrewRested) &&
+                (_isTavernSleep || _isHouseSleep || !AllCrewRested) &&
                 Time.unscaledTime - _sleepingSince > SleepingBackstop)
             {
                 Plugin.Log.LogWarning($"[SLEEP] SLEEPING backstop timed out ({SleepingBackstop}s); force-waking crew. allCrewRested={AllCrewRested}, host_sleep={PlayerNeeds.sleep:F1}%");
@@ -665,21 +679,25 @@ namespace SailwindCoop.Sync
             // arm of the Update() self-timeout consumes it), so the field simply tracks "when we entered bed".
             if (_committedToSleepAt <= 0f) _committedToSleepAt = Time.unscaledTime;
             _isTavernSleep = isTavern;
+            // 0.39: a bed inside a house. It travels with the request for the logs only; what kind of sleep
+            // the crew gets is decided by the HOST's own bed when the sleep starts (TransitionToSleeping).
+            bool isHouse = GameState.currentHouse != null;
 
-            VerboseLogger.SleepLocal($"Entered bed, tavern={isTavern}, moored={isMoored}, state={CurrentState}");
+            VerboseLogger.SleepLocal($"Entered bed, tavern={isTavern}, moored={isMoored}, house={isHouse}, state={CurrentState}");
 
             // Send request to other player
             var packet = new SleepRequestPacket
             {
                 IsTavern = isTavern,
                 IsMoored = isMoored,
+                IsHouse = isHouse,
                 AuthorId = SteamClient.SteamId.Value
             };
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.SleepRequest, w =>
                 PacketSerializer.WriteSleepRequest(w, packet));
 
-            VerboseLogger.SleepSend($"SleepRequest, tavern={isTavern}, moored={isMoored}");
+            VerboseLogger.SleepSend($"SleepRequest, tavern={isTavern}, moored={isMoored}, house={isHouse}");
 
             // Update state based on whether the rest of the crew is already waiting.
             // N-player (Phase 4): the host starts sleep only once EVERY connected peer is also in bed
@@ -766,11 +784,14 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.SleepRequest,
                     w => PacketSerializer.WriteSleepRequest(w, packet));
 
-            VerboseLogger.SleepRecv($"SleepRequest, tavern={packet.IsTavern}, moored={packet.IsMoored}");
+            VerboseLogger.SleepRecv($"SleepRequest, tavern={packet.IsTavern}, moored={packet.IsMoored}, house={packet.IsHouse}");
 
             _inBedPeers.Add(author);
 
-            // Context mismatch check
+            // Context mismatch check (tavern against anything else). A 0.39 house bed is NOT refused against
+            // a boat bunk: this check only runs on a machine that is already in bed, so a refusal depended on
+            // who lay down last, and the refused crewmate was told nothing. The pairing assembles either way
+            // and the host's own bed decides the kind of sleep (see TransitionToSleeping).
             if (_localPlayerInBed && _isTavernSleep != packet.IsTavern)
             {
                 // Mismatch - show warning, don't track remote as in bed for sleep purposes
@@ -857,10 +878,11 @@ namespace SailwindCoop.Sync
         {
             if (Plugin.IsHost) return; // Host doesn't receive this
 
-            VerboseLogger.SleepRecv($"SleepApproved, tavern={packet.IsTavern}, timeskip={packet.IsTimeskip}");
+            VerboseLogger.SleepRecv($"SleepApproved, tavern={packet.IsTavern}, timeskip={packet.IsTimeskip}, house={packet.IsHouse}");
 
             _isTavernSleep = packet.IsTavern;
             _isTimeskipEnabled = packet.IsTimeskip;
+            _isHouseSleep = packet.IsHouse;
 
             // INDEPENDENT NEEDS: the guest's FallAsleep is blocked, so it never sets Sleep.timeskipSleep
             // itself. Without it, Sun.Update keeps the guest clock at 1x while the host runs 9x (moored),
@@ -988,7 +1010,10 @@ namespace SailwindCoop.Sync
             // instant the crew is rested (~1s of warp left players stuck mid-night). Just record the rest and
             // let the warp continue; the morning DurationCap releases the wake gate. Boat sleep keeps the
             // active "wake the moment the WHOLE crew is fully rested" behavior below.
-            if (_isTavernSleep) return;
+            // A 0.39 house sleep runs to morning too: vanilla suppresses its own rested wake while
+            // GameState.currentHouse is set (Sleep.cs:64), which is what makes a house usable for skipping a
+            // night you are not tired for. Waking the crew the instant they are rested would undo that.
+            if (_isTavernSleep || _isHouseSleep) return;
 
             // INDEPENDENT NEEDS: for BOAT sleep, actively wake the crew the instant EVERYONE is rested,
             // rather than relying on the vanilla boat cap re-firing (the window can be missed during a long
@@ -1057,6 +1082,12 @@ namespace SailwindCoop.Sync
         private void TransitionToSleeping()
         {
             CurrentState = SleepState.Sleeping;
+            // HOST: this is the one place the house context is decided, from the host's own bed, assigned
+            // rather than ORed in. The host's vanilla Sleep.Update is what ends the sleep, and it takes the
+            // morning branch only when the HOST's GameState.currentHouse is set (DurationCapReached reads the
+            // same field). A flag folded in from a crewmate's bed while the host lay in a bunk switched off
+            // every rested-wake path with nothing to replace it. The guest keeps the value SleepApproved gave it.
+            if (Plugin.IsHost) _isHouseSleep = GameState.currentHouse != null;
             // Unscaled so the 60s backstop is REAL time, not 16x warp time.
             // Guard against a Sleeping<->Waiting bounce re-stamping the backstop clock. TransitionToAwake
             // zeroes _sleepingSince when the WHOLE attempt ends; until then a re-entry of TransitionToSleeping
@@ -1071,7 +1102,7 @@ namespace SailwindCoop.Sync
             // Per-peer rested deadline: seed/extend a real-time deadline for every connected peer that has
             // not yet reported rested, so one slow peer can be force-rested before the crew-wide backstop fires.
             // Done on the HOST (quorum owner) for BOAT sleep; tavern runs to the morning gate, so no deadlines.
-            if (Plugin.IsHost && !_isTavernSleep)
+            if (Plugin.IsHost && !_isTavernSleep && !_isHouseSleep)
             {
                 var dlPeers = Plugin.NetworkManager?.ConnectedPeers;
                 if (dlPeers != null)
@@ -1084,7 +1115,9 @@ namespace SailwindCoop.Sync
             // is fully rested. NotificationUi.text is a fixed-scale, non-wrapping world-space
             // TextMesh, so keep this short with explicit line breaks to fit inside the scroll graphic.
             ShowNotification(
-                "Sleeping...\nClick to wake.\nCrew wakes when all rested.",
+                _isTavernSleep ? "Sleeping...\nCrew wakes in the morning."
+                : _isHouseSleep ? "Sleeping...\nClick to wake.\nCrew wakes in the morning."
+                : "Sleeping...\nClick to wake.\nCrew wakes when all rested.",
                 12f);
 
             // Determine if timeskip is enabled.
@@ -1102,16 +1135,23 @@ namespace SailwindCoop.Sync
             // the AllCrewRested quorum auto-woke, and the boat had barely moved. _isTimeskipEnabled drives
             // the guest's Sleep.timeskipSleep (OnSleepApprovedReceived via SleepApproved.IsTimeskip) and the
             // SleepPatches boat-cap scoping (IsTimeskipEnabled).
-            _isTimeskipEnabled = isMoored || _isTavernSleep;
-            // Host: drive Sun's timescale immediately for the moored/tavern case. Vanilla FallAsleep also sets
-            // it there (decomp Sleep.FallAsleep only sets timeskipSleep TRUE for moored/tavern and leaves it
-            // UNTOUCHED otherwise - it never sets it false), but our FallAsleep timing is gated, so set it ONCE
-            // here. Sun.Update re-reads the flag every frame, so this single set holds the 9x for the whole warp;
-            // no per-frame re-assert is needed. NEVER set for an unmoored sleep (vanilla keeps Sun at 1x there).
+            // 0.39: vanilla's FallAsleep now also sets timeskipSleep whenever GameState.currentBoat is null
+            // (Sleep.cs:154), which is every house bed and every bed item placed on land. The host's own
+            // FallAsleep runs vanilla, so the host's Sun goes 9x in those beds whatever is computed here;
+            // mirror the same rule so the crew is told and runs the same clock. The guest does not recompute
+            // this: it keeps the value SleepApproved gave it.
+            if (Plugin.IsHost)
+                _isTimeskipEnabled = isMoored || _isTavernSleep || GameState.currentBoat == null;
+            // Host: drive Sun's timescale immediately. Vanilla FallAsleep also sets it (Sleep.FallAsleep sets
+            // timeskipSleep TRUE for moored, tavern and off-boat sleeps and leaves it UNTOUCHED otherwise - it
+            // never sets it false), but our FallAsleep timing is gated, so set it ONCE here. Sun.Update
+            // re-reads the flag every frame, so this single set holds the 9x for the whole warp; no per-frame
+            // re-assert is needed. NEVER set for an unmoored bunk (vanilla keeps Sun at 1x there).
             // Cleared on every wake by TransitionToAwake (and vanilla WakeUp).
             if (Plugin.IsHost && _isTimeskipEnabled) Sleep.timeskipSleep = true;
 
-            VerboseLogger.SleepEvent($"State -> SLEEPING, tavern={_isTavernSleep}, moored={isMoored}, timeskip={_isTimeskipEnabled}");
+            VerboseLogger.SleepEvent($"State -> SLEEPING, tavern={_isTavernSleep}, house={_isHouseSleep}, moored={isMoored}, timeskip={_isTimeskipEnabled}");
+            Plugin.Log.LogInfo($"[SLEEP] Crew sleep started: tavern={_isTavernSleep}, house={_isHouseSleep}, moored={isMoored}, timeskip={_isTimeskipEnabled}, host={Plugin.IsHost}");
 
             if (Plugin.IsHost)
             {
@@ -1132,13 +1172,14 @@ namespace SailwindCoop.Sync
                 var packet = new SleepApprovedPacket
                 {
                     IsTavern = _isTavernSleep,
-                    IsTimeskip = _isTimeskipEnabled
+                    IsTimeskip = _isTimeskipEnabled,
+                    IsHouse = _isHouseSleep
                 };
 
                 Plugin.NetworkManager.SendToAllReliable(PacketType.SleepApproved, w =>
                     PacketSerializer.WriteSleepApproved(w, packet));
 
-                VerboseLogger.SleepSend($"SleepApproved, tavern={_isTavernSleep}, timeskip={_isTimeskipEnabled}");
+                VerboseLogger.SleepSend($"SleepApproved, tavern={_isTavernSleep}, timeskip={_isTimeskipEnabled}, house={_isHouseSleep}");
 
                 // Boat sleep: the game's Sleep.Update calls FallAsleep (player is inBed). Taverns have NO bed,
                 // so trigger it explicitly now that state==SLEEPING (the FallAsleep patch will allow it).
@@ -1207,6 +1248,7 @@ namespace SailwindCoop.Sync
             _localPlayerInBed = false;
             _inBedPeers.Clear();
             _isTavernSleep = false;
+            _isHouseSleep = false;
             _isTimeskipEnabled = false;
             // TAVERN (unified): clear the tavern flag on EVERY abort/wake path (this is the single chokepoint
             // for WAITING timeout, context-mismatch, partner-left, disconnect, and leave-bed-while-waiting), so
@@ -1580,7 +1622,7 @@ namespace SailwindCoop.Sync
             // TAVERN-TIME: a tavern sleep must run to the vanilla 7-10am morning gate, so don't
             // force-wake the crew just because a leaver completed the rested quorum (mirrors the
             // _isTavernSleep guard in OnGuestRested; the morning DurationCap drives the tavern wake).
-            if (CurrentState == SleepState.Sleeping && Plugin.IsHost && !_isTavernSleep && AllCrewRested && Sleep.instance != null)
+            if (CurrentState == SleepState.Sleeping && Plugin.IsHost && !_isTavernSleep && !_isHouseSleep && AllCrewRested && Sleep.instance != null)
             {
                 VerboseLogger.SleepEvent("OnPeerLeft completed the all-rested quorum; waking remaining crew");
                 bool wasTavern = _isTavernSleep; // capture before WakeUp->TransitionToAwake clears it

@@ -143,11 +143,20 @@ namespace SailwindCoop.Patches
         public static class BoatDamageImpactPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix(BoatDamage __instance)
+            public static bool Prefix(BoatDamage __instance, Collider other)
             {
                 if (Plugin.IsMultiplayer && !Plugin.IsHost)
                 {
                     return false; // Skip on guest
+                }
+
+                // Vanilla exempts items with GetComponent, which misses an item's subcolliders: they sit on child
+                // objects of the ItemRigidbody. A remote apply can put one against the hull, and that then counts
+                // as the ship hitting something.
+                if (Plugin.IsMultiplayer && other != null && other.GetComponentInParent<ItemRigidbody>() != null)
+                {
+                    VerboseLogger.DamageEvent($"Impact ignored for '{__instance.gameObject.name}': item collider '{other.name}'");
+                    return false;
                 }
 
                 // (v0.2.28 Fix C) Shipyard discharge suppression: vanilla DischargeShip instant-teleports

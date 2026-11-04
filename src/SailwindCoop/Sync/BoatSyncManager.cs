@@ -62,6 +62,7 @@ namespace SailwindCoop.Sync
             // Cached references to avoid GetComponent in hot paths
             public Transform CachedBoatTransform;
             public Rigidbody CachedBoatRb;
+            public Crest.BoatProbes CachedProbes;
 
             // Previous-frame values, used to detect floating-origin shifts and position jumps
             public Vector3 PrevBoatPosition;
@@ -182,7 +183,17 @@ namespace SailwindCoop.Sync
         /// the one guest setting then clearing it exactly as before. (Contrast IgnoreRemoteItemDestruction
         /// in ItemSyncManager, which IS host-side global across guests and was ref-counted in Phase 3.)
         /// </summary>
-        public static bool IsJoinInProgress { get; set; }
+        public static bool IsJoinInProgress
+        {
+            get => _isJoinInProgress;
+            set
+            {
+                bool ended = _isJoinInProgress && !value;
+                _isJoinInProgress = value;
+                if (ended) BoatUtility.RefreshHorizonsAfterJoin();
+            }
+        }
+        private static bool _isJoinInProgress;
 
         /// (v0.2.25) True once THIS machine has received a BoatWorldState join snapshot from the host.
         /// Distinct from _hasReceivedState, which per-packet BoatTransform updates also set: the guest
@@ -432,6 +443,7 @@ namespace SailwindCoop.Sync
             {
                 state.CachedBoatTransform = boat;
                 state.CachedBoatRb = boat.GetComponent<Rigidbody>();
+                state.CachedProbes = boat.GetComponent<Crest.BoatProbes>();
                 Plugin.Log.LogInfo($"Guest: Cached new boat: {boat.name}");
             }
 
@@ -496,7 +508,14 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            if (errorMagnitude > TeleportThreshold || (state.SnapOnNextApply && errorMagnitude > 5f))
+            // SHARED SEA: the host's Y is a height on the HOST's water. Our own buoyancy, on our own water,
+            // owns this hull's height; the host's Y is only followed where that cannot press the hull under.
+            // So a stall or escalation snap is judged on, and applied to, XZ only. The 50 m join/recovery
+            // teleport still takes the host's full position.
+            bool seaOwnsY = Plugin.SharedSeaConfig == null || Plugin.SharedSeaConfig.Value;
+            float snapError = seaOwnsY ? new Vector2(positionError.x, positionError.z).magnitude : errorMagnitude;
+
+            if (errorMagnitude > TeleportThreshold || (state.SnapOnNextApply && snapError > 5f))
             {
                 // === TELEPORT MODE ===
                 // Error too large for velocity correction (join/recovery), or the stream stalled >2s and we
@@ -505,7 +524,9 @@ namespace SailwindCoop.Sync
                     $"from={boat.position} to={targetLocalPosition}");
 
                 var prevTeleportPos = boat.position;
-                boat.position = targetLocalPosition;
+                var snapTo = targetLocalPosition;
+                if (seaOwnsY && errorMagnitude <= TeleportThreshold) snapTo.y = boat.position.y;
+                boat.position = snapTo;
                 boat.rotation = extrapolatedRotation;
                 rb.velocity = state.TargetVelocity;
                 rb.angularVelocity = state.TargetAngularVelocity;
@@ -528,6 +549,10 @@ namespace SailwindCoop.Sync
                 float verticalFactor = (Mathf.Abs(positionError.y) > VerticalHardCorrectThreshold)
                     ? 1f
                     : VerticalCorrectionFactor;
+                // Never pull the hull DOWN into our own water: once its buoyancy already carries more than
+                // its weight, the host's lower Y is a disagreement between the two seas, not a real descent.
+                if (seaOwnsY && positionError.y < 0f)
+                    verticalFactor *= DownPullAllowance(state, rb);
                 positionError.y *= verticalFactor;
 
                 // Position correction: add velocity toward target position
@@ -610,7 +635,7 @@ namespace SailwindCoop.Sync
                         if (mooringRopes.ropes[i] != null && mooringRopes.ropes[i].IsMoored()) { ropeMoored = true; break; }
                 }
 
-                if (!ropeMoored && errorMagnitude > SustainedDivergenceMeters)
+                if (!ropeMoored && snapError > SustainedDivergenceMeters)
                 {
                     if (state.DivergenceStartUnscaledTime <= 0f)
                         state.DivergenceStartUnscaledTime = Time.unscaledTime;
@@ -652,6 +677,26 @@ namespace SailwindCoop.Sync
             state.PrevBoatPosition = boat.position;
             state.PrevOffset = offset;
             state.HasPrevValues = true;
+        }
+
+        /// <summary>
+        /// How much of a DOWNWARD vertical correction to apply: 1 while the hull's own buoyancy carries no
+        /// more than its weight, falling to 0 once it carries 1.5 times that (the hull is already pressed
+        /// into our water). Fails open to 1 when the probes cannot say (none, or disabled), and a flooded or
+        /// sunk hull has little buoyancy, so the host can still take a wreck under.
+        /// </summary>
+        private static float DownPullAllowance(BoatSyncState state, Rigidbody rb)
+        {
+            var probes = state.CachedProbes;
+            if (probes == null || !probes.enabled) return 1f;
+            var forces = probes.appliedBuoyancyForces;
+            if (forces == null || forces.Length == 0) return 1f;
+            float weight = rb.mass * Mathf.Abs(Physics.gravity.y);
+            if (weight <= 0f) return 1f;
+
+            float lift = 0f;
+            for (int i = 0; i < forces.Length; i++) lift += forces[i];
+            return Mathf.InverseLerp(1.5f, 1f, lift / weight);
         }
 
         // Throttle the hull dump: the error line can fire every frame during an excursion, and one line per

@@ -493,6 +493,7 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(item.ExtraValue2);
             writer.Write(item.ExtraValue3);
             writer.Write(item.ExtraValue4);
+            writer.Write(item.IsNailed);
 
             // Chart data
             writer.Write(item.HasChartData);
@@ -535,6 +536,7 @@ namespace SailwindCoop.Networking.Packets
             item.ExtraValue2 = reader.ReadSingle();
             item.ExtraValue3 = reader.ReadSingle();
             item.ExtraValue4 = reader.ReadSingle();
+            item.IsNailed = reader.ReadBoolean();
 
             // Chart data
             item.HasChartData = reader.ReadBoolean();
@@ -1000,6 +1002,8 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.HostWavesUp);
             writer.Write(packet.HostTargetInertiaAngle);
             writer.Write(packet.HostWindWavesWeight);
+            writer.Write(packet.HostInertiaAngle0);
+            writer.Write(packet.HostInertiaAngle1);
         }
 
         public static WeatherStatePacket ReadWeatherState(BinaryReader reader)
@@ -1038,6 +1042,8 @@ namespace SailwindCoop.Networking.Packets
             packet.HostWavesUp = reader.ReadByte();
             packet.HostTargetInertiaAngle = reader.ReadSingle();
             packet.HostWindWavesWeight = reader.ReadSingle();
+            packet.HostInertiaAngle0 = reader.ReadSingle();
+            packet.HostInertiaAngle1 = reader.ReadSingle();
 
             return packet;
         }
@@ -1357,6 +1363,7 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.IsTavern);
             writer.Write(packet.IsMoored);
             writer.Write(packet.AuthorId);
+            writer.Write(packet.IsHouse);
         }
 
         public static SleepRequestPacket ReadSleepRequest(BinaryReader reader)
@@ -1365,7 +1372,8 @@ namespace SailwindCoop.Networking.Packets
             {
                 IsTavern = reader.ReadBoolean(),
                 IsMoored = reader.ReadBoolean(),
-                AuthorId = reader.ReadUInt64()
+                AuthorId = reader.ReadUInt64(),
+                IsHouse = reader.ReadBoolean()
             };
         }
 
@@ -1388,6 +1396,7 @@ namespace SailwindCoop.Networking.Packets
         {
             writer.Write(packet.IsTavern);
             writer.Write(packet.IsTimeskip);
+            writer.Write(packet.IsHouse);
         }
 
         public static SleepApprovedPacket ReadSleepApproved(BinaryReader reader)
@@ -1395,7 +1404,8 @@ namespace SailwindCoop.Networking.Packets
             return new SleepApprovedPacket
             {
                 IsTavern = reader.ReadBoolean(),
-                IsTimeskip = reader.ReadBoolean()
+                IsTimeskip = reader.ReadBoolean(),
+                IsHouse = reader.ReadBoolean()
             };
         }
 
@@ -1569,6 +1579,7 @@ namespace SailwindCoop.Networking.Packets
             WriteQuaternion(writer, packet.Rotation);
             writer.Write(packet.ParentBoatName ?? "");
             writer.Write(packet.IsLocalPosition);
+            writer.Write(packet.Attached);
         }
 
         public static ItemDroppedPacket ReadItemDropped(BinaryReader reader)
@@ -1579,8 +1590,50 @@ namespace SailwindCoop.Networking.Packets
                 Position = ReadVector3(reader),
                 Rotation = ReadQuaternion(reader),
                 ParentBoatName = reader.ReadString(),
-                IsLocalPosition = reader.ReadBoolean()
+                IsLocalPosition = reader.ReadBoolean(),
+                Attached = reader.ReadBoolean()
             };
+        }
+
+        public static void WriteBoatItemsRequest(BinaryWriter writer, BoatItemsRequestPacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+        }
+
+        public static BoatItemsRequestPacket ReadBoatItemsRequest(BinaryReader reader)
+        {
+            return new BoatItemsRequestPacket { BoatName = reader.ReadString() };
+        }
+
+        public static void WriteBoatItems(BinaryWriter writer, BoatItemsPacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+            writer.Write(packet.Items?.Length ?? 0);
+            if (packet.Items != null)
+            {
+                foreach (var item in packet.Items)
+                    WriteNetworkSaveData(writer, item);
+            }
+        }
+
+        public static BoatItemsPacket ReadBoatItems(BinaryReader reader)
+        {
+            var packet = new BoatItemsPacket { BoatName = reader.ReadString() };
+            int count = reader.ReadInt32();
+            packet.Items = new NetworkSaveData[count];
+            for (int i = 0; i < count; i++)
+                packet.Items[i] = ReadNetworkSaveData(reader);
+            return packet;
+        }
+
+        public static void WriteItemResyncRequest(BinaryWriter writer, ItemResyncRequestPacket packet)
+        {
+            writer.Write(packet.ItemInstanceId);
+        }
+
+        public static ItemResyncRequestPacket ReadItemResyncRequest(BinaryReader reader)
+        {
+            return new ItemResyncRequestPacket { ItemInstanceId = reader.ReadInt32() };
         }
 
         public static void WriteItemPickupRequest(BinaryWriter writer, ItemPickupRequestPacket packet)

@@ -820,7 +820,7 @@ namespace SailwindCoop.Patches
         /// reach the host.
         ///
         /// HOST: a Prefix is a no-op (vanilla runs: deduct currency[3], set extraSetting, log, gold sound);
-        ///       the Postfix then broadcasts BoatOwnershipChanged to every peer, and the currency deduction
+        ///       the Finalizer then broadcasts BoatOwnershipChanged to every peer, and the currency deduction
         ///       reaches them via the normal CurrencySync polling.
         /// GUEST: the Prefix suppresses the local purchase (don't touch the host-owned wallet) and sends a
         ///        BoatPurchaseRequest to the host, which validates the shared wallet + performs the
@@ -833,7 +833,7 @@ namespace SailwindCoop.Patches
             [HarmonyPrefix]
             public static bool Prefix(PurchasableBoat __instance)
             {
-                // Solo or host: run vanilla purchase (host is authoritative; the Postfix broadcasts).
+                // Solo or host: run vanilla purchase (host is authoritative; the Finalizer broadcasts).
                 if (!Plugin.IsMultiplayer || Plugin.IsHost) return true;
 
                 // Guest: route the purchase through the host instead of charging the shared wallet locally.
@@ -850,16 +850,44 @@ namespace SailwindCoop.Patches
                 return false; // suppress local purchase; host performs it authoritatively
             }
 
-            [HarmonyPostfix]
-            public static void Postfix(PurchasableBoat __instance)
+            /// <summary>
+            /// A FINALIZER, not a postfix: Sailwind 0.39 added a jib-hinge reset to the tail of
+            /// PurchaseBoat that walks BoatRefs.masts, a SPARSE Mast[48] (BoatRefs.cs:15 allocates 48 and
+            /// fills by orderIndex), with no null check. No hull fills all 48 (the largest uses 44), so
+            /// vanilla throws a NullReferenceException on the first empty slot on EVERY boat purchase -
+            /// after the purchase itself has completed. Harmony skips postfixes when the original throws,
+            /// so the ownership broadcast was lost and no crewmate ever saw the boat change hands. A
+            /// finalizer still runs, and we swallow that one NRE so it cannot surface in the button handler.
+            /// </summary>
+            [HarmonyFinalizer]
+            public static System.Exception Finalizer(PurchasableBoat __instance, System.Exception __exception)
             {
-                // Only the host broadcasts; guests never reach here (Prefix returned false).
-                if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
+                // Harmony runs a finalizer even when the Prefix skipped the original, so a guest DOES reach
+                // here (with no exception). This guard is what keeps guests out.
+                if (!Plugin.IsMultiplayer || !Plugin.IsHost) return __exception;
 
                 var saveable = __instance.GetComponent<SaveableObject>();
                 string boatName = saveable != null ? saveable.gameObject.name : __instance.gameObject.name;
 
-                EconomySyncManager.Instance?.SendBoatOwnershipChanged(boatName, true);
+                // Only if vanilla actually got as far as taking ownership - it sets extraSetting before the
+                // throwing loop, so this is true on the 0.39 NRE path and false if it failed earlier.
+                bool owned = saveable == null || saveable.extraSetting;
+                if (owned)
+                {
+                    EconomySyncManager.Instance?.SendBoatOwnershipChanged(boatName, true);
+                }
+
+                // Swallow only the known failure: a boat (houses return before the loop), bought, then the
+                // jib loop. Anything else, including an NRE from before ownership was taken, goes back out.
+                if (__exception is System.NullReferenceException && owned && saveable != null
+                    && __instance.GetComponent<BoatRefs>() != null)
+                {
+                    Plugin.Log.LogWarning($"[ECONOMY] vanilla PurchaseBoat threw after buying '{boatName}' " +
+                        "(0.39 sparse BoatRefs.masts); swallowed, ownership was broadcast.");
+                    return null;
+                }
+
+                return __exception;
             }
         }
 

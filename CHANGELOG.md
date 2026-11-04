@@ -14,6 +14,72 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.5.0 - 2026-11-04
+
+> Built for Sailwind 0.40. **Sailwind Player Model v0.1.6** is included in the zip and installs
+> alongside co-op. None of this release has been played in a live session yet.
+
+### Added
+
+- **Houses work in co-op.** The host or a guest can buy one, the whole crew shares ownership, and
+  people who join later see it. Stored items keep their position and facing, and house front doors
+  sync. The cabin doors on the Large Sanbuq sync on the same path.
+- **The host's bed decides the kind of sleep.** A night in a house bed runs to morning and holds food
+  and water, the same as a tavern night.
+- **Boats and houses coming into range take their contents from the host,** with full state: crate
+  contents, food state, charts and nails. A guest that is told about an item it does not have asks the
+  host for it.
+- **A burning lantern on a crewmate's belt gives light around them,** and toggling it reaches the
+  crew. `Coop.BeltLanternLight` turns the light off.
+- **Cutting a tobacco pack is shared with the crew.**
+- **The host spawns randomized forage for the crew,** so everyone sees it in the same place.
+- **A guest on a different Sailwind version from the host is refused at join** with a message saying
+  so.
+- **A `[NEEDS]` line in `BepInEx/LogOutput.log` every 30 seconds,** for the open report under Known
+  issues below.
+
+### Fixed
+
+- **Placed furniture and items could be missing for a joining player, even after relaunching.** A
+  join applied the host's items to a boat that still counted as out of range from the joiner's saved
+  position, and the game packed them away on the next frame. `Coop.JoinCacheGuard` turns the guard
+  off.
+- **The ship could buck when a crewmate set something down, and that could damage a docked ship.** A
+  crewmate's body kept posing a released item for one frame, pushing it into the hull, and a carried
+  item was weighed at the wrong person, so the drop moved its whole lever in one physics step. Carried
+  items are weighed where the holder stands while the holder is aboard, and the center of mass eases
+  when one is set down. `Coop.RemoteHeldMass` turns that off. Item subcolliders do not count as hull
+  damage.
+- **Wall hooks placed by another player could fall off the wall.** The flag that holds a hook in
+  place was only set on the machine that placed it.
+- **Items hung on hooks could go invisible, and lanterns on hooks gave no light.** A hang whose item
+  or hook was missing left the item hidden and without colliders. The item is restored, the missing
+  part is requested from the host, and the hang applies once both are ready.
+- **Items on a boat could stay missing for a guest after sailing away and coming back.** The game
+  only respawns a boat's items on a kinematic boat, and a guest's boats never are.
+  `Coop.HostItemsOnStreamIn` restores the old behavior.
+- **Items the host bought could fail to appear for guests.**
+- **Items carried out of a house could disappear later,** swept back into the house and deleted when
+  the crew sailed away.
+- **A boat could look half submerged to one player.** Each machine's swell carried its own history in
+  its wave phases, so host and guest had different water at the same spot and the boat corrector pulled
+  the hull under one player's sea. `Coop.SharedSea` turns the shared phases off, and the whole crew
+  should use the same setting.
+- **A boat bought on Sailwind 0.39 or later was not shared with the crew.** The game throws an error at
+  the end of every boat purchase, which skipped the broadcast.
+- **A guest's save could fail after joining.** Items destroyed during a join stayed on the save list.
+- **A resynced item could show up turned to the wrong heading.**
+
+### Changed
+
+- **The Invites button is in the pause menu only.**
+
+### Known issues
+
+- A report of guests losing rest, food and water about three times as fast as the host is open, with
+  no cause found. The `[NEEDS]` lines from both machines would settle it.
+- A guest alone on an island gets randomized forage only while the host is within 300 m of it.
+
 ## v0.4.0 - 2026-09-14
 
 > The **Sailwind Player Model** mod is now included in the zip and installs alongside co-op.

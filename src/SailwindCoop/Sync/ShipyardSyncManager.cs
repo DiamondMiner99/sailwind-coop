@@ -640,7 +640,7 @@ namespace SailwindCoop.Sync
             if (_lastMastsEnabled == null) return true;
 
             // Check masts
-            var currentMasts = data.masts ?? new bool[30];
+            var currentMasts = data.masts ?? new bool[48];
             if (_lastMastsEnabled.Length != currentMasts.Length) return true;
             for (int i = 0; i < currentMasts.Length; i++)
             {
@@ -689,7 +689,7 @@ namespace SailwindCoop.Sync
             var packet = new ShipyardCustomizationPacket
             {
                 BoatName = boat.gameObject.name,
-                MastsEnabled = data.masts ?? new bool[30],
+                MastsEnabled = data.masts ?? new bool[48],
                 Sails = data.sails?.Select(s => new NetworkSailData
                 {
                     PrefabIndex = s.prefabIndex,
@@ -1187,7 +1187,7 @@ namespace SailwindCoop.Sync
 
         private void CacheState(SaveBoatCustomizationData data)
         {
-            _lastMastsEnabled = (bool[])data.masts?.Clone() ?? new bool[30];
+            _lastMastsEnabled = (bool[])data.masts?.Clone() ?? new bool[48];
             _lastSails = data.sails?.Select(s => new NetworkSailData
             {
                 PrefabIndex = s.prefabIndex,
@@ -1240,7 +1240,7 @@ namespace SailwindCoop.Sync
             var localBoat = GameState.currentShipyard != null ? BoatUtility.GetCurrentBoat() : null;
             if (localBoat != null && localBoat.gameObject.name == packet.BoatName)
             {
-                _lastMastsEnabled = (bool[])packet.MastsEnabled?.Clone() ?? new bool[30];
+                _lastMastsEnabled = (bool[])packet.MastsEnabled?.Clone() ?? new bool[48];
                 _lastSails = (NetworkSailData[])packet.Sails?.Clone() ?? new NetworkSailData[0];
                 _lastPartOptions = (int[])packet.PartActiveOptions?.Clone() ?? new int[0];
 
@@ -1274,7 +1274,7 @@ namespace SailwindCoop.Sync
             // Build SaveBoatCustomizationData from packet
             var saveData = new SaveBoatCustomizationData
             {
-                masts = packet.MastsEnabled ?? new bool[30],
+                masts = packet.MastsEnabled ?? new bool[48],
                 sails = packet.Sails?.Select(s => new SaveSailData
                 {
                     prefabIndex = s.PrefabIndex,

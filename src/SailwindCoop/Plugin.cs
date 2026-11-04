@@ -38,9 +38,8 @@ namespace SailwindCoop
         // pre-release suffixes - a "-alpha" tag makes the chainloader reject the plugin ("version is
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
-        // load. This is the v0.3.2 build (chart-ghost stand-down scoped to the kit item, ordering-proof
-        // renderer restore, stale-session teardown); shows as 0.3.2.
-        public const string PluginVersion = "0.4.0";
+        // load.
+        public const string PluginVersion = "0.5.0";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -69,6 +68,11 @@ namespace SailwindCoop
         // (v0.3.0) Kill switch for the guest hull-physics derivation - see the Config.Bind call for why a
         // feature that cannot be tested solo needs one. Read by DamagePatches every frame, so it is live.
         public static ConfigEntry<bool> GuestHullPhysicsConfig { get; private set; }
+        public static ConfigEntry<bool> SharedSeaConfig { get; private set; }
+        public static ConfigEntry<bool> JoinCacheGuardConfig { get; private set; }
+        public static ConfigEntry<bool> HostItemsOnStreamInConfig { get; private set; }
+        public static ConfigEntry<bool> RemoteHeldMassConfig { get; private set; }
+        public static ConfigEntry<bool> BeltLanternLightConfig { get; private set; }
 
         // How a body stands, crouches and leans, and what it looks like, now live in the Sailwind Player
         // Model mod (BodyTuning / HeldToolPose / PlayerModel.LocalAppearance) - its own config file, its own
@@ -229,6 +233,10 @@ namespace SailwindCoop
             Log = Logger;
 
             Log.LogInfo($"{PluginName} v{PluginVersion} loading...");
+            // This build reads GameState.currentHouse, which Sailwind 0.39 added. On an older game the sleep
+            // code fails the first time it runs, with nothing to say why, so say it here.
+            if (typeof(GameState).GetField("currentHouse") == null)
+                Log.LogError($"{PluginName} v{PluginVersion} needs Sailwind 0.39 or newer; this game reports {Application.version}. Crew sleep will not work until the game is updated.");
 
             // (v0.2.32) Mod-compat soft-detect: every module must init in Awake so the composed
             // lobby-data / handshake token (CompatRegistry.ModSignature) is ready before any lobby
@@ -336,6 +344,44 @@ namespace SailwindCoop
                 "everyone else, and a hull that loaded sunk stayed weightless forever. Turn this off only " +
                 "if boats start behaving worse than that for your crew; it restores the old behavior.");
             Log.LogInfo($"GuestHullPhysics: {GuestHullPhysicsConfig.Value}");
+            // Read live, like GuestHullPhysics. The wave half needs the whole crew on the same setting.
+            SharedSeaConfig = Config.Bind(
+                "Coop",
+                "SharedSea",
+                true,
+                "Make the swell the same for the whole crew, and let each machine's own sea carry the boat's " +
+                "height. Default on. Without it every machine draws the same waves in different places, and a " +
+                "crewmate's boat is pulled toward a height that is right on the captain's water and under " +
+                "theirs, which looks like the ship sitting half submerged. The whole crew should use the same " +
+                "setting. Turn it off only if the sea visibly jumps for your crew; that restores the old behavior.");
+            Log.LogInfo($"SharedSea: {SharedSeaConfig.Value}");
+            JoinCacheGuardConfig = Config.Bind(
+                "Coop",
+                "JoinCacheGuard",
+                true,
+                "While joining, keep the game from packing away a boat's items because the boat still counts as " +
+                "out of range. Default on. Without it, a joiner whose own save left the boat more than 1 km from " +
+                "the crew can lose everything on board. Turn it off only if items duplicate when joining.");
+            HostItemsOnStreamInConfig = Config.Bind(
+                "Coop",
+                "HostItemsOnStreamIn",
+                true,
+                "When a boat or house comes back into range, take its contents from the host with their full " +
+                "state: crate contents, food state, charts and nails. Default on. Turning it off restores the " +
+                "old behavior, where a crewmate's boat may never get its items back.");
+            RemoteHeldMassConfig = Config.Bind(
+                "Coop",
+                "RemoteHeldMass",
+                true,
+                "Weigh an item a crewmate is carrying where they are carrying it, and ease the boat's balance " +
+                "when one is set down. Default on. Without it, setting a heavy item down can jerk the ship. " +
+                "Turn it off only if a ship's trim looks wrong while crewmates carry cargo.");
+            BeltLanternLightConfig = Config.Bind(
+                "Coop",
+                "BeltLanternLight",
+                true,
+                "Show the light of a burning lantern on a crewmate's belt. Default on. Turn it off if it costs " +
+                "too much frame rate with a large crew.");
             // The body's pose, held-tool and appearance config live in the Sailwind Player Model mod.
             RemoveRetiredSettings();
 
@@ -1013,9 +1059,17 @@ namespace SailwindCoop
                 {
                     _joinedOverModMismatch = false; // fresh verdict per join attempt
                     var hostVersion = LobbyManager.GetLobbyData("version");
-                    if (!string.IsNullOrEmpty(hostVersion) && hostVersion != PluginVersion)
+                    // GAME VERSION, same gate. Absent on a host older than this build, which reads as
+                    // unknown rather than as a mismatch (the mod version check refuses those anyway).
+                    var hostGame = LobbyManager.GetLobbyData("game");
+                    string ourGame = Application.version;
+                    bool modVersionDiffers = !string.IsNullOrEmpty(hostVersion) && hostVersion != PluginVersion;
+                    bool gameDiffers = !modVersionDiffers && !string.IsNullOrEmpty(hostGame) && hostGame != ourGame;
+                    if (modVersionDiffers || gameDiffers)
                     {
-                        string mismatchMsg = $"Mod version mismatch: the host runs v{hostVersion}, you run v{PluginVersion}. Everyone must install the same version.";
+                        string mismatchMsg = modVersionDiffers
+                            ? $"Mod version mismatch: the host runs v{hostVersion}, you run v{PluginVersion}. Everyone must install the same version."
+                            : $"Sailwind version mismatch: the host runs Sailwind {hostGame}, you run Sailwind {ourGame}. Everyone must be on the same game version.";
                         Log.LogError($"[VERSION] {mismatchMsg}");
                         if (AllowVersionMismatchConfig != null && AllowVersionMismatchConfig.Value)
                         {
@@ -1026,13 +1080,22 @@ namespace SailwindCoop
                             // Title-screen join: the phantom co-op world is already loaded, so a bare
                             // lobby-leave would strand the guest in a dead session - quit cleanly instead.
                             _joinedAsGuest = true;
-                            EndGuestSessionAndQuit(mismatchMsg, "Cannot join: mod versions differ",
-                                new System.Collections.Generic.List<string>
-                                {
-                                    $"The host runs co-op v{hostVersion}.",
-                                    $"You run co-op v{PluginVersion}.",
-                                },
-                                "Everyone must install the same version of the co-op mod. The game will now quit.");
+                            EndGuestSessionAndQuit(mismatchMsg,
+                                modVersionDiffers ? "Cannot join: mod versions differ" : "Cannot join: game versions differ",
+                                modVersionDiffers
+                                    ? new System.Collections.Generic.List<string>
+                                    {
+                                        $"The host runs co-op v{hostVersion}.",
+                                        $"You run co-op v{PluginVersion}.",
+                                    }
+                                    : new System.Collections.Generic.List<string>
+                                    {
+                                        $"The host runs Sailwind {hostGame}.",
+                                        $"You run Sailwind {ourGame}.",
+                                    },
+                                modVersionDiffers
+                                    ? "Everyone must install the same version of the co-op mod. The game will now quit."
+                                    : "Everyone must be on the same version of Sailwind. Let Steam update the game. The game will now quit.");
                             return;
                         }
                         else
@@ -1831,6 +1894,24 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadNailState(reader);
                 ItemSyncManager?.OnRemoteNailState(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.BoatItemsRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadBoatItemsRequest(reader);
+                ItemSyncManager?.OnRemoteBoatItemsRequest(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.BoatItems, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadBoatItems(reader);
+                ItemSyncManager?.OnRemoteBoatItems(packet);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.ItemResyncRequest, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadItemResyncRequest(reader);
+                ItemSyncManager?.OnRemoteItemResyncRequest(packet, sender);
             });
 
             NetworkManager.RegisterHandler(PacketType.ItemHung, (sender, reader) =>
@@ -2733,10 +2814,6 @@ namespace SailwindCoop
             // cleared the counter and no live packet is ever mistaken for silence.
             try { SailwindCoop.Networking.HostLinkWatchdog.Tick(_joinedAsGuest, _endingGuestSession); }
             catch (System.Exception e) { Log.LogWarning("[HostLink] Tick failed: " + e.Message); }
-
-            // Co-op hosting/joining lives in the main + pause menus (see CoopMenu/CoopPauseMenu);
-            // F9 was removed. Keep the menu labels + player list live while a menu is open.
-            SailwindCoop.UI.CoopMenu.Tick();
 
             // 2s ping loop for the F8 overlay: each machine probes its DIRECT peers (star topology,
             // so a guest's ConnectedPeers is just the host, and the host's is every guest). Unreliable

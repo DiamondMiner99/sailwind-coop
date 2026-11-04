@@ -306,6 +306,21 @@ namespace SailwindCoop.Sync
         /// peers this is false (nobody to sync to), so a solo/empty host never spams. At N=1 this is "the single
         /// guest hasn't seen the id".
         /// </summary>
+        /// <summary>Host: spawn-sync an item for any peer that has not been told about it yet.</summary>
+        private void BackfillPeersMissingItem(int instanceId)
+        {
+            if (!Plugin.IsHost || !AnyPeerMissingSyncedItem(instanceId)) return;
+
+            var item = FindItemByInstanceId(instanceId);
+            if (item == null) _remoteHeldItems.TryGetValue(instanceId, out item);
+            var prefab = item != null ? item.GetComponent<SaveablePrefab>() : null;
+            if (prefab == null || prefab.instanceId == 0) return;
+
+            SendItemSpawnedForExisting(item, prefab);
+            MarkSyncedForAllPeers(instanceId);
+            VerboseLogger.ItemSend($"Synced item {instanceId} to guest(s) before relaying a hang (a peer was missing it)");
+        }
+
         private bool AnyPeerMissingSyncedItem(int instanceId)
         {
             var peers = Plugin.NetworkManager?.ConnectedPeers;
@@ -514,7 +529,8 @@ namespace SailwindCoop.Sync
                 IsOnBoat = isOnBoat,
                 BoatName = boatName,
                 LocalPosition = localPos,
-                Rotation = item.transform.rotation,
+                // Same frame as LocalPosition: the receiver applies this as localRotation on a boat.
+                Rotation = isOnBoat ? item.transform.localRotation : item.transform.rotation,
                 MissionIndex = missionIndex
             };
 
@@ -538,6 +554,7 @@ namespace SailwindCoop.Sync
             if (existing != null)
             {
                 Plugin.Log.LogInfo($"[ITEM:RESYNC] Destroying wrong item {existing.name} for ID {packet.InstanceId}");
+                existing.GetComponent<SaveablePrefab>()?.Unregister();
                 Object.Destroy(existing.gameObject);
             }
 
@@ -774,6 +791,9 @@ namespace SailwindCoop.Sync
             // Send a one-shot reliable terminal for locally dropped items once they come to rest,
             // so every machine converges on the dropper's resting pose.
             SweepDropSettleTerminals();
+            DrainBoatItemsAfterJoin();
+            SweepPendingHangs();
+            SweepBeltLanterns();
 
             Plugin.Profiler?.EndMeasure("Items");
         }
@@ -885,6 +905,8 @@ namespace SailwindCoop.Sync
         // reverse index itemId -> carrier, so the visuals loop (which enumerates items by id) can find the
         // carrier for an item in O(1). Kept in lockstep with _syncedHeldItems.
         private readonly Dictionary<int, SteamId> _heldItemCarrier = new Dictionary<int, SteamId>();
+        // carrier -> the item id this machine last handed to that carrier's body. See ReleaseBodyHeldItem.
+        private readonly Dictionary<SteamId, int> _bodyPosedItem = new Dictionary<SteamId, int>();
 
         /// <summary>
         /// Updates the synced position for ONE carrier's held item (called from PlayerPosition handler).
@@ -980,6 +1002,7 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void ClearSyncedHeldItemForCarrier(SteamId carrier)
         {
+            if (_bodyPosedItem.TryGetValue(carrier, out var posedId)) ReleaseBodyHeldItem(posedId);
             if (_syncedHeldItems.TryGetValue(carrier, out var state))
             {
                 if (_heldItemCarrier.TryGetValue(state.ItemId, out var c) && c == carrier)
@@ -994,6 +1017,8 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void ClearSyncedHeldItemById(int itemId)
         {
+            ReleaseBodyHeldItem(itemId);
+
             // (v0.3.1) If we hid this item's renderers because its carrier's chart ghost was drawing it,
             // put them back NOW. The per-frame loop that would normally restore them only walks items
             // still in _remoteHeldItems, so an item that leaves that set while ghosted - a drop, a
@@ -1014,6 +1039,43 @@ namespace SailwindCoop.Sync
                 _heldItemCarrier.Remove(itemId);
                 if (_syncedHeldItems.TryGetValue(carrier, out var state) && state.ItemId == itemId)
                     _syncedHeldItems.Remove(carrier);
+            }
+        }
+
+        /// <summary>
+        /// Take an item out of a crewmate's hands on their Player Model body. The body keeps drawing its last
+        /// held item for one frame after the last SetHeldItemPose, and it moves the item's ItemRigidbody along
+        /// with it. That frame is the one in which a drop, hang or crate insert has just been applied (packets
+        /// are applied in Update, the body poses in LateUpdate), so the body put the freshly re-armed
+        /// rigidbody back at the hand, in the visual frame, inside the hull. The boat was shoved and played
+        /// its impact sound on every machine but the dropper's, on every placement. Clearing the pose here,
+        /// in Update, ends the carry before any LateUpdate runs.
+        /// </summary>
+        private void ReleaseBodyHeldItem(int itemId)
+        {
+            if (_bodyPosedItem.Count == 0) return;
+
+            SteamId carrier = default;
+            bool found = false;
+            foreach (var kv in _bodyPosedItem)
+            {
+                if (kv.Value != itemId) continue;
+                carrier = kv.Key;
+                found = true;
+                break;
+            }
+            if (!found) return;
+
+            _bodyPosedItem.Remove(carrier);
+            try
+            {
+                var avatar = Plugin.RemotePlayerManager?.GetAvatar(carrier);
+                if (avatar != null) avatar.SetHeldItemPose(null, null, Vector3.zero, Quaternion.identity, false);
+                VerboseLogger.ItemApply($"Released {carrier}'s body pose for item {itemId}");
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[ITEM] could not release the held pose for item {itemId}: {e.Message}");
             }
         }
 
@@ -1179,6 +1241,7 @@ namespace SailwindCoop.Sync
                         carrierAvatar.SetHeldItemPose(item.transform,
                             item.itemRigidbodyC != null ? item.itemRigidbodyC.transform : null,
                             worldPos, worldRot, item.big);
+                        _bodyPosedItem[carrier] = kvp.Key;
                         if (carrierAvatar.PlacesHeldItemInHand) continue;
                     }
 
@@ -1435,6 +1498,11 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void Reset()
         {
+            _pendingHangs.Clear();
+            _lastItemResyncRequest.Clear();
+            _boatItemsDuringJoin.Clear();
+            ClearBeltLanternLights();
+
             // (v0.2.38) Withdraw freezes MUST be released first, BEFORE the held-item maps below are
             // cleared - the re-arm guard reads them, and a cleared map makes every frozen item look unheld.
             //
@@ -1490,6 +1558,7 @@ namespace SailwindCoop.Sync
             _itemRegistry.Clear();
             _syncedHeldItems.Clear();
             _heldItemCarrier.Clear();
+            _bodyPosedItem.Clear();
             // _syncedItemIds MUST be cleared here: if it survived into a NEXT session, the host's skip-
             // respawn check would still hold stale ids and a new guest would never receive ItemSpawned for
             // those scene items (item invisible on the guest) - plus it would grow across the process
@@ -1565,6 +1634,10 @@ namespace SailwindCoop.Sync
 
             var prefab = item.GetComponent<SaveablePrefab>();
             if (prefab == null) return;
+
+            // 0.39 houses: a pocketed item's collider is off, so walking out of the house with it never
+            // un-files it, and vanilla's OnEnterInventory only un-files boats. Do it here for the carrier too.
+            if (inventorySlot >= 0) ReleaseHouseLatch(item);
 
             int instanceId = prefab.instanceId;
 
@@ -1943,7 +2016,13 @@ namespace SailwindCoop.Sync
             // Determine parent boat if any
             string parentBoatName = "";
             bool isLocalPosition = false;
-            Quaternion rotation = item.transform.localRotation;  // Use local rotation for consistency
+            // Rotation travels in the same frame as the position: boat-relative for a boat drop, world for
+            // a world drop. It used to be item.transform.localRotation in both cases, which is only right
+            // while the item's parent is that frame. A 0.39 house parents the held item to the house, and
+            // five of the six houses are yawed (34 to 172 degrees), so every item set down in one landed
+            // turned by that much on the other machines. Same for a carried item that had not latched to
+            // the boat it is dropped on.
+            Quaternion rotation = item.transform.rotation;
 
             // Use actual item position for precise placement
             // item.transform.position reflects where the player placed/dropped the item
@@ -1986,6 +2065,7 @@ namespace SailwindCoop.Sync
             {
                 parentBoatName = boatSaveable.gameObject.name;
                 position = dropBoatModel.InverseTransformPoint(dropWorldPos);
+                rotation = Quaternion.Inverse(dropBoatModel.rotation) * item.transform.rotation;
                 isLocalPosition = true;
                 if (item.currentActualBoat == null)
                     VerboseLogger.ItemLocal($"Drop boat-frame fallback: item {instanceId} had no latched boat; using its embark-trigger boat ({parentBoatName})");
@@ -2023,8 +2103,12 @@ namespace SailwindCoop.Sync
                 }
             }
 
+            // A hook that snapped to a wall stays there on every machine. Read here, after the wall-attach delay
+            // in OnLocalDrop and again at the settle terminal, because vanilla OnDrop sets it after the prefix.
+            bool attached = item.wallAttachment && item.itemRigidbodyC != null && item.itemRigidbodyC.attached;
+
             // Send drop packet
-            SendItemDropped(instanceId, position, rotation, parentBoatName, isLocalPosition);
+            SendItemDropped(instanceId, position, rotation, parentBoatName, isLocalPosition, attached);
 
             // Arm the settle-terminal tracker for this LOCAL drop, so a divergent remote fall converges
             // once the item comes to rest here. Only real local drops arm it: remote applies never reach
@@ -2087,7 +2171,7 @@ namespace SailwindCoop.Sync
             });
         }
 
-        private void SendItemDropped(int instanceId, Vector3 position, Quaternion rotation, string parentBoatName, bool isLocalPosition)
+        private void SendItemDropped(int instanceId, Vector3 position, Quaternion rotation, string parentBoatName, bool isLocalPosition, bool attached = false)
         {
             var packet = new ItemDroppedPacket
             {
@@ -2095,7 +2179,8 @@ namespace SailwindCoop.Sync
                 Position = position,
                 Rotation = rotation,
                 ParentBoatName = parentBoatName,
-                IsLocalPosition = isLocalPosition
+                IsLocalPosition = isLocalPosition,
+                Attached = attached
             };
 
             VerboseLogger.ItemSend($"ItemDropped, id={instanceId}, boat={parentBoatName}, pos={position}");
@@ -2252,6 +2337,7 @@ namespace SailwindCoop.Sync
                     FishingSyncManager.SyncExternalRodParts(item, stowed: true);
                     // C: the chip log's bobber/line is world-parented too; park it the same way.
                     ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: true);
+                    ReleaseHouseLatch(item);
                     item.gameObject.SetActive(false);
                     VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} hidden (in remote inventory slot {packet.InventorySlot})");
                 }
@@ -2336,6 +2422,33 @@ namespace SailwindCoop.Sync
             {
                 Plugin.Log.LogWarning($"[ITEM] UpdateMaterial skipped for {itemName}: {e.Message} (expected for kettles - CookableFoodKettle hides the base Awake)");
             }
+        }
+
+        /// <summary>
+        /// Un-file an item from a Sailwind 0.39 house, the way vanilla ShipItem.ExitHouse does. Vanilla only
+        /// runs ExitHouse from the item's own trigger leaving the house collider while the item is held, so
+        /// it only ever happens on the machine of the player carrying it. Everywhere else the item's
+        /// colliders are disabled for the carry (or the object is inactive in a pocket), Unity sends no
+        /// OnTriggerExit for a disabled collider, and the copy keeps parentObject == the house index. That
+        /// field alone decides what BoatLocalItems caches: 1000 m from the house the copy was swept into the
+        /// house cache and destroyed, wherever it had been put down since. Call this when a crewmate takes an
+        /// item, and for a local pocket (vanilla's own OnEnterInventory un-files boats only).
+        /// </summary>
+        internal static void ReleaseHouseLatch(ShipItem item)
+        {
+            if (item == null) return;
+            var prefab = item.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+            var house = BoatUtility.FindHouseBySceneIndex(prefab.GetParentObject());
+            if (house == null) return;
+
+            prefab.SetParentObject(-1);
+            if (item.transform.parent == house.transform)
+            {
+                var world = GameObject.Find("_shifting world")?.transform;
+                if (world != null) item.transform.SetParent(world, worldPositionStays: true);
+            }
+            VerboseLogger.ItemApply($"Item {prefab.instanceId} un-filed from {house.gameObject.name}");
         }
 
         internal static void ClearBoatLatch(ShipItem item)
@@ -2443,6 +2556,9 @@ namespace SailwindCoop.Sync
             if (item == null)
             {
                 Plugin.Log.LogWarning($"OnRemoteItemDropped: item {packet.ItemInstanceId} not found");
+                // A release is the last word on an item we never received (a shop purchase whose correlation
+                // missed, a stream-in we were not there for). Ask now, while the host has it at rest.
+                RequestItemResync(packet.ItemInstanceId);
                 return;
             }
 
@@ -2596,6 +2712,15 @@ namespace SailwindCoop.Sync
                         catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not set boat-latch fields on dropped boat item {packet.ItemInstanceId}: {e.Message}"); }
                     }
 
+                    // File the item under this boat. That is vanilla EnterBoat's remaining job
+                    // (ShipItem.cs:442), and the latch seeding above means EnterBoat never runs here. Without
+                    // it the copy kept whatever it was filed under before the carry: a house (swept back into
+                    // the house cache 1000 m later), another boat, or nothing, so the boat's own item cache
+                    // never held it. Values below -1 are vanilla's cache-out flags; leave those alone.
+                    var boatDropPrefab = item.GetComponent<SaveablePrefab>();
+                    if (boatDropPrefab != null && boatDropPrefab.GetParentObject() >= -1)
+                        boatDropPrefab.SetParentObject(boat.sceneIndex);
+
                     // 2. Parent ShipItem to visual boat (boatModel)
                     item.transform.SetParent(boatModel, worldPositionStays: false);
 
@@ -2657,6 +2782,7 @@ namespace SailwindCoop.Sync
                         {
                             var boatMass = boatModel.parent != null ? boatModel.parent.GetComponent<BoatMass>() : null;
                             boatMass?.AddItem(item.itemRigidbodyC);
+                            Patches.BoatPhysicsPatches.BoatMassBalanceEasePatch.NoteItemSetDown(boatMass);
                         }
                         catch (System.Exception e) { Plugin.Log.LogWarning($"[ITEM] could not add dropped boat item {packet.ItemInstanceId} to BoatMass: {e.Message}"); }
 
@@ -2676,6 +2802,9 @@ namespace SailwindCoop.Sync
                     // currentBoatCollider, removes BoatMass cargo weight, resets onBoat) - the old manual
                     // null-out left currentBoatCollider stale, permanently blocking re-latch onto the same
                     // boat (the 2026-07-02 moored-brig sink). Positioning below overrides ExitBoat's own.
+                    var leftBoatMass = item.currentActualBoat != null && item.currentActualBoat.parent != null
+                        ? item.currentActualBoat.parent.GetComponent<BoatMass>() : null;
+                    Patches.BoatPhysicsPatches.BoatMassBalanceEasePatch.NoteItemSetDown(leftBoatMass);
                     ClearBoatLatch(item);
 
                     // Parent to shifting world
@@ -2684,6 +2813,25 @@ namespace SailwindCoop.Sync
                     item.transform.SetParent(shiftingWorld, worldPositionStays: false);
                     item.transform.position = worldPos;
                     item.transform.rotation = packet.Rotation;
+
+                    // 0.39 houses: file the item by where it was put down, which is what vanilla EnterHouse
+                    // does from the item's trigger. Asked by position because a trigger enter is not
+                    // guaranteed to fire here for a collider that is re-enabled already inside the house, and
+                    // the settle resend lands in this branch with no new enter at all.
+                    var landDropPrefab = item.GetComponent<SaveablePrefab>();
+                    if (landDropPrefab != null && landDropPrefab.GetParentObject() >= -1)
+                    {
+                        var house = BoatUtility.FindHouseContaining(worldPos);
+                        if (house != null)
+                        {
+                            landDropPrefab.SetParentObject(house.sceneIndex);
+                            item.transform.SetParent(house.transform, worldPositionStays: true);
+                        }
+                        else if (BoatUtility.FindHouseBySceneIndex(landDropPrefab.GetParentObject()) != null)
+                        {
+                            landDropPrefab.SetParentObject(-1);
+                        }
+                    }
 
                     if (item.itemRigidbodyC != null)
                     {
@@ -2715,6 +2863,16 @@ namespace SailwindCoop.Sync
                     VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} land drop at {worldPos}");
                 }
 
+                // A wall hook is held in place by this flag alone, and vanilla only sets it on the machine that
+                // placed the hook. Without it the hook is a loose body here and falls off the wall, taking
+                // whatever hangs on it along. It also has to be cleared for a hook set down on the floor, because
+                // a loaded hook starts out attached.
+                if (item.wallAttachment && item.itemRigidbodyC != null)
+                {
+                    item.itemRigidbodyC.attached = packet.Attached;
+                    VerboseLogger.ItemApply($"Item {packet.ItemInstanceId} wall attached={packet.Attached}");
+                }
+
                 // Reset layer to Default (0) for raycast interaction.
                 // The game's DropItem() sets layer=0; remote drops must do the same or
                 // dropped items stay on the IgnoreRaycast layer and can't be clicked
@@ -2724,6 +2882,406 @@ namespace SailwindCoop.Sync
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        // === Items a guest never received ===
+
+        private const float ItemResyncRequestCooldown = 5f;
+        private readonly Dictionary<int, float> _lastItemResyncRequest = new Dictionary<int, float>();
+
+        /// <summary>Guest: ask the host for one item. Limited per id, so a burst of packets asks once.</summary>
+        private void RequestItemResync(int instanceId)
+        {
+            if (Plugin.IsHost || instanceId == 0) return;
+
+            float now = Time.unscaledTime;
+            if (_lastItemResyncRequest.TryGetValue(instanceId, out float last) && now - last < ItemResyncRequestCooldown)
+                return;
+            _lastItemResyncRequest[instanceId] = now;
+
+            VerboseLogger.ItemSend($"ItemResyncRequest, id={instanceId}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.ItemResyncRequest, w =>
+                PacketSerializer.WriteItemResyncRequest(w, new ItemResyncRequestPacket { ItemInstanceId = instanceId }));
+        }
+
+        /// <summary>
+        /// Host: answer a guest that is missing an item. An item in a hand or a pocket gets no answer, because
+        /// its pose is not settled and the guest asks again when it is released.
+        /// </summary>
+        public void OnRemoteItemResyncRequest(ItemResyncRequestPacket packet, SteamId sender)
+        {
+            if (!Plugin.IsHost) return;
+
+            var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (item == null || item.held != null)
+            {
+                VerboseLogger.ItemApply($"ItemResyncRequest for {packet.ItemInstanceId} from {sender}: not at rest here, no answer");
+                return;
+            }
+
+            var prefab = item.GetComponent<SaveablePrefab>();
+            if (prefab == null || prefab.instanceId == 0) return;
+
+            RegisterBoatItems(sender, new[] { packet.ItemInstanceId });
+
+            // Not ItemResync: that destroys whatever the guest has under the id, and this answer can land after the
+            // guest got the item another way and hung it or picked it up. Both of these skip an id it already has.
+            var owner = prefab.GetParentObject() > 0 ? SaveLoadManager.instance.GetObject(prefab.GetParentObject()) : null;
+            if (owner != null)
+            {
+                var one = new BoatItemsPacket { BoatName = owner.gameObject.name, Items = new[] { BoatStateCollector.ConvertFiledItem(prefab, owner) } };
+                Plugin.NetworkManager.SendReliable(sender, PacketType.BoatItems, w => PacketSerializer.WriteBoatItems(w, one));
+            }
+            else
+            {
+                var spawn = BuildItemSpawnedPacket(item, prefab);
+                Plugin.NetworkManager.SendReliable(sender, PacketType.ItemSpawned, w => PacketSerializer.WriteItemSpawned(w, spawn));
+            }
+        }
+
+        /// <summary>
+        /// Host: is this id in one of our own boat or house caches? Such an item is real but not live here until we
+        /// come back in range, so a crewmate's refused pickup says nothing about it being a ghost.
+        /// </summary>
+        private static bool IsInHostItemCache(int instanceId)
+        {
+            var objects = SaveLoadManager.instance?.GetCurrentObjects();
+            if (objects == null) return false;
+            foreach (var obj in objects)
+            {
+                var cached = obj != null ? obj.GetComponent<BoatLocalItems>()?.GetCachedItems() : null;
+                if (cached == null) continue;
+                foreach (var data in cached)
+                    if (data != null && data.instanceId == instanceId) return true;
+            }
+            return false;
+        }
+
+        // === Boat and house contents on stream-in ===
+
+        // Items per packet. Charts make an item's size uneven; this stays far below the 256 KB packet limit.
+        private const int BoatItemsPerPacket = 32;
+
+        // BoatItems that land during a join would be cleared along with the guest's old items, and the snapshot
+        // predates them, so they wait for the join to finish.
+        private readonly List<BoatItemsPacket> _boatItemsDuringJoin = new List<BoatItemsPacket>();
+
+        /// <summary>Guest: a boat or house streamed in; its local cache was discarded, so ask the host.</summary>
+        public void RequestBoatItems(SaveableObject owner)
+        {
+            if (Plugin.IsHost || owner == null) return;
+
+            string boatName = owner.gameObject.name;
+            VerboseLogger.ItemSend($"BoatItemsRequest, boat={boatName}");
+            Plugin.NetworkManager.SendToAllReliable(PacketType.BoatItemsRequest, w =>
+                PacketSerializer.WriteBoatItemsRequest(w, new BoatItemsRequestPacket { BoatName = boatName }));
+        }
+
+        /// <summary>Host: send a guest what is filed under a boat or house, from the world or from the cache.</summary>
+        public void OnRemoteBoatItemsRequest(BoatItemsRequestPacket packet, SteamId sender)
+        {
+            if (!Plugin.IsHost) return;
+
+            var owner = BoatUtility.FindPurchasableByName(packet.BoatName);
+            if (owner == null)
+            {
+                Plugin.Log.LogWarning($"[ITEM] BoatItemsRequest for unknown '{packet.BoatName}' from {sender}");
+                return;
+            }
+
+            // Both, when the host is far away: the cache, plus anything a crewmate has put down there since. A live
+            // copy wins, being the newer of the two.
+            var live = BoatStateCollector.CollectFiledItems(owner);
+            var liveIds = new HashSet<int>(live.Select(i => i.InstanceId));
+            var cached = BoatStateCollector.ConvertCachedItems(owner.GetComponent<BoatLocalItems>()?.GetCachedItems(), owner);
+            var items = BoatStateCollector.OmitOrphanedCrateContents(live.Concat(cached.Where(c => !liveIds.Contains(c.InstanceId))).ToArray());
+
+            RegisterBoatItems(sender, items.Select(i => i.InstanceId).ToList());
+
+            Plugin.Log.LogInfo($"[ITEM] Sending {items.Length} item(s) of {packet.BoatName} to {sender} ({live.Length} live, {cached.Length} cached)");
+            ForEachBoatItemsPacket(packet.BoatName, items, chunk =>
+                Plugin.NetworkManager.SendReliable(sender, PacketType.BoatItems, w => PacketSerializer.WriteBoatItems(w, chunk)));
+        }
+
+        /// <summary>Host: its own copy of a boat or house just streamed in; give the crew the full state.</summary>
+        public void BroadcastBoatItems(SaveableObject owner, NetworkSaveData[] items)
+        {
+            if (!Plugin.IsHost || owner == null || items == null || items.Length == 0) return;
+
+            foreach (var item in items)
+            {
+                MarkSyncedForAllPeers(item.InstanceId);
+                _itemRegistry[item.InstanceId] = item.PrefabIndex;
+            }
+
+            ForEachBoatItemsPacket(owner.gameObject.name, items, chunk =>
+                Plugin.NetworkManager.SendToAllReliable(PacketType.BoatItems, w => PacketSerializer.WriteBoatItems(w, chunk)));
+        }
+
+        // Crates first, so a crate exists before the packet that names it as a container.
+        private static void ForEachBoatItemsPacket(string boatName, NetworkSaveData[] items, System.Action<BoatItemsPacket> send)
+        {
+            var sorted = items.OrderBy(i => i.CrateId > 0 ? 1 : 0).ToArray();
+            for (int start = 0; start < sorted.Length; start += BoatItemsPerPacket)
+            {
+                int count = Mathf.Min(BoatItemsPerPacket, sorted.Length - start);
+                var slice = new NetworkSaveData[count];
+                System.Array.Copy(sorted, start, slice, 0, count);
+                send(new BoatItemsPacket { BoatName = boatName, Items = slice });
+            }
+        }
+
+        /// <summary>
+        /// Guest: spawn what we do not already have. Ids already in the world are left alone, so this is safe to
+        /// receive in any order with a live ItemSpawned or ItemDropped for the same item.
+        /// </summary>
+        public void OnRemoteBoatItems(BoatItemsPacket packet)
+        {
+            if (Plugin.IsHost) return;
+
+            if (BoatSyncManager.IsJoinInProgress)
+            {
+                _boatItemsDuringJoin.Add(packet);
+                return;
+            }
+
+            VerboseLogger.ItemRecv($"BoatItems, boat={packet.BoatName}, count={packet.Items?.Length ?? 0}");
+            var owner = BoatUtility.FindPurchasableByName(packet.BoatName);
+            if (owner == null || packet.Items == null)
+            {
+                Plugin.Log.LogWarning($"[ITEM] BoatItems for unknown '{packet.BoatName}'");
+                return;
+            }
+
+            // The save registry also holds pocketed (inactive) items, which a scene scan would miss.
+            var live = new HashSet<int>();
+            var registered = SaveLoadManager.instance?.GetCurrentPrefabs();
+            if (registered != null)
+            {
+                foreach (var prefab in registered)
+                    if (prefab != null && prefab.instanceId > 0) live.Add(prefab.instanceId);
+            }
+
+            var spawned = new List<int>();
+            IsApplyingRemoteState = true;
+            try
+            {
+                foreach (var item in packet.Items)
+                {
+                    if (item.InstanceId <= 0 || live.Contains(item.InstanceId)) continue;
+                    if (FindItemByInstanceId(item.InstanceId) != null || _remoteHeldItems.ContainsKey(item.InstanceId)) continue;
+
+                    try
+                    {
+                        // No id set here on purpose: that turns on SpawnItem's join-time orphan cleanup, which
+                        // would delete a stacked item of the same type that is simply not in this packet.
+                        if (BoatStateApplicator.SpawnItem(owner, item) != null)
+                            spawned.Add(item.InstanceId);
+                    }
+                    catch (System.Exception e)
+                    {
+                        Plugin.Log.LogError($"[ITEM] Could not spawn {item.InstanceId} (prefab {item.PrefabIndex}) on {packet.BoatName}: {e}");
+                    }
+                }
+            }
+            finally
+            {
+                IsApplyingRemoteState = false;
+            }
+
+            if (spawned.Count > 0)
+            {
+                RegisterBoatItems(spawned);
+                Plugin.Log.LogInfo($"[ITEM] Received {spawned.Count} item(s) for {packet.BoatName} from the host");
+            }
+        }
+
+        private void DrainBoatItemsAfterJoin()
+        {
+            if (_boatItemsDuringJoin.Count == 0 || BoatSyncManager.IsJoinInProgress) return;
+
+            var waiting = _boatItemsDuringJoin.ToArray();
+            _boatItemsDuringJoin.Clear();
+            foreach (var packet in waiting)
+                OnRemoteBoatItems(packet);
+        }
+
+        // === Hangs whose item or hook has not arrived yet ===
+
+        private struct PendingHang { public int HookId; public float Time; }
+        private readonly Dictionary<int, PendingHang> _pendingHangs = new Dictionary<int, PendingHang>();
+        private readonly List<int> _pendingHangScratch = new List<int>();
+        private const float PendingHangTimeout = 15f;
+        private const float PendingHangPollInterval = 0.5f;
+        private float _nextPendingHangPoll;
+
+        private void SweepPendingHangs()
+        {
+            if (_pendingHangs.Count == 0 || Time.unscaledTime < _nextPendingHangPoll) return;
+            _nextPendingHangPoll = Time.unscaledTime + PendingHangPollInterval;
+
+            _pendingHangScratch.Clear();
+            _pendingHangScratch.AddRange(_pendingHangs.Keys);
+            foreach (int itemId in _pendingHangScratch)
+            {
+                var pending = _pendingHangs[itemId];
+                if (Time.unscaledTime - pending.Time > PendingHangTimeout)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] Gave up hanging item {itemId} on hook {pending.HookId}");
+                    _pendingHangs.Remove(itemId);
+                    continue;
+                }
+
+                var item = FindItemByInstanceId(itemId);
+                var hook = FindItemByInstanceId(pending.HookId);
+                if (item == null || hook == null) continue;
+                if (IsHeldByLocalPlayer(item, itemId) || _heldItems.ContainsKey(itemId))
+                {
+                    _pendingHangs.Remove(itemId);
+                    continue;
+                }
+
+                var hangable = item.GetComponent<HangableItem>();
+                if (hangable == null || hangable.IsHanging())
+                {
+                    _pendingHangs.Remove(itemId);
+                    continue;
+                }
+                if (!CanHangNow(item, hook)) continue;
+
+                _pendingHangs.Remove(itemId);
+                IsApplyingRemoteState = true;
+                try
+                {
+                    RearmRemoteHeldItemPhysics(item, itemId);
+                    hangable.ConnectJoint(hook.GetComponent<Collider>());
+                    VerboseLogger.ItemApply($"Hung item {itemId} on hook {pending.HookId} after both were ready");
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] Could not hang item {itemId} on hook {pending.HookId}: {e.Message}");
+                }
+                finally
+                {
+                    IsApplyingRemoteState = false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// ConnectJoint needs both rigidbodies, which ItemRigidbody.Start creates a frame or more after a spawn, and
+        /// it marks the hook occupied before it first touches the item's. Called too early it throws there, leaving a
+        /// hook that is occupied by nothing and that throws when picked up. A hook that really is occupied would pin a
+        /// second item in place, and removing that item would take the first one's joint with it.
+        /// </summary>
+        private static bool CanHangNow(ShipItem item, ShipItem hook)
+        {
+            if (item.itemRigidbodyC == null || item.itemRigidbodyC.GetBody() == null) return false;
+            if (hook.itemRigidbodyC == null || hook.itemRigidbodyC.GetBody() == null) return false;
+
+            var lampHook = hook.GetComponent<ShipItemLampHook>();
+            return lampHook != null && !HarmonyLib.Traverse.Create(lampHook).Field("occupied").GetValue<bool>();
+        }
+
+        // === Light from a lantern on a crewmate's belt ===
+        //
+        // Vanilla keeps a belted lantern active so its light shines from the slot. On every other machine the
+        // belted item is SetActive(false), which also turns its light off. The item has to stay hidden, so the
+        // crewmate carries a stand-in light. Polled from the holder maps instead of hooked at each of the hide
+        // sites, so a pickup, drop, disconnect or burnout cannot leave one on.
+        private const float BeltLanternPollInterval = 0.5f;
+        private static readonly Vector3 BeltLanternOffset = new Vector3(0f, 0f, 0.3f); // ahead of the body, or it shadows itself
+        private readonly Dictionary<ulong, Light> _beltLanternLights = new Dictionary<ulong, Light>();
+        private readonly Dictionary<ulong, ShipItemLight> _beltLanternScratch = new Dictionary<ulong, ShipItemLight>();
+        private readonly List<ulong> _beltLanternRemovalScratch = new List<ulong>();
+        private float _nextBeltLanternPoll;
+
+        private void SweepBeltLanterns()
+        {
+            if (Time.unscaledTime < _nextBeltLanternPoll) return;
+            _nextBeltLanternPoll = Time.unscaledTime + BeltLanternPollInterval;
+
+            _beltLanternScratch.Clear();
+            if (Plugin.BeltLanternLightConfig == null || Plugin.BeltLanternLightConfig.Value)
+            {
+                foreach (var kvp in _remoteHeldItems)
+                {
+                    var lamp = kvp.Value as ShipItemLight;
+                    if (lamp == null || lamp.gameObject.activeSelf) continue;
+                    if (lamp.amount < 1f || lamp.health <= 0f) continue; // SetLight keeps amount at 1 while lit
+                    if (!_heldItems.TryGetValue(kvp.Key, out var holder) || holder == SteamClient.SteamId) continue;
+                    _beltLanternScratch[holder.Value] = lamp;
+                }
+            }
+
+            foreach (var kvp in _beltLanternScratch)
+            {
+                _beltLanternLights.TryGetValue(kvp.Key, out var standIn);
+                if (standIn == null)
+                {
+                    var capsule = Player.RemotePlayerManager.Instance?.GetAvatar(new SteamId { Value = kvp.Key })?.GetRemoteCapsule();
+                    if (capsule == null) continue;
+                    var go = new GameObject("CoopBeltLanternLight");
+                    go.transform.SetParent(capsule, worldPositionStays: false);
+                    go.transform.localPosition = BeltLanternOffset;
+                    standIn = go.AddComponent<Light>();
+                    _beltLanternLights[kvp.Key] = standIn;
+                }
+                CopyLanternLight(kvp.Value, standIn);
+            }
+
+            _beltLanternRemovalScratch.Clear();
+            foreach (var kvp in _beltLanternLights)
+                if (kvp.Value == null || !_beltLanternScratch.ContainsKey(kvp.Key))
+                    _beltLanternRemovalScratch.Add(kvp.Key);
+            foreach (var id in _beltLanternRemovalScratch)
+            {
+                if (_beltLanternLights[id] != null) Object.Destroy(_beltLanternLights[id].gameObject);
+                _beltLanternLights.Remove(id);
+            }
+        }
+
+        private static void CopyLanternLight(ShipItemLight lamp, Light standIn)
+        {
+            try
+            {
+                var source = HarmonyLib.Traverse.Create(lamp).Field("light").GetValue<Light>();
+                if (source == null) return;
+                standIn.type = source.type;
+                standIn.color = source.color;
+                standIn.intensity = source.intensity;
+                standIn.range = source.range;
+                standIn.cullingMask = source.cullingMask;
+                standIn.renderMode = source.renderMode;
+                standIn.shadows = Settings.lanternShadows ? LightShadows.Soft : LightShadows.None;
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[ITEM] Could not copy a belt lantern's light: {e.Message}");
+            }
+        }
+
+        private void ClearBeltLanternLights()
+        {
+            foreach (var standIn in _beltLanternLights.Values)
+                if (standIn != null) Object.Destroy(standIn.gameObject);
+            _beltLanternLights.Clear();
+        }
+
+        /// <summary>True when the crewmate holding this item reports standing on the named boat root.</summary>
+        public bool HolderIsAboard(ShipItem item, string boatRootName)
+        {
+            var prefab = item != null ? item.GetComponent<SaveablePrefab>() : null;
+            if (prefab == null || !_heldItems.TryGetValue(prefab.instanceId, out var holder)) return false;
+            var avatar = Player.RemotePlayerManager.Instance?.GetAvatar(holder);
+            return avatar != null && avatar.CurrentBoatName == boatRootName;
+        }
+
+        /// <summary>True while this machine shows another player holding the item, as hand or belt.</summary>
+        public bool IsRemoteHeld(ShipItem item)
+        {
+            var prefab = item != null ? item.GetComponent<SaveablePrefab>() : null;
+            return prefab != null && _remoteHeldItems.ContainsKey(prefab.instanceId);
         }
 
 
@@ -3000,6 +3558,7 @@ namespace SailwindCoop.Sync
                 // the hide, or it stays a live non-kinematic rigidbody and falls through the earth)
                 FishingSyncManager.SyncExternalRodParts(item, stowed: true);
                 ChipLogSyncManager.SyncExternalChipLogParts(item, stowed: true);
+                ReleaseHouseLatch(item);
                 item.gameObject.SetActive(false);
                 VerboseLogger.ItemApply($"Host hiding guest item {packet.ItemInstanceId} (in inventory slot {packet.InventorySlot})");
             }
@@ -3096,6 +3655,13 @@ namespace SailwindCoop.Sync
             if (count <= GhostPurgeDenyThreshold)
             {
                 perId[instanceId] = count;
+                return;
+            }
+
+            if (IsInHostItemCache(instanceId))
+            {
+                perId[instanceId] = GhostPurgeDenyThreshold;
+                VerboseLogger.ItemApply($"GhostItemPurge SKIPPED for id={instanceId} -> {sender}: in the host's own item cache");
                 return;
             }
 
@@ -3335,6 +3901,9 @@ namespace SailwindCoop.Sync
         /// </summary>
         private void DisarmRemoteHeldItemPhysics(ShipItem item, int instanceId)
         {
+            // 0.39 houses: the trigger disable below means vanilla's ExitHouse can never run for this carry.
+            ReleaseHouseLatch(item);
+
             // Set held to non-null so ShipItem thinks item is held
             item.held = Object.FindObjectOfType<GoPointer>();
 
@@ -4174,7 +4743,12 @@ namespace SailwindCoop.Sync
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.LightState, w =>
                     PacketSerializer.WriteLightState(w, packet));
 
+            // A lantern on a crewmate's belt is hidden here, and the scene scan cannot see a hidden item.
             var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (item == null && !_remoteHeldItems.TryGetValue(packet.ItemInstanceId, out item))
+                item = null;
+            if (item == null)
+                item = FindInactiveItemByInstanceId(packet.ItemInstanceId);
             if (item == null)
             {
                 Plugin.Log.LogWarning($"OnRemoteLightStateChanged: item {packet.ItemInstanceId} not found");
@@ -4473,10 +5047,15 @@ namespace SailwindCoop.Sync
         {
             VerboseLogger.ItemRecv($"ItemHung, item={packet.ItemInstanceId}, hook={packet.HookInstanceId}");
 
-            // Star-relay: forward to the other guests (reliable).
+            // Star-relay: forward to the other guests (reliable). A hang sends no ItemDropped, so this is the one
+            // chance to give a guest the item or hook it has never seen, same as the drop relay does.
             if (Plugin.IsHost)
+            {
+                BackfillPeersMissingItem(packet.HookInstanceId);
+                BackfillPeersMissingItem(packet.ItemInstanceId);
                 Plugin.NetworkManager.SendToAllExcept(sender, PacketType.ItemHung, w =>
                     PacketSerializer.WriteItemHung(w, packet));
+            }
 
             // LOCAL-HOLD RACE GUARD: a hang can race a local grab (the hanger's reliable ItemHung lands
             // after THIS player already snatched the item). Applying it would stomp live vanilla held
@@ -4491,6 +5070,10 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // Read before the bookkeeping below: an item from a crewmate's belt is hidden, and this is the only
+            // record of it the scene scan cannot miss.
+            _remoteHeldItems.TryGetValue(packet.ItemInstanceId, out var hungHeldCopy);
+
             // Clear held state - item is no longer held when hung on hook
             _heldItems.Remove(packet.ItemInstanceId);
             _remoteHeldItems.Remove(packet.ItemInstanceId);
@@ -4502,11 +5085,26 @@ namespace SailwindCoop.Sync
             RemoveFromGuestInventory(packet.ItemInstanceId);
 
             var item = FindItemByInstanceId(packet.ItemInstanceId);
+            if (item == null) item = hungHeldCopy;
+            if (item == null) item = FindInactiveItemByInstanceId(packet.ItemInstanceId);
             var hook = FindItemByInstanceId(packet.HookInstanceId);
 
             if (item == null || hook == null)
             {
-                Plugin.Log.LogWarning($"OnRemoteItemHung: item or hook not found");
+                Plugin.Log.LogWarning($"OnRemoteItemHung: item or hook not found (item={item != null}, hook={hook != null})");
+
+                // Never leave the item as it was: stuck on a crewmate's hold, with no colliders, and hidden if it
+                // came from a belt. That is an item nobody on this machine can see or touch.
+                if (item != null)
+                {
+                    IsApplyingRemoteState = true;
+                    try { RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId); }
+                    finally { IsApplyingRemoteState = false; }
+                }
+
+                if (item == null) RequestItemResync(packet.ItemInstanceId);
+                if (hook == null) RequestItemResync(packet.HookInstanceId);
+                _pendingHangs[packet.ItemInstanceId] = new PendingHang { HookId = packet.HookInstanceId, Time = Time.unscaledTime };
                 return;
             }
 
@@ -4514,6 +5112,17 @@ namespace SailwindCoop.Sync
             if (hangable == null)
             {
                 Plugin.Log.LogWarning($"OnRemoteItemHung: item {packet.ItemInstanceId} is not hangable");
+                return;
+            }
+
+            if (!CanHangNow(item, hook))
+            {
+                // Same-frame spawn and hang: the backfill above sends them together. Visible and touchable now,
+                // hung as soon as both are ready.
+                IsApplyingRemoteState = true;
+                try { RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId); }
+                finally { IsApplyingRemoteState = false; }
+                _pendingHangs[packet.ItemInstanceId] = new PendingHang { HookId = packet.HookInstanceId, Time = Time.unscaledTime };
                 return;
             }
 
@@ -4540,6 +5149,7 @@ namespace SailwindCoop.Sync
         public void OnRemoteItemUnhung(ItemUnhungPacket packet, SteamId sender = default)
         {
             VerboseLogger.ItemRecv($"ItemUnhung, item={packet.ItemInstanceId}");
+            _pendingHangs.Remove(packet.ItemInstanceId);
 
             // Star-relay: forward to the other guests (reliable).
             if (Plugin.IsHost)
@@ -5673,6 +6283,7 @@ namespace SailwindCoop.Sync
             // was a remote carrier here). At N=1 this is the single slot.
             _syncedHeldItems.Clear();
             _heldItemCarrier.Clear();
+            _bodyPosedItem.Clear();
         }
 
         /// <summary>

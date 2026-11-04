@@ -163,7 +163,12 @@ namespace SailwindCoop.Patches
     {
         static bool Prefix(BoatLocalItems __instance)
         {
-            if (!Sync.BoatSyncManager.IsJoinInProgress) return true; // outside the join window: vanilla spawn.
+            if (!Sync.BoatSyncManager.IsJoinInProgress)
+            {
+                // Outside the join window: vanilla spawn, minus anything that is already in the world.
+                DropEntriesAlreadyLive(__instance);
+                return true;
+            }
 
             // During the join: skip the spawn (false = don't run original). The vanilla caller sets
             // itemsLoaded=true right after, so ALSO null cachedItems here to keep BoatLocalItems' invariant
@@ -172,6 +177,42 @@ namespace SailwindCoop.Patches
             // again, which could strand a secondary boat's host items that cached out->in during the join.
             try { HarmonyLib.Traverse.Create(__instance).Field("cachedItems").SetValue(null); } catch { }
             return false;
+        }
+
+        /// <summary>
+        /// RETURN-VISIT DUPLICATES. A house (or a boat left in port) streams in on each machine on that
+        /// machine's own distance check, and while it is far the check only runs every 10 to 20 seconds.
+        /// When the host's check fires first, its stream-in broadcast makes every guest spawn the items from
+        /// ItemSpawned; the guest's own cache then spawns the same instance ids again, because vanilla
+        /// SpawnCachedItems instantiates every entry with no id check. The receive side already skips an id
+        /// that is live, which covers the other order. This covers this one: an entry whose id is already
+        /// in the world is dropped from the cache before vanilla walks it.
+        /// </summary>
+        static void DropEntriesAlreadyLive(BoatLocalItems instance)
+        {
+            if (!Plugin.IsMultiplayer) return;
+
+            try
+            {
+                var cached = instance.GetCachedItems();
+                if (cached == null || cached.Count == 0) return;
+
+                var registered = SaveLoadManager.instance?.GetCurrentPrefabs();
+                if (registered == null) return;
+
+                // The save registry also holds pocketed (inactive) items, which a scene scan would miss.
+                var live = new System.Collections.Generic.HashSet<int>();
+                foreach (var prefab in registered)
+                    if (prefab != null && prefab.instanceId > 0) live.Add(prefab.instanceId);
+
+                int dropped = cached.RemoveAll(d => d != null && d.instanceId > 0 && live.Contains(d.instanceId));
+                if (dropped > 0)
+                    Plugin.Log.LogInfo($"[ITEM] {instance.gameObject.name}: skipped {dropped} cached item(s) that are already in the world (stream-in arrived from a crewmate first)");
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning($"[ITEM] cached-item dedup failed on {instance.gameObject.name}: {e.Message}");
+            }
         }
     }
 
@@ -196,6 +237,7 @@ namespace SailwindCoop.Patches
         static void Prefix(BoatLocalItems __instance, out System.Collections.Generic.HashSet<int> __state)
         {
             __state = null;
+            _fullState = null;
             if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
             if (Sync.BoatSyncManager.IsJoinInProgress) return; // vanilla spawn is skipped by the guard above
             var mgr = Sync.ItemSyncManager.Instance;
@@ -203,13 +245,38 @@ namespace SailwindCoop.Patches
 
             var cached = __instance.GetCachedItems();
             if (cached == null || cached.Count == 0) return;
+
+            // The cache is the full save data, which the single-item spawn packet cannot carry: crate membership,
+            // food state, charts, nails. Read it now, because the spawn empties the list.
+            if (Plugin.HostItemsOnStreamInConfig == null || Plugin.HostItemsOnStreamInConfig.Value)
+            {
+                var owner = __instance.GetComponent<SaveableObject>();
+                if (owner != null)
+                {
+                    _fullState = Sync.BoatStateCollector.ConvertCachedItems(cached, owner);
+                    return;
+                }
+            }
+
             __state = new System.Collections.Generic.HashSet<int>();
             foreach (var data in cached)
                 if (data != null && data.instanceId > 0) __state.Add(data.instanceId);
         }
 
+        // SpawnCachedItems is not reentrant, so one field carries this from the prefix to the postfix.
+        private static Networking.Packets.NetworkSaveData[] _fullState;
+
         static void Postfix(BoatLocalItems __instance, System.Collections.Generic.HashSet<int> __state)
         {
+            if (_fullState != null)
+            {
+                var full = _fullState;
+                _fullState = null;
+                Sync.ItemSyncManager.Instance?.BroadcastBoatItems(__instance.GetComponent<SaveableObject>(), full);
+                Plugin.Log.LogInfo($"[ITEM] Broadcast {full.Length} item(s) of {__instance.gameObject.name} on stream-in");
+                return;
+            }
+
             if (__state == null || __state.Count == 0) return;
             var mgr = Sync.ItemSyncManager.Instance;
             if (mgr == null) return;

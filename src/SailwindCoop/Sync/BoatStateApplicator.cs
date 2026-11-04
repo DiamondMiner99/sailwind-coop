@@ -861,9 +861,25 @@ namespace SailwindCoop.Sync
 
             boat.extraSetting = isOwned;
             var purchasable = boat.GetComponent<PurchasableBoat>();
-            if (purchasable != null && isOwned)
+            if (purchasable == null) return;
+
+            if (isOwned)
             {
                 purchasable.LoadAsPurchased();
+                return;
+            }
+
+            // Not owned: put the FOR SALE sign back. A joiner whose own save had bought this boat or house
+            // arrives with the sign hidden (SaveableObject.Load calls LoadAsPurchased), and nothing in vanilla
+            // ever shows it again, so the flag was corrected but that player had no way to buy it.
+            try
+            {
+                var ui = Traverse.Create(purchasable).Field("purchaseUI").GetValue<GameObject>();
+                if (ui != null && !ui.activeSelf) ui.SetActive(true);
+            }
+            catch (System.Exception e)
+            {
+                Plugin.Log.LogWarning($"[JOIN] Could not restore the purchase sign on {boat.gameObject.name}: {e.Message}");
             }
         }
 
@@ -933,7 +949,7 @@ namespace SailwindCoop.Sync
             // Build SaveBoatCustomizationData from network data
             var saveData = new SaveBoatCustomizationData
             {
-                masts = data.MastsEnabled ?? new bool[30],
+                masts = data.MastsEnabled ?? new bool[48],
                 sails = sailList.Select(s => new SaveSailData
                 {
                     prefabIndex = s.PrefabIndex,
@@ -965,6 +981,9 @@ namespace SailwindCoop.Sync
                 // Only destroy ship items, not boat parts
                 if (prefab.GetComponent<ShipItem>() != null)
                 {
+                    // Unregister first. A destroyed item left on the save list throws from the next save, and
+                    // from BoatLocalItems when the boat next goes out of range, partway through its cache.
+                    prefab.Unregister();
                     Object.Destroy(prefab.gameObject);
                     count++;
                 }
@@ -1032,8 +1051,31 @@ namespace SailwindCoop.Sync
                 // IsRecentlySynced guard already used by ClearBoatItems.)
                 if (ItemSyncManager.Instance?.IsRecentlySynced(instanceId) == true) continue;
                 clearedNames.Add($"{item.name}(id={instanceId})");
+                item.GetComponent<SaveablePrefab>()?.Unregister();
                 Object.Destroy(item.gameObject);
                 clearedCount++;
+            }
+
+            // Same clean-slate problem as ClearBoatItems, for the one place that is not a boat: a Sailwind
+            // 0.39 house carries its own BoatLocalItems cache of the furniture stored inside it, but no
+            // BoatRefs, so the per-boat flush above never reaches it. Left alone, the joiner keeps its own
+            // save's house contents in that cache and streams them in on the first approach, on top of the
+            // host's authoritative copies. Flush it the same way: null the cache, mark loaded so the spawn
+            // branch is inert. The host's own house items still reach this guest through the normal
+            // BoatLocalItems host-spawn broadcast, which is not boat-specific.
+            foreach (var obj in BoatUtility.FindNonBoatPurchasables())
+            {
+                var houseItems = obj.GetComponent<BoatLocalItems>();
+                if (houseItems == null) continue;
+                try
+                {
+                    Traverse.Create(houseItems).Field("cachedItems").SetValue(null);
+                    houseItems.SetItemsLoaded(true);
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[JOIN] Could not flush BoatLocalItems cache on {obj.gameObject.name}: {e.Message}");
+                }
             }
 
             // Log results
@@ -1299,7 +1341,7 @@ namespace SailwindCoop.Sync
                 item.Rotation,                   // rot
                 item.PrefabIndex,                // prefabIndex
                 item.IsSold,                     // isSold
-                false,                           // isNailed
+                item.IsNailed,                   // isNailed
                 item.Health,                     // health
                 item.Amount,                     // amount
                 item.InventorySlot,              // slot
@@ -1395,7 +1437,7 @@ namespace SailwindCoop.Sync
                 item.Rotation,                   // rot
                 item.PrefabIndex,                // prefabIndex
                 item.IsSold,                     // isSold
-                false,                           // isNailed
+                item.IsNailed,                   // isNailed
                 item.Health,                     // health
                 item.Amount,                     // amount
                 item.InventorySlot,              // slot
@@ -1456,6 +1498,7 @@ namespace SailwindCoop.Sync
                 if (orphanPrefab != null && hostItemIds != null && !isHostItem && !isOurFreshSpawn)
                 {
                     Plugin.Log.LogInfo($"[ITEM-DEDUP] Destroying local orphan {orphan.name} (id={orphanId}, prefab={item.PrefabIndex}) near {worldPos} before spawning host item id={item.InstanceId}");
+                    orphanPrefab.Unregister();
                     Object.Destroy(orphan.gameObject);
                 }
             }

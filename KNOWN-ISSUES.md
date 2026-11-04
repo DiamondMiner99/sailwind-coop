@@ -17,6 +17,13 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 
 ## Open / deferred
 
+- 🟠 **Guests losing rest, food and water about three times as fast as the host.** Reported, with
+  no cause found in the code. Co-op writes a `[NEEDS]` line to `BepInEx/LogOutput.log` every 30 seconds
+  on every machine. The lines from both machines would show whether a real multiplier is involved.
+
+- 🟡 **Randomized forage follows the host.** The host spawns it for the crew and only within 300 m of
+  its own camera, so a guest alone on an island sees it only while the host is nearby.
+
 - 🟡 **Anchor Improvements 1.1.7 is broken on Sailwind 0.38, with or without this mod.** It patches
   `Anchor.Start` and `Anchor.FixedUpdate`, and the game renamed both in 0.38, so it throws partway
   through applying its patches. Harmony does not undo the ones that already applied, so a little of it
@@ -63,7 +70,7 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 - 🟡 **Everyone must run the same mod build AND the same Sailwind version.** Since v0.2.28
   the host refuses joins from a mismatched mod version with a clear message on both screens
   (older builds still fail silently against each other).
-- 🟡 **Targets Sailwind v0.38.** Game updates can break the Harmony hooks; a new game patch
+- 🟡 **Targets Sailwind v0.40.** Game updates can break the Harmony hooks; a new game patch
   may need a mod update.
 - 🟡 **Heavy Harmony patching**: may conflict with other mods that patch the same systems.
 - 🟡 **No dedicated servers.** Co-op is host-authoritative over Steam P2P via friend invites

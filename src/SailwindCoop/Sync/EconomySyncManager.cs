@@ -179,6 +179,7 @@ namespace SailwindCoop.Sync
 
             SendCurrencySync(target);
             SendReputationSync(target);
+            SendNonBoatOwnershipTo(target);
         }
 
         #endregion
@@ -272,7 +273,7 @@ namespace SailwindCoop.Sync
         /// peers apply it live; a later joiner gets ownership via the join snapshot instead. Mirrors the
         /// AnchorEvent broadcast (BoatName-keyed, SendToAllReliable).
         /// </summary>
-        public void SendBoatOwnershipChanged(string boatName, bool isOwned)
+        public void SendBoatOwnershipChanged(string boatName, bool isOwned, SteamId? target = null)
         {
             if (!Plugin.IsHost || !Plugin.IsMultiplayer) return;
             if (string.IsNullOrEmpty(boatName)) return;
@@ -283,10 +284,35 @@ namespace SailwindCoop.Sync
                 IsOwned = isOwned
             };
 
-            VerboseLogger.Log("ECONOMY", "SEND", $"BoatOwnershipChanged, boat={boatName}, owned={isOwned}");
+            VerboseLogger.Log("ECONOMY", "SEND", $"BoatOwnershipChanged, boat={boatName}, owned={isOwned}{(target.HasValue ? $" (to {target.Value})" : "")}");
 
-            Plugin.NetworkManager.SendToAllReliable(PacketType.BoatOwnershipChanged, w =>
-                PacketSerializer.WriteBoatOwnershipChanged(w, packet));
+            if (target.HasValue)
+                Plugin.NetworkManager.SendReliable(target.Value, PacketType.BoatOwnershipChanged, w =>
+                    PacketSerializer.WriteBoatOwnershipChanged(w, packet));
+            else
+                Plugin.NetworkManager.SendToAllReliable(PacketType.BoatOwnershipChanged, w =>
+                    PacketSerializer.WriteBoatOwnershipChanged(w, packet));
+        }
+
+        /// <summary>
+        /// HOST: replay ownership of every NON-boat purchasable, owned or not, to one joiner. The join snapshot
+        /// is built from the BoatRefs-keyed boat set, so a Sailwind 0.39 house the crew already owns is not
+        /// in it and a joiner would arrive to a locked door and a FOR SALE sign on a house that is paid for.
+        /// Reuses the live ownership packet, so the snapshot format is untouched.
+        /// </summary>
+        private void SendNonBoatOwnershipTo(SteamId target)
+        {
+            foreach (var obj in BoatUtility.FindNonBoatPurchasables())
+            {
+                var purchasable = obj.GetComponent<PurchasableBoat>();
+                if (purchasable == null) continue;
+                // Assert the host's value either way, the same as the boat snapshot does (it carries
+                // IsOwned = extraSetting for every boat). Only pushing "owned" would leave a joiner whose own
+                // phantom save had bought the house able to open a door the crew never paid for: vanilla's
+                // SaveableObject.Load restores extraSetting from that save and nothing else clears it.
+                // ApplyOwnership handles false by writing extraSetting back off, which re-locks the door.
+                SendBoatOwnershipChanged(obj.gameObject.name, purchasable.isPurchased(), target);
+            }
         }
 
         /// <summary>
@@ -299,7 +325,10 @@ namespace SailwindCoop.Sync
 
             VerboseLogger.Log("ECONOMY", "RECV", $"BoatOwnershipChanged, boat={packet.BoatName}, owned={packet.IsOwned}");
 
-            var boat = BoatUtility.FindBoatByName(packet.BoatName);
+            // Purchasable, not just boats: Sailwind 0.39 sells houses through PurchasableBoat, and a house
+            // has no BoatRefs, so the boat-keyed lookup dropped every house ownership packet on the floor
+            // and the guest's house door stayed locked (GPButtonHouseDoor only opens on extraSetting).
+            var boat = BoatUtility.FindPurchasableByName(packet.BoatName);
             if (boat == null)
             {
                 VerboseLogger.Log("ECONOMY", "APPLY", $"BoatOwnershipChanged: boat '{packet.BoatName}' not found");
@@ -322,7 +351,8 @@ namespace SailwindCoop.Sync
 
             VerboseLogger.Log("ECONOMY", "RECV", $"BoatPurchaseRequest from {sender}, boat={packet.BoatName}");
 
-            var boat = BoatUtility.FindBoatByName(packet.BoatName);
+            // Purchasable, not just boats - a guest buying a 0.39 house lands here too.
+            var boat = BoatUtility.FindPurchasableByName(packet.BoatName);
             if (boat == null)
             {
                 VerboseLogger.Log("ECONOMY", "REJECT", $"BoatPurchaseRequest: boat '{packet.BoatName}' not found");
@@ -358,7 +388,20 @@ namespace SailwindCoop.Sync
             // Authoritative purchase. PurchaseBoat() deducts currency[3], sets extraSetting, logs + plays the
             // gold sound on the HOST, and our PurchaseBoatPatch postfix (host branch) broadcasts ownership.
             VerboseLogger.Log("ECONOMY", "EXEC", $"BoatPurchaseRequest: buying '{packet.BoatName}' for {purchasable.price}");
-            purchasable.PurchaseBoat();
+            // Sailwind 0.39's PurchaseBoat walks BoatRefs.masts to reset the jib hinges, but that array is a
+            // SPARSE Mast[48] (BoatRefs.cs:15, filled by orderIndex) and the loop has no null check, so it
+            // throws on the first empty slot - AFTER the purchase has fully completed. Never let that escape
+            // into the packet handler: the ownership broadcast is sent from PurchaseBoatPatch's finalizer.
+            try
+            {
+                purchasable.PurchaseBoat();
+            }
+            catch (System.Exception e)
+            {
+                // The finalizer already swallowed the known 0.39 NRE, so this is something else.
+                Plugin.Log.LogWarning($"[ECONOMY] vanilla PurchaseBoat threw for '{packet.BoatName}', " +
+                    $"owned now={purchasable.isPurchased()}: {e.GetType().Name}: {e.Message}");
+            }
         }
 
         #endregion

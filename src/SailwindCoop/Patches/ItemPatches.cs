@@ -104,6 +104,13 @@ namespace SailwindCoop.Patches
                 // decrements the stove's fuel count without floor (~60/s into deep negatives). A burnt
                 // fuel's destroy is legitimate at ANY distance - never eat it.
                 && !(__instance.GetComponent<StoveFuel>()?.inserted == true)
+                // STREAM-OUT exemption (0.39 houses): a house's stored furniture is sold, has no walkCol
+                // (it is parented to the house, not a boat) and streams out past this 300m gate, so this
+                // guard used to eat vanilla's cache-out teardown entirely. BoatLocalItems had already
+                // cached the items, so walking back to the house spawned a second copy on top of the
+                // first, every time. parentObject==-2 is the cache-out sentinel; let those fall through to
+                // the stream-out branch below, which destroys locally without broadcasting.
+                && __instance.GetComponent<SaveablePrefab>()?.GetParentObject() != -2
                 && Camera.main != null
                 && Vector3.Distance(Camera.main.transform.position, __instance.transform.position) > 300f)
             {

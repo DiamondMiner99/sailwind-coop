@@ -349,6 +349,10 @@ namespace SailwindCoop.Networking
                 lobby.SetPrivate();
                 lobby.SetData("name", $"{SteamClient.Name}'s Sailwind Voyage");
                 lobby.SetData("version", Plugin.PluginVersion);
+                // The game's own version (Application.version, "0.39"). 0.39 is the first update with content
+                // only one side can have (houses, a ninth hull, new sails), so a guest on another game
+                // version is refused before P2P, like a mod version mismatch.
+                lobby.SetData("game", UnityEngine.Application.version);
                 // (v0.2.32) Composed mod-set token (SE + SCF + NAND Tweaks sim vector + Deep Ports
                 // bundle hash + Towable Boats + HMS Leopard). Guests pre-check this BEFORE opening
                 // P2P, exactly like the version stamp above. Opaque - compare for equality only.

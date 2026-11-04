@@ -339,5 +339,12 @@ namespace SailwindCoop.Networking.Packets
         //     rebuilt), floor height (float). Sent up to 10 times a second while the body moves.
         //   getting up: progress byte (0 to 255), up to 10 times a second.
         RestState = 227,                 // Player -> all (host relays); re-sent while it lasts
+
+        // A guest's own cache of a boat or house goes stale while it is out of range, and a guest boat can
+        // never respawn it anyway (never kinematic). On stream-in the guest asks and the host answers with the
+        // full save data. The host also sends BoatItems unasked when its own copy streams in.
+        BoatItemsRequest = 228,          // Guest -> host
+        BoatItems = 229,                 // Host -> requesting guest / host -> all
+        ItemResyncRequest = 230,         // Guest -> host: "I was told about this id and do not have it"
     }
 }

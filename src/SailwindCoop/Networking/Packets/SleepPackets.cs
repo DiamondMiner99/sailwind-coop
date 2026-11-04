@@ -10,6 +10,8 @@ namespace SailwindCoop.Networking.Packets
     {
         public bool IsTavern;      // true if sleeping in tavern
         public bool IsMoored;      // true if boat is moored (for context check)
+        public bool IsHouse;       // true if the sender's bed is in a house (Sailwind 0.39). Logged only: the
+                                   // HOST's own bed decides whether the crew gets a house sleep.
         public ulong AuthorId;     // N-player: SteamId of the crew member who entered bed (survives host relay
                                    // so other guests track the real author, not the relaying host's transport id)
     }
@@ -31,7 +33,8 @@ namespace SailwindCoop.Networking.Packets
     public struct SleepApprovedPacket
     {
         public bool IsTavern;      // tavern sleep (no cycles, fixed wake)
-        public bool IsTimeskip;    // true if moored/tavern (time warp enabled)
+        public bool IsTimeskip;    // true if moored/tavern/off-boat (time warp enabled)
+        public bool IsHouse;       // house sleep (runs to morning, not to rest - Sailwind 0.39)
     }
 
     /// <summary>
