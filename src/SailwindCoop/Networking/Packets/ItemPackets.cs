@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace SailwindCoop.Networking.Packets
@@ -46,6 +47,64 @@ namespace SailwindCoop.Networking.Packets
     public struct ItemResyncRequestPacket
     {
         public int ItemInstanceId;
+    }
+
+    /// <summary>"I still show this item in your hands. Is it?"</summary>
+    [Serializable]
+    public struct ItemReleaseQueryPacket
+    {
+        public int ItemInstanceId;
+        public ulong CarrierSteamId;
+    }
+
+    public enum HookAttachmentKind : byte
+    {
+        Item = 0,      // A ShipItem, by instance id
+        Anchor = 1,    // A boat's anchor, by boat name
+        ClearAll = 2,  // Joiner only: forget what your own save hung, the replay follows
+    }
+
+    /// <summary>HooksHangMore: something went onto or came off a lamp hook.</summary>
+    [Serializable]
+    public struct HookAttachmentPacket
+    {
+        public HookAttachmentKind Kind;
+        public bool Attached;
+        public int HookInstanceId;
+        public int ItemInstanceId;
+        public string BoatName;
+    }
+
+    public enum InstrumentNoteKind : byte
+    {
+        Strike = 0,   // Lute, nakers: one note, played once
+        Voice = 1,    // Flute, hurdy-gurdy: play mode and the note now held (-1 for none)
+        Horn = 2,     // Viking Horn: Playing = being blown
+    }
+
+    /// <summary>MusicMod: a note from an instrument in a crewmate's hands.</summary>
+    [Serializable]
+    public struct InstrumentNotePacket
+    {
+        public InstrumentNoteKind Kind;
+        public int ItemInstanceId;
+        public bool Playing;
+        public sbyte Note;
+    }
+
+    /// <summary>Sail Damage: one sail's six values (DamageModel.Snapshot), by Sail Damage's own save key.</summary>
+    [Serializable]
+    public struct SailDamageEntry
+    {
+        public string Key;
+        public float[] Values;
+    }
+
+    [Serializable]
+    public struct SailDamagePacket
+    {
+        public bool ReplaceAll;   // Joiner: forget your own save's sail damage first
+        public List<SailDamageEntry> Entries;
     }
 
     [Serializable]

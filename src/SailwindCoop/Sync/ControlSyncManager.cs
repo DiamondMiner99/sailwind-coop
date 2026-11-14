@@ -101,6 +101,8 @@ namespace SailwindCoop.Sync
 
             Plugin.Profiler?.StartMeasure();
 
+            AnchorPoseSync.Tick();
+
             // (v0.2.25) Rate halved on the HOST during a co-op sleep (scale is 1 on guests/awake):
             // Time.time runs 16x under the warp, so this 10Hz poll became ~160Hz real and helped
             // saturate a guest's packet budget (the SLEEP_SNAP crash chain). Frequency only.
@@ -2360,6 +2362,7 @@ namespace SailwindCoop.Sync
 
         public void Reset()
         {
+            AnchorPoseSync.Reset();
             _lastSyncTime = 0f;
             _controlStates.Clear();               // every per-boat rope/helm state dies with the session
             _pollNamesScratch.Clear();

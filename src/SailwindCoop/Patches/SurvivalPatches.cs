@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Reflection.Emit;
 using HarmonyLib;
 using SailwindCoop.Debug;
 using SailwindCoop.Networking.Packets;
@@ -11,6 +13,103 @@ namespace SailwindCoop.Patches
     /// </summary>
     public static class SurvivalPatches
     {
+        #region Frame-rate independent needs
+
+        /// <summary>
+        /// Two of vanilla's needs drains depend on the frame rate, which nobody sees alone but every crew sees as one
+        /// player starving or drying out faster than another for the same play:
+        ///  - PlayerNeeds.LateUpdate refills food debt by `Sun.sun.timescale * 0.5f` PER FRAME, taking the same from
+        ///    food, so a player at 120 fps loses that food twice as fast as one at 60 fps.
+        ///  - PlayerNeeds.DrainEnergyFromMovement charges running and swimming water (and swimming food) from the
+        ///    squared distance moved IN ONE FRAME (OVRPlayerController.outLastMovement), so over a second the cost
+        ///    goes as 1/fps: the same run at 30 fps costs twice the water it does at 60 fps.
+        /// In a co-op session both are rescaled so they cost per second what vanilla costs at 60 fps; a player at 60 fps
+        /// sees no change. Solo play is left as vanilla. Coop.NeedsFrameRateFix turns it off.
+        /// </summary>
+        private const float ReferenceFps = 60f;
+
+        private static BepInEx.Configuration.ConfigEntry<bool> _frameRateFix;
+
+        private static bool FrameRateFixOn
+        {
+            get
+            {
+                if (!Plugin.IsMultiplayer) return false;
+                if (_frameRateFix == null && Plugin.Instance != null)
+                    _frameRateFix = Plugin.Instance.Config.Bind("Coop", "NeedsFrameRateFix", true,
+                        "In a co-op session, make the game's food-debt refill and running/swimming costs take the same per second " +
+                        "at any frame rate, as vanilla does at 60 fps. Without it, players with different frame rates get hungry " +
+                        "and thirsty at different speeds.");
+                return _frameRateFix != null && _frameRateFix.Value;
+            }
+        }
+
+        /// <summary>
+        /// The food-debt step for this frame: vanilla's per-frame 0.5, made per real second at 60 fps. Unscaled time,
+        /// because vanilla's step is per frame: the sleep warp (Time.timeScale 16) makes deltaTime 16 times larger but
+        /// does not change how many frames vanilla runs, so scaled time gave the sleeper ten times vanilla's rate.
+        /// </summary>
+        public static float FoodDebtStep()
+        {
+            if (!FrameRateFixOn) return 0.5f;
+            return 0.5f * UnityEngine.Mathf.Clamp(UnityEngine.Time.unscaledDeltaTime * ReferenceFps, 0f, 10f);
+        }
+
+        [HarmonyPatch(typeof(PlayerNeeds), "LateUpdate")]
+        public static class FoodDebtFrameRatePatch
+        {
+            [HarmonyTranspiler]
+            public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var timescale = AccessTools.Field(typeof(Sun), nameof(Sun.timescale));
+                var step = AccessTools.Method(typeof(SurvivalPatches), nameof(FoodDebtStep));
+                CodeInstruction prev = null;
+                int swapped = 0;
+                foreach (var ci in instructions)
+                {
+                    // `Sun.sun.timescale * 0.5f` appears only in the food-debt refill (twice); `sleep * 0.5f` is left alone.
+                    if (ci.opcode == OpCodes.Ldc_R4 && ci.operand is float f && f == 0.5f && prev != null && prev.LoadsField(timescale))
+                    {
+                        var call = new CodeInstruction(OpCodes.Call, step);
+                        call.labels.AddRange(ci.labels);
+                        call.blocks.AddRange(ci.blocks);
+                        prev = call;
+                        swapped++;
+                        yield return call;
+                        continue;
+                    }
+                    prev = ci;
+                    yield return ci;
+                }
+                if (swapped != 2)
+                    Plugin.Log.LogWarning($"[NEEDS] Food-debt frame-rate fix matched {swapped} place(s) instead of 2; check for a game update.");
+            }
+        }
+
+        [HarmonyPatch(typeof(PlayerNeeds), "DrainEnergyFromMovement")]
+        public static class MovementDrainFrameRatePatch
+        {
+            [HarmonyPrefix]
+            public static void Prefix(out UnityEngine.Vector3 __state)
+            {
+                __state = new UnityEngine.Vector3(PlayerNeeds.food, PlayerNeeds.foodDebt, PlayerNeeds.water);
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix(UnityEngine.Vector3 __state)
+            {
+                float dt = UnityEngine.Time.deltaTime;
+                if (!FrameRateFixOn || dt <= 0f) return;
+                // Cost per frame goes as dt squared; scaling it by (1/60)/dt makes the cost per second fixed.
+                float k = UnityEngine.Mathf.Clamp(1f / (dt * ReferenceFps), 0.1f, 10f);
+                PlayerNeeds.food = __state.x - (__state.x - PlayerNeeds.food) * k;
+                PlayerNeeds.foodDebt = __state.y - (__state.y - PlayerNeeds.foodDebt) * k;
+                PlayerNeeds.water = __state.z - (__state.z - PlayerNeeds.water) * k;
+            }
+        }
+
+        #endregion
+
         #region Disable Guest Stat Decay
 
         /// <summary>

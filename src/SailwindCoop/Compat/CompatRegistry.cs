@@ -31,6 +31,17 @@ namespace SailwindCoop.Compat
             DeepPortsCompat.Init();
             TowableBoatsCompat.Init();
             LeopardCompat.Init();
+            // Not a segment: HooksHangMore adds nothing to a boat's hierarchy, and a crew that differs on it only
+            // loses the hung state on the machine without it, so it does not refuse joins.
+            HooksHangMoreCompat.Init();
+            // Not a segment either: a crewmate without MusicMod has no instruments to play, and nothing else differs.
+            MusicModCompat.Init();
+            VikingHornCompat.Init();
+            // Not a segment: the host's copy decides, and a crewmate without the mod just sees whole sails.
+            SailDamageCompat.Init();
+            // Not a segment: the host's pets are built on each guest from the host's state.
+            FurstMateCompat.Init();
+            PostalExpansionCompat.Init();
             _cached = null;
             // The report-only manifest is built from the chainloader, not from these modules, but it shares
             // their lifetime and the same "never freeze a premature read" hazard, so it is reset here too.
@@ -50,6 +61,7 @@ namespace SailwindCoop.Compat
                     DeepPortsCompat.ModSignature,
                     TowableBoatsCompat.ModSignature,
                     LeopardCompat.ModSignature,
+                    PostalExpansionCompat.ModSignature,   // its cargo items and mission rules need it on both ends
                 };
                 _cached = string.Join(";", parts.Where(p => !string.IsNullOrEmpty(p)));
                 Plugin.Log.LogInfo($"[MODS] Composed mod-set token: [{_cached}]");
@@ -384,6 +396,7 @@ namespace SailwindCoop.Compat
                 case "DP": return "Deep Ports";
                 case "TB": return "Towable Boats";
                 case "LEO": return "HMS Leopard";
+                case "PE": return "Postal Expansion";
                 default: return key;
             }
         }

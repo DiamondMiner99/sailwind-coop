@@ -22,7 +22,7 @@ file it as a GitHub issue.
 - [ ] **Same mod build everywhere.** Re-extract the bundle, overwriting old DLLs. A stale DLL is the #1
       cause of fake "desyncs." The network format changes between releases and a mismatch can
       desync silently or break the session outright.
-- [ ] **Same Sailwind version everywhere** (built against **v0.40**).
+- [ ] **Same Sailwind version everywhere** (built against **v0.40.1**).
 - [ ] **BepInEx present**: `winhttp.dll` sits next to `Sailwind.exe`.
 - [ ] **Turn on verbose logging: press `F8` after you're in-world, on BOTH machines.** A small corner
       indicator reads `● co-op debug logging ON`. It starts **disabled every launch**: if you forget,

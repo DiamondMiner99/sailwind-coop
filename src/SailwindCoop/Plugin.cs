@@ -25,6 +25,17 @@ namespace SailwindCoop
     [BepInDependency(Compat.DeepPortsCompat.DPGuid, BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency(Compat.TowableBoatsCompat.TBGuid, BepInDependency.DependencyFlags.SoftDependency)]
     [BepInDependency(Compat.LeopardCompat.LeopardGuid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.HooksHangMoreCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.MusicModCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.VikingHornCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.SailDamageCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency(Compat.FurstMateCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    // Loads Postal Expansion first, so co-op's guest mission prefixes say HarmonyBefore it (MissionPatches).
+    [BepInDependency(Compat.PostalExpansionCompat.Guid, BepInDependency.DependencyFlags.SoftDependency)]
+    // pander33's Sailwind LAN Co-op. A mod manager keeps the two in separate folders, so both would load and patch the
+    // same game methods. BepInEx checks this before loading either assembly, which matters because both are named
+    // SailwindCoop with a type SailwindCoop.Plugin. It logs the reason and skips this plugin; the other is untouched.
+    [BepInIncompatibility("com.sailwind.coop")]
     public class Plugin : BaseUnityPlugin
     {
         public const string PluginGUID = "com.sailwindcoop.mod";
@@ -39,7 +50,7 @@ namespace SailwindCoop
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
         // load.
-        public const string PluginVersion = "0.5.0";
+        public const string PluginVersion = "0.6.0";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -467,6 +478,11 @@ namespace SailwindCoop
                 // (v0.2.32) Manual patches on HMS Leopard's own controller types (attribute patches
                 // cannot reference maybe-absent types). Hard no-op when Leopard is absent.
                 Compat.LeopardCompat.ApplyPatches(_harmony);
+                Compat.HooksHangMoreCompat.ApplyPatches(_harmony);
+                Compat.MusicModCompat.ApplyPatches(_harmony);
+                Compat.VikingHornCompat.ApplyPatches(_harmony);
+                Compat.SailDamageCompat.ApplyPatches(_harmony);
+                Compat.FurstMateCompat.ApplyPatches(_harmony);
                 Log.LogInfo($"Harmony patches applied successfully");
             }
             catch (System.Exception ex)
@@ -1618,6 +1634,7 @@ namespace SailwindCoop
                     // the host for relayed packets). At N=1 author == the one guest, so behavior is identical.
                     ItemSyncManager.Instance?.UpdateRemoteHeldItemPosition(heldItemId, heldItemPos, heldItemRot, isOnBoat, boatName, author);
                 }
+                ItemSyncManager.Instance?.NoteCarrierHeldReport(author, hasHeldItem, heldItemId);
 
                 // CROUCH (v0.2.25 wire change): trailing byte = quantized 0..1 crouch amount, appended
                 // AFTER the held-item block. Probe remaining length so a packet from a pre-v0.2.25
@@ -1761,6 +1778,36 @@ namespace SailwindCoop
             {
                 var packet = PacketSerializer.ReadAnchorEvent(reader);
                 ControlSyncManager?.OnRemoteAnchorChanged(packet, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.AnchorPose, (sender, reader) =>
+            {
+                AnchorPoseSync.OnRemotePose(PacketSerializer.ReadAnchorPose(reader), sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.HookAttachment, (sender, reader) =>
+            {
+                Compat.HooksHangMoreCompat.OnRemoteAttachment(PacketSerializer.ReadHookAttachment(reader), sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.InstrumentNote, (sender, reader) =>
+            {
+                Compat.MusicModCompat.OnRemoteNote(PacketSerializer.ReadInstrumentNote(reader), sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.FurstMate, (sender, reader) =>
+            {
+                Compat.FurstMateCompat.OnPacket(reader, sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.SailDamage, (sender, reader) =>
+            {
+                Compat.SailDamageCompat.OnRemote(PacketSerializer.ReadSailDamage(reader), sender);
+            });
+
+            NetworkManager.RegisterHandler(PacketType.ItemReleaseQuery, (sender, reader) =>
+            {
+                ItemSyncManager?.OnRemoteItemReleaseQuery(PacketSerializer.ReadItemReleaseQuery(reader));
             });
 
             NetworkManager.RegisterHandler(PacketType.MooringState, (sender, reader) =>
@@ -2375,6 +2422,9 @@ namespace SailwindCoop
                 // The hung-lantern joint is not persisted or in the snapshot either; replay hung state AFTER
                 // the nailed resync so the hook is on-wall before the lantern re-hangs (issue #4).
                 ItemSyncManager?.ResyncHungStateTo(sender);
+                Compat.HooksHangMoreCompat.ResyncTo(sender);
+                Compat.SailDamageCompat.ResyncTo(sender);
+                Compat.FurstMateCompat.ResyncTo(sender);
                 // Carrier cargo arrives in the snapshot as plain world items; tuck it back into the
                 // port cargo carriers (v0.2.29 cargo transport sync).
                 ItemSyncManager?.ResyncCargoCarriersTo(sender);

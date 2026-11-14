@@ -36,8 +36,11 @@ namespace SailwindCoop.Sync
                 return new NetworkMissionData { SlotIndex = slotIndex, IsValid = false };
             }
 
+            Compat.PostalExpansionCompat.Describe(mission, out byte postalKind, out string letterId);
             return new NetworkMissionData
             {
+                PostalKind = postalKind,
+                PostalLetterId = letterId,
                 SlotIndex = slotIndex,
                 IsValid = true,
                 OriginPortIndex = mission.originPort.portIndex,
@@ -59,6 +62,17 @@ namespace SailwindCoop.Sync
         {
             if (!data.IsValid) return null;
 
+            // A mod's cargo (Postal Expansion's letters, for one) that this machine has no prefab for would throw
+            // in the Mission constructor and lose every slot after it.
+            var directory = PrefabsDirectory.instance;
+            if (directory == null || data.GoodPrefabIndex < 0 || data.GoodPrefabIndex >= directory.directory.Length
+                || directory.directory[data.GoodPrefabIndex] == null)
+            {
+                Plugin.Log.LogWarning($"[MISSION] Cargo prefab {data.GoodPrefabIndex} does not exist here; the host's mission " +
+                                      $"in slot {data.SlotIndex} is not shown. A mod the host runs is probably missing.");
+                return null;
+            }
+
             var saveData = new SaveMissionData(
                 data.SlotIndex,
                 data.OriginPortIndex,
@@ -72,7 +86,9 @@ namespace SailwindCoop.Sync
                 data.DueDay
             );
 
-            return new Mission(saveData);
+            var mission = new Mission(saveData);
+            Compat.PostalExpansionCompat.Attach(mission, data.PostalKind, data.PostalLetterId);
+            return mission;
         }
 
         #endregion
@@ -229,15 +245,23 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            var missions = port.GetMissions(packet.Page, packet.IsWorldMission);
-            if (packet.BoardSlot >= missions.Length || missions[packet.BoardSlot] == null)
+            Mission mission;
+            if (Compat.PostalExpansionCompat.SyncEnabled && packet.HasIdentity)
+            {
+                // Postal Expansion builds new Mission objects every time a board is shown; find the same offer.
+                mission = Compat.PostalExpansionCompat.FindOffer(port, packet.Tab, packet.Identity);
+            }
+            else
+            {
+                var missions = port.GetMissions(packet.Page, packet.IsWorldMission);
+                mission = packet.BoardSlot < missions.Length ? missions[packet.BoardSlot] : null;
+            }
+            if (mission == null)
             {
                 Plugin.Log.LogWarning("Mission no longer available");
                 NotificationUi.instance?.ShowNotification("Mission no longer available");
                 return;
             }
-
-            var mission = missions[packet.BoardSlot];
 
             // Accept the mission (this triggers our postfix to broadcast)
             PlayerMissions.AcceptMission(mission);
@@ -256,6 +280,7 @@ namespace SailwindCoop.Sync
         private void RefreshHostMissionBoardIfOpen()
         {
             if (!GameState.inPortMissionList || MissionListUI.instance == null) return;
+            if (Compat.PostalExpansionCompat.RefreshHostBoard(MissionListUI.instance)) return;
             var t = HarmonyLib.Traverse.Create(MissionListUI.instance);
             var dude = t.Field("currentPortDude").GetValue<PortDude>();
             if (dude != null && dude.GetPort() != null)
@@ -342,12 +367,18 @@ namespace SailwindCoop.Sync
                 return;
             }
 
-            var missions = port.GetMissions(packet.Page, packet.IsWorldMission);
+            Mission[] missions;
+            int total;
+            if (!Compat.PostalExpansionCompat.TryBuildBoard(port, packet.Tab, packet.Page, out missions, out total))
+            {
+                missions = port.GetMissions(packet.Page, packet.IsWorldMission);
+                total = port.GetMissionCount();
+            }
 
             var response = new MissionBoardResponsePacket
             {
                 Missions = new NetworkMissionData[missions.Length],
-                TotalCount = port.GetMissionCount()
+                TotalCount = total
             };
 
             for (int i = 0; i < missions.Length; i++)
@@ -420,6 +451,10 @@ namespace SailwindCoop.Sync
                 NotificationUi.instance?.ShowNotification("Wrong port!");
                 return;
             }
+
+            // Postal Expansion's letters go to a place at an hour, never to the office; the host checks both.
+            if (!Compat.PostalExpansionCompat.HostMayDeliver(mission, packet.DeliveryKind))
+                return;
 
             // Deliver the good (triggers reward and broadcasts via patches)
             good.Deliver();
@@ -585,6 +620,7 @@ namespace SailwindCoop.Sync
                     missions[i].missionIndex = -1;
                 }
             }
+            _lastBoard = missions;
 
             // If we have pending UI context, initialize and display
             if (_pendingMissionUI != null && _pendingPortDude != null)
@@ -678,6 +714,9 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Request mission board data from host.
         /// </summary>
+        // Guest: the board the host last sent, as shown. An accept names its offer from here.
+        private static Mission[] _lastBoard;
+
         public void RequestMissionBoard(int portIndex, int page, bool isWorld)
         {
             if (Plugin.IsHost) return;
@@ -686,7 +725,8 @@ namespace SailwindCoop.Sync
             {
                 PortIndex = portIndex,
                 Page = page,
-                IsWorldMission = isWorld
+                IsWorldMission = isWorld,
+                Tab = Compat.PostalExpansionCompat.CurrentTab(isWorld)
             };
 
             VerboseLogger.Log("MISSION", "SEND", $"BoardRequest, port={portIndex}, page={page}");
@@ -707,8 +747,15 @@ namespace SailwindCoop.Sync
                 PortIndex = portIndex,
                 BoardSlot = boardSlot,
                 Page = page,
-                IsWorldMission = isWorld
+                IsWorldMission = isWorld,
+                Tab = Compat.PostalExpansionCompat.CurrentTab(isWorld)
             };
+            var shown = _lastBoard != null && boardSlot >= 0 && boardSlot < _lastBoard.Length ? _lastBoard[boardSlot] : null;
+            if (Compat.PostalExpansionCompat.SyncEnabled && shown != null)
+            {
+                packet.HasIdentity = true;
+                packet.Identity = MissionToNetworkData(shown, boardSlot);
+            }
 
             VerboseLogger.Log("MISSION", "SEND", $"AcceptRequest, port={portIndex}, slot={boardSlot}");
 
@@ -737,7 +784,7 @@ namespace SailwindCoop.Sync
         /// <summary>
         /// Request to deliver cargo at port.
         /// </summary>
-        public void RequestDeliverGood(int itemInstanceId, int prefabIndex, int portIndex)
+        public void RequestDeliverGood(int itemInstanceId, int prefabIndex, int portIndex, byte deliveryKind = 0)
         {
             if (Plugin.IsHost) return;
 
@@ -745,7 +792,8 @@ namespace SailwindCoop.Sync
             {
                 ItemInstanceId = itemInstanceId,
                 PrefabIndex = prefabIndex,
-                PortIndex = portIndex
+                PortIndex = portIndex,
+                DeliveryKind = deliveryKind
             };
 
             VerboseLogger.Log("MISSION", "SEND", $"DeliverRequest, item={itemInstanceId}, prefab={prefabIndex}, port={portIndex}");

@@ -794,6 +794,12 @@ namespace SailwindCoop.Sync
             DrainBoatItemsAfterJoin();
             SweepPendingHangs();
             SweepBeltLanterns();
+            SweepStaleCarries();
+            Compat.HooksHangMoreCompat.Tick();
+            Compat.MusicModCompat.Tick();
+            Compat.VikingHornCompat.Tick();
+            Compat.SailDamageCompat.Tick();
+            Compat.FurstMateCompat.Tick();
 
             Plugin.Profiler?.EndMeasure("Items");
         }
@@ -1498,6 +1504,13 @@ namespace SailwindCoop.Sync
         /// </summary>
         public void Reset()
         {
+            _carrierHeldReport.Clear();
+            _staleCarries.Clear();
+            Compat.HooksHangMoreCompat.Reset();
+            Compat.MusicModCompat.Reset();
+            Compat.VikingHornCompat.Reset();
+            Compat.SailDamageCompat.Reset();
+            Compat.FurstMateCompat.Reset();
             _pendingHangs.Clear();
             _lastItemResyncRequest.Clear();
             _boatItemsDuringJoin.Clear();
@@ -1819,11 +1832,28 @@ namespace SailwindCoop.Sync
             // every frame by CrateInventory.LateUpdate, so anyone grabbing it fought the crate for it.
             if (prefab.currentCrateId != 0)
             {
-                VerboseLogger.ItemLocal($"Skipping drop sync for item {prefab.instanceId} - just inserted into crate {prefab.currentCrateId}");
-                // The one bit of local bookkeeping SendDropPacket would have done
-                _heldItems.Remove(prefab.instanceId);
-                ClearSyncedHeldItemById(prefab.instanceId);
-                return;
+                // Ask the crate. A stale id (a save or snapshot naming a crate that is gone, a crate renumbered
+                // by correlation) is not an insert, and skipping on it left the item in this player's hands on
+                // every other machine for as long as it stayed down.
+                var inCrate = FindItemByInstanceId(prefab.currentCrateId)?.GetComponent<CrateInventory>();
+                if (inCrate != null && inCrate.containedItems.Contains(item))
+                {
+                    VerboseLogger.ItemLocal($"Skipping drop sync for item {prefab.instanceId} - just inserted into crate {prefab.currentCrateId}");
+                    // The one bit of local bookkeeping SendDropPacket would have done
+                    _heldItems.Remove(prefab.instanceId);
+                    ClearSyncedHeldItemById(prefab.instanceId);
+                    return;
+                }
+
+                Plugin.Log.LogWarning($"[ITEM] {item.name} ({prefab.instanceId}) carried a stale crate id {prefab.currentCrateId}; clearing it and dropping normally");
+                prefab.currentCrateId = 0;
+                if (item.itemRigidbodyC != null)
+                {
+                    // What vanilla's load wrote for the crate it never found. A wall item's attached is its own.
+                    if (!item.wallAttachment) item.itemRigidbodyC.attached = false;
+                    item.itemRigidbodyC.disableCol = false;
+                    item.itemRigidbodyC.inStove = false;
+                }
             }
 
             // Delay sync for wall-attachable items to let snap complete
@@ -2546,13 +2576,13 @@ namespace SailwindCoop.Sync
             // drop cannot disarm a legitimate tracker.
             _pendingDropTerminals.Remove(packet.ItemInstanceId);
 
-            // Try to find item - check _remoteHeldItems first (item may be hidden with SetActive(false))
-            var item = FindItemByInstanceId(packet.ItemInstanceId);
-            if (item == null && _remoteHeldItems.TryGetValue(packet.ItemInstanceId, out var heldItem))
-            {
+            // The object we are carrying for this id comes first: it may be hidden, and with a duplicate id the scene
+            // scan can return the other copy, leaving this one frozen in the air with its colliders off.
+            ShipItem item = null;
+            if (_remoteHeldItems.TryGetValue(packet.ItemInstanceId, out var heldItem) && heldItem != null)
                 item = heldItem;
-                VerboseLogger.ItemApply($"Found hidden item {packet.ItemInstanceId} in _remoteHeldItems for drop");
-            }
+            if (item == null)
+                item = FindItemByInstanceId(packet.ItemInstanceId);
             if (item == null)
             {
                 Plugin.Log.LogWarning($"OnRemoteItemDropped: item {packet.ItemInstanceId} not found");
@@ -2882,6 +2912,177 @@ namespace SailwindCoop.Sync
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        // === Carried items that outlive the carry ===
+        //
+        // The player position stream says what each crewmate's hands hold, about 20 times a second. If it says
+        // something else for a while and this machine still has the item in that crewmate's hands, the release
+        // never landed here. Ask the carrier, who knows where the item really is, and if the carrier cannot say,
+        // let go of it where it is so nobody is left with an item they cannot touch.
+
+        private struct CarrierHeldReport { public int ItemId; public float Time; }
+        private class StaleCarry { public float NextQuery; public int Queries; }
+
+        private const float StaleCarrySweepInterval = 0.5f;
+        private const float StaleCarryGrace = 1.5f;        // Far over the 0.15 s a wall item's drop is held back
+        private const float StaleCarryQueryInterval = 1.5f;
+        private const int StaleCarryMaxQueries = 3;
+        private const float CarrierReportMaxAge = 3f;      // A silent stream says nothing either way
+
+        private readonly Dictionary<SteamId, CarrierHeldReport> _carrierHeldReport = new Dictionary<SteamId, CarrierHeldReport>();
+        private readonly Dictionary<int, StaleCarry> _staleCarries = new Dictionary<int, StaleCarry>();
+        private readonly List<int> _staleCarryGiveUpScratch = new List<int>();
+        private readonly List<int> _staleCarryPruneScratch = new List<int>();
+        private float _nextStaleCarrySweep;
+
+        public void NoteCarrierHeldReport(SteamId carrier, bool holding, int itemId)
+        {
+            // An item with no id yet says nothing about which item it is.
+            if (holding && itemId == 0) return;
+            _carrierHeldReport[carrier] = new CarrierHeldReport { ItemId = holding ? itemId : 0, Time = Time.unscaledTime };
+        }
+
+        private void SweepStaleCarries()
+        {
+            float now = Time.unscaledTime;
+            if (now < _nextStaleCarrySweep) return;
+            _nextStaleCarrySweep = now + StaleCarrySweepInterval;
+
+            if (_staleCarries.Count > 0)
+            {
+                _staleCarryPruneScratch.Clear();
+                foreach (var id in _staleCarries.Keys)
+                    if (!_remoteHeldItems.ContainsKey(id)) _staleCarryPruneScratch.Add(id);
+                foreach (var id in _staleCarryPruneScratch) _staleCarries.Remove(id);
+            }
+
+            _staleCarryGiveUpScratch.Clear();
+            foreach (var kvp in _remoteHeldItems)
+            {
+                int id = kvp.Key;
+                var item = kvp.Value;
+
+                // A pocketed item is hidden on purpose and is in nobody's hand stream.
+                SteamId carrier = default;
+                CarrierHeldReport report = default;
+                bool contradicted = item != null && item.gameObject.activeSelf
+                    && _heldItems.TryGetValue(id, out carrier) && carrier != SteamClient.SteamId
+                    && _carrierHeldReport.TryGetValue(carrier, out report)
+                    && now - report.Time <= CarrierReportMaxAge && report.ItemId != id;
+                if (!contradicted)
+                {
+                    _staleCarries.Remove(id);
+                    continue;
+                }
+
+                if (!_staleCarries.TryGetValue(id, out var stale))
+                {
+                    _staleCarries[id] = new StaleCarry { NextQuery = now + StaleCarryGrace };
+                    continue;
+                }
+                if (now < stale.NextQuery) continue;
+
+                if (stale.Queries >= StaleCarryMaxQueries)
+                {
+                    _staleCarryGiveUpScratch.Add(id);
+                    continue;
+                }
+
+                stale.Queries++;
+                stale.NextQuery = now + StaleCarryQueryInterval;
+                SendItemReleaseQuery(id, carrier);
+            }
+
+            foreach (var id in _staleCarryGiveUpScratch)
+            {
+                var item = _remoteHeldItems[id];
+                Plugin.Log.LogWarning($"[ITEM] Nothing came back about {item.name} ({id}); letting go of it where it is");
+                _staleCarries.Remove(id);
+
+                IsApplyingRemoteState = true;
+                try
+                {
+                    _heldItems.Remove(id);
+                    _remoteHeldItems.Remove(id);
+                    RemoveFromGuestInventory(id);
+                    ClearSyncedHeldItemById(id);
+                    RearmRemoteHeldItemPhysics(item, id);
+                }
+                finally
+                {
+                    IsApplyingRemoteState = false;
+                }
+            }
+        }
+
+        private void SendItemReleaseQuery(int instanceId, SteamId carrier)
+        {
+            Plugin.Log.LogWarning($"[ITEM] Item {instanceId} still shows in {carrier}'s hands here but their hands report something else; asking them");
+            var packet = new ItemReleaseQueryPacket { ItemInstanceId = instanceId, CarrierSteamId = carrier.Value };
+            if (Plugin.IsHost)
+                Plugin.NetworkManager.SendReliable(carrier, PacketType.ItemReleaseQuery, w => PacketSerializer.WriteItemReleaseQuery(w, packet));
+            else
+                Plugin.NetworkManager.SendToAllReliable(PacketType.ItemReleaseQuery, w => PacketSerializer.WriteItemReleaseQuery(w, packet));
+        }
+
+        /// <summary>The carrier's side: say again whatever is true of the item now.</summary>
+        public void OnRemoteItemReleaseQuery(ItemReleaseQueryPacket packet)
+        {
+            if (packet.CarrierSteamId != SteamClient.SteamId.Value)
+            {
+                // Guest to guest goes through the host.
+                if (Plugin.IsHost)
+                    Plugin.NetworkManager.SendReliable(new SteamId { Value = packet.CarrierSteamId }, PacketType.ItemReleaseQuery,
+                        w => PacketSerializer.WriteItemReleaseQuery(w, packet));
+                return;
+            }
+
+            int id = packet.ItemInstanceId;
+            var item = FindItemByInstanceId(id);
+            if (item == null) item = FindInactiveItemByInstanceId(id);
+            if (item == null)
+            {
+                Plugin.Log.LogWarning($"[ITEM] Asked about item {id}, which does not exist here");
+                return;
+            }
+
+            var pointer = Object.FindObjectOfType<GoPointer>();
+            if (pointer != null && ReferenceEquals(pointer.GetHeldItem(), item)) return; // Still in hand; the stream was behind
+
+            var prefab = item.GetComponent<SaveablePrefab>();
+            if (prefab == null) return;
+
+            int slot = item.GetCurrentInventorySlot();
+            var crate = prefab.currentCrateId != 0 ? FindItemByInstanceId(prefab.currentCrateId)?.GetComponent<CrateInventory>() : null;
+            var hangable = item.GetComponent<HangableItem>();
+
+            Plugin.Log.LogWarning($"[ITEM] A crewmate still saw {item.name} ({id}) in this player's hands. " +
+                $"sold={item.sold} slot={slot} crate={prefab.currentCrateId} hanging={hangable != null && hangable.IsHanging()} " +
+                $"attached={(item.itemRigidbodyC != null && item.itemRigidbodyC.attached)} wallAttachment={item.wallAttachment}");
+
+            if (slot >= 100) return; // Handed to a cargo carrier, which has its own packets
+            if (slot >= 0)
+            {
+                OnLocalPickup(item, slot);
+                return;
+            }
+            if (crate != null && crate.containedItems.Contains(item))
+            {
+                OnLocalItemInsertedInCrate(item, crate);
+                return;
+            }
+            if (hangable != null && hangable.IsHanging())
+            {
+                var hook = HarmonyLib.Traverse.Create(hangable).Field("currentHook").GetValue<Collider>()?.GetComponent<ShipItem>();
+                if (hook != null)
+                {
+                    OnLocalItemHung(item, hook);
+                    return;
+                }
+            }
+
+            SendDropPacket(item, id, armSettleTerminal: false);
         }
 
         // === Items a guest never received ===

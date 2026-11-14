@@ -346,5 +346,27 @@ namespace SailwindCoop.Networking.Packets
         BoatItemsRequest = 228,          // Guest -> host
         BoatItems = 229,                 // Host -> requesting guest / host -> all
         ItemResyncRequest = 230,         // Guest -> host: "I was told about this id and do not have it"
+
+        // Where an anchor physically is. The anchor is a PickupableItem but not a ShipItem, so item sync never
+        // saw it, and AnchorEvent carries only set + rope length. See AnchorPoseSync.
+        AnchorPose = 231,                // Carrier or setter -> all (host relays); host -> all for set anchors
+
+        // HooksHangMore keeps what hangs on a hook in a dictionary local to each machine. See HooksHangMoreCompat.
+        HookAttachment = 232,            // Hanger -> all (host relays); host -> joiner as a replay
+
+        // A receiver still shows an item in a crewmate's hands, while that crewmate's own position stream says
+        // the hands hold something else. The carrier answers with whatever state the item is really in.
+        ItemReleaseQuery = 233,          // Viewer -> carrier (through the host when both are guests)
+
+        // 234 and 235 are reserved for the table games on branch table-games.
+
+        // MusicMod: a crewmate struck a note, or changed the note they hold. See MusicModCompat.
+        InstrumentNote = 236,            // Player -> all (host relays)
+
+        // Sail Damage: the host's damage, patches and studding sail damage per sail. See SailDamageCompat.
+        SailDamage = 237,                // Host -> all; guest -> host (a mend), host relays; host -> joiner (replace all)
+
+        // FurstMate's pets: host world, poses and events -> all; a guest's requests -> host. See FurstMateCompat.
+        FurstMate = 238,
     }
 }

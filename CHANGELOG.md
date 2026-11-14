@@ -14,6 +14,53 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.6.0 - 2026-11-14
+
+> Built for Sailwind 0.40.1. **Sailwind Player Model v0.2.0** is included in the zip and installs
+> alongside co-op. None of this release has been played in a live session yet.
+
+### Added
+
+- **Postal Expansion works in co-op.** The host's mail boards are shared on every tab, special mail
+  keeps its kind on every machine, and the host completes a crewmate's delivery. A letter only counts
+  at its own drop-off place within its hours. Every player needs the same Postal Expansion version,
+  or nobody has it.
+- **Sail Damage works in co-op.** Only the host's sails tear, and the whole crew sees the same damage
+  and patches. Mending by hand or at the shipyard reaches everyone, and a joining player takes the
+  host's sail damage in place of their own save's.
+- **MusicMod and Viking Horn work in co-op.** Crewmates hear each other play the lute, nakers, flute
+  and hurdy-gurdy, and blow the horn.
+- **HooksHangMore works in co-op.** Items and anchors hung on its hooks stay hung for the whole crew,
+  and a joining player sees them.
+- **FurstMate works in co-op.** The host's dog, cat and booby are the crew's pets. Petting, feeding,
+  commands, calling a pet, buying the dog and taming the cat or the booby work from any crewmate.
+- **Crewmates see custom colors, patterns and stubble** from the Player Model character screen.
+
+### Fixed
+
+- **Players lost food and water at different rates depending on frame rate.** The game refills food
+  debt once per frame and charges running and swimming by the distance moved in one frame. In a co-op
+  session both now cost per second what they cost at 60 fps. Solo play is unchanged.
+  `Coop.NeedsFrameRateFix` turns it off. This is the likely cause of guests draining faster than the
+  host, which is not yet confirmed in a live session.
+- **An anchor a crewmate carried stayed frozen in mid-air for everyone else,** with its rope running to
+  where it was set. The carried anchor now shows in their hands, falls where it is let go and sits
+  where it is set, and nobody else can grab it while it is carried.
+- **An item a crewmate set down could stay in their hands on other machines.** A stale crate id could
+  skip the drop, and a duplicate id could apply it to the other copy. A machine that still shows an
+  item in a crewmate's hands while their hands hold something else now asks them, and lets go of it
+  after about 6 seconds without an answer. Both sides log an `[ITEM]` warning.
+- **A crewmate's fishing bobber landed short and crept to where it belonged.**
+- **A host mission with cargo from a mod a guest does not have hid the rest of the guest's missions.**
+  That mission is skipped and logged.
+
+### Changed
+
+- **Invites are a tab of the Friends screen,** from the title screen or the pause menu. The Friends
+  button shows how many invites are waiting, and the screen opens on Invites when there are any.
+- **Co-op does not load alongside pander33's SailwindCoop LAN co-op mod.** Both patch the same game
+  code, so BepInEx skips this mod and logs why.
+
 ## v0.5.0 - 2026-11-04
 
 > Built for Sailwind 0.40. **Sailwind Player Model v0.1.6** is included in the zip and installs

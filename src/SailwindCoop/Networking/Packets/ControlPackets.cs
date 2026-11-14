@@ -40,6 +40,24 @@ namespace SailwindCoop.Networking.Packets
         public float RopeLength;
     }
 
+    public enum AnchorPoseState : byte
+    {
+        Carried = 0,     // In a crewmate's hand. Boat-relative pose, sent unreliably about 10 times a second.
+        Released = 1,    // Just left the hand. Boat-relative pose, reliable. Each machine simulates the fall from here.
+        Set = 2,         // Just set on the bottom. Real-world pose, reliable, sent right before the AnchorEvent.
+        SetRefresh = 3,  // Host's periodic word on a set anchor. Real-world pose, unreliable.
+    }
+
+    [Serializable]
+    public struct AnchorPosePacket
+    {
+        public string BoatName;
+        public AnchorPoseState State;
+        public Vector3 Position;
+        public Quaternion Rotation;
+        public float RopeLength;  // 0-1 normalized, RopeControllerAnchor.currentLength
+    }
+
     /// <summary>(v0.2.32) Where a moored rope is attached. Towable Boats reuses the vanilla mooring
     /// SpringJoint with the bollard (TowingCleat) on a MOVING boat, so a world-space dock position
     /// is wrong the instant the towing boat moves - boat targets travel as (towBoatName, cleatPath)

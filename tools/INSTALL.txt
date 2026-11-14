@@ -1,4 +1,4 @@
-Sailwind Co-op v0.5.0  [game v0.40]
+Sailwind Co-op v0.6.0  [game v0.40.1]
 
 This version needs the Sailwind Player Model mod. It is included in this zip and installs
 alongside co-op. If you already have Sailwind Player Model installed, this zip overwrites it

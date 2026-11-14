@@ -41,6 +41,12 @@ namespace SailwindCoop.Sync
         // movement > BobberCoalesceDelta.
         private readonly Dictionary<int, Vector3> _lastSentBobberPos = new Dictionary<int, Vector3>();
         private const float BobberCoalesceDelta = 0.5f; // metres of world movement before a resend
+        // A cast often comes to rest less than BobberCoalesceDelta from its last in-flight sample, which left every
+        // viewer's bobber at that stale spot until waves or drift moved the real one half a metre: it seemed to drop
+        // short and then creep to where it belonged. Any smaller change still goes out once a second.
+        private const float BobberSettleDelta = 0.05f;
+        private const float BobberSettleInterval = 1f;
+        private readonly Dictionary<int, float> _lastSentBobberTime = new Dictionary<int, float>();
 
         // B (receive side): remote-owned bobbers are made kinematic (joint/float forces ignored) and
         // lerped to the streamed target every frame; a boat-frame target tracks the boat between
@@ -220,10 +226,17 @@ namespace SailwindCoop.Sync
         private void SyncOneCastRodBobber(int rodId, ShipItemFishingRod rod, ConfigurableJoint bobberJoint)
         {
             Vector3 worldPos = bobberJoint.transform.position;
-            if (_lastSentBobberPos.TryGetValue(rodId, out var last)
-                && (worldPos - last).sqrMagnitude <= BobberCoalesceDelta * BobberCoalesceDelta)
-                return;
+            if (_lastSentBobberPos.TryGetValue(rodId, out var last))
+            {
+                float moved = (worldPos - last).sqrMagnitude;
+                bool settleDue = _lastSentBobberTime.TryGetValue(rodId, out var sentAt)
+                                 && Time.unscaledTime - sentAt >= BobberSettleInterval
+                                 && moved > BobberSettleDelta * BobberSettleDelta;
+                if (moved <= BobberCoalesceDelta * BobberCoalesceDelta && !settleDue)
+                    return;
+            }
             _lastSentBobberPos[rodId] = worldPos;
+            _lastSentBobberTime[rodId] = Time.unscaledTime;
 
             Transform boatModel = rod.currentActualBoat;
             if (boatModel == null)
@@ -1127,6 +1140,7 @@ namespace SailwindCoop.Sync
             _castRods.Clear();
             _lastSentLineLength.Clear();
             _lastSentBobberPos.Clear();
+            _lastSentBobberTime.Clear();
             _lastStateSyncTime = 0f;
         }
 

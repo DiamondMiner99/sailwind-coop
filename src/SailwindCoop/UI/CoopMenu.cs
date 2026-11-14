@@ -78,8 +78,8 @@ namespace SailwindCoop.UI
                 clone.transform.localScale = template.localScale;
                 SetLabel(clone.transform, "Friends");
 
-                // No Invites row here. The title screen had one and players found it confusing; invites are
-                // answered from the pause menu's Invites button once a world is loaded.
+                // No Invites row here. The title screen had one and players found it confusing. Invites are a tab
+                // of the Friends screen this button opens (2026-11-14), the same as from the pause menu.
 
                 // Directly above Settings: below New Game as asked, and unambiguous whether or not Continue
                 // is present (an install with no saves hides Continue entirely).

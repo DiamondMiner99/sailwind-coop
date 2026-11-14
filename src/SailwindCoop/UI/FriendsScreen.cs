@@ -34,7 +34,7 @@ namespace SailwindCoop.UI
         private static bool _reopenPauseOnClose;
         private static Vector2 _scroll;
         private static bool _stylesBuilt;
-        private static GUIStyle _panel, _title, _label, _small, _button, _band, _name;
+        private static GUIStyle _panel, _title, _label, _small, _button, _band, _name, _tabOn;
         private static Texture2D _panelTex, _titleTex, _bandTex;
         private static int _keyConsumedFrame = -1;
         /// <summary>Title-menu buttons we switched off while this screen covers them. See SuppressMenuButtons.</summary>
@@ -51,8 +51,21 @@ namespace SailwindCoop.UI
         /// title buttons underneath) applies to both the same way.</summary>
         private enum Page { Friends, Invites }
         private static Page _page;
+        // A tab click lands here and takes effect on the next Layout event. Switching mid-event drew controls the
+        // Layout pass never measured, and Unity threw "Getting control N's position" for that event.
+        private static Page? _pendingPage;
 
-        public static void Open() { Open(Page.Friends); }
+        /// <summary>
+        /// Opens on Invites when any are waiting (the button's count is what drew the click), otherwise on
+        /// Friends. Invites are a tab of this screen, and only while not in a lobby; joining empties the list.
+        /// </summary>
+        public static void Open() { Open(InviteCount() > 0 && !Plugin.IsMultiplayer ? Page.Invites : Page.Friends); }
+
+        private static int InviteCount()
+        {
+            var lm = Plugin.LobbyManager;
+            return lm != null && lm.Invites != null ? lm.Invites.Count : 0;
+        }
 
         public static void OpenInvites() { Open(Page.Invites); }
 
@@ -66,6 +79,7 @@ namespace SailwindCoop.UI
                     return;
                 }
                 _page = page;
+                _pendingPage = null;
                 _scroll = Vector2.zero;
                 _open = true;
                 // (v0.3.0) Remember whether we are covering the PAUSE parchment, so closing restores only
@@ -201,6 +215,10 @@ namespace SailwindCoop.UI
             _button.normal.textColor = SailwindSkin.InkColor;
             _button.hover.textColor = SailwindSkin.ParchmentDark;
 
+            _tabOn = new GUIStyle(_button);
+            _tabOn.normal.background = _tabOn.hover.background = _tabOn.active.background = _titleTex;
+            _tabOn.normal.textColor = _tabOn.hover.textColor = _tabOn.active.textColor = SailwindSkin.Parchment;
+
             _band = new GUIStyle(GUI.skin.box) { padding = new RectOffset(10, 10, 8, 8), alignment = TextAnchor.UpperLeft };
             _band.normal.background = _bandTex;
 
@@ -219,8 +237,28 @@ namespace SailwindCoop.UI
 
             GUI.depth = 0;
             GUILayout.BeginArea(new Rect(x, y, w, h), _panel);
+            if (_pendingPage.HasValue && Event.current.type == EventType.Layout)
+            {
+                _page = _pendingPage.Value;
+                _pendingPage = null;
+                _scroll = Vector2.zero;
+            }
+            if (Plugin.IsMultiplayer) _page = Page.Friends;
             GUILayout.Label(_page == Page.Invites ? "Invites" : "Friends playing now", _title);
             GUILayout.Space(8f);
+
+            if (!Plugin.IsMultiplayer)
+            {
+                int n = InviteCount();
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("Friends", _page == Page.Friends ? _tabOn : _button, GUILayout.Width(150f)))
+                    _pendingPage = Page.Friends;
+                if (GUILayout.Button(n > 0 ? "Invites (" + n + ")" : "Invites", _page == Page.Invites ? _tabOn : _button, GUILayout.Width(150f)))
+                    _pendingPage = Page.Invites;
+                GUILayout.FlexibleSpace();
+                GUILayout.EndHorizontal();
+                GUILayout.Space(6f);
+            }
 
             _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
 

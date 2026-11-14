@@ -299,7 +299,7 @@ namespace SailwindCoop.Patches
         static readonly AccessTools.FieldRef<Anchor, SaveableObject> AnchorBoatSaveableRef =
             AccessTools.FieldRefAccess<Anchor, SaveableObject>("boatSaveable");
 
-        static SaveableObject ResolveAnchorBoat(Anchor anchor)
+        internal static SaveableObject ResolveAnchorBoat(Anchor anchor)
         {
             var boat = AnchorBoatSaveableRef(anchor);
             if (boat != null) return boat;
@@ -342,9 +342,12 @@ namespace SailwindCoop.Patches
         /// guest is literally holding the anchor; a set is allowed briefly after a local hold (drop).</summary>
         private static bool AllowAnchorTransition(Anchor __instance, bool isRelease)
         {
-            if (!Plugin.IsMultiplayer || Plugin.IsHost) return true;               // host sim is authoritative
+            if (!Plugin.IsMultiplayer) return true;
             if (ControlSyncManager.Instance?.IsApplyingRemoteState == true) return true; // host-sent state applies freely
             if (!_inAnchorAutoUpdate) return true;                                  // manual/load paths untouched
+            // In a crewmate's hand on this machine: its stale ground contacts must not set it mid-carry, on any role.
+            if (AnchorPoseSync.IsRemotelyCarried(__instance)) return false;
+            if (Plugin.IsHost) return true;                                         // host sim is authoritative
 
             if (isRelease)
             {
@@ -370,6 +373,13 @@ namespace SailwindCoop.Patches
                 if (__instance.held != null)
                     _anchorLastHeldTime[__instance.GetInstanceID()] = UnityEngine.Time.time;
                 _inAnchorAutoUpdate = true;
+            }
+
+            // Vanilla just wrote isKinematic and isTrigger from its own (null) held. Overrule it for a remote carry.
+            [HarmonyPostfix]
+            public static void Postfix(Anchor __instance)
+            {
+                if (Plugin.IsMultiplayer) AnchorPoseSync.OnAnchorFixedUpdate(__instance);
             }
 
             // Finalizer, not postfix: the flag must clear even if vanilla throws mid-update,
@@ -460,6 +470,9 @@ namespace SailwindCoop.Patches
                 var ropeLength = joint?.linearLimit.limit ?? 0f;
 
                 VerboseLogger.ControlLocal($"Anchor set, boat={boat.gameObject.name}, ropeLen={ropeLength:F2}");
+
+                // Before the event, so a receiver's SetAnchor freezes the body in the right place.
+                AnchorPoseSync.SendSetPose(__instance, boat);
 
                 ControlSyncManager.Instance?.OnLocalAnchorChanged(
                     boat.gameObject.name,

@@ -7,8 +7,8 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.5.0-blue)](../../releases)
-[![game](https://img.shields.io/badge/Sailwind-v0.40-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
+[![version](https://img.shields.io/badge/version-v0.6.0-blue)](../../releases)
+[![game](https://img.shields.io/badge/Sailwind-v0.40.1-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -131,6 +131,40 @@ which hulls get a towing cleat at all, so it's checked alongside presence and ve
 A crew with mismatched Towable Boats installs, or a mismatched "Small boats can tow"
 setting, is refused at join. `Coop.AllowModMismatch` bypasses this check as well.
 
+### Postal Expansion (v0.6.0+)
+
+Compatible with DogEggz's **Postal Expansion**. The host's mail boards are shared on every
+tab, special mail (urgent, golden, registered and anonymous letters) keeps its kind on every
+machine, and the host completes every delivery, so a letter only counts at its own drop-off
+place within its hours.
+
+Every player needs the same Postal Expansion version, or nobody has it. A mismatched crew is
+refused at join. `Coop.AllowModMismatch` bypasses this check.
+
+### Sail Damage (v0.6.0+)
+
+Compatible with FluffyJesus's **Sail Damage**. Only the host's sails tear, and every crewmate
+sees the same damage and patches. Mending by hand or at the shipyard reaches the whole crew,
+and a joining player takes the host's sail damage in place of their own save's. A crewmate
+without Sail Damage sees whole sails, so it is not checked at join.
+
+### MusicMod and Viking Horn (v0.6.0+)
+
+Compatible with Viking-D-Mike's **MusicMod** and **Viking Horn**. Crewmates hear each other
+play the lute, nakers, flute and hurdy-gurdy, and blow the horn. Neither is checked at join.
+
+### HooksHangMore (v0.6.0+)
+
+Compatible with bryon82's **HooksHangMore**. Items and anchors hung on its hooks stay hung for
+the whole crew, and a joining player sees them. It is not checked at join.
+
+### FurstMate (v0.6.0+)
+
+Compatible with Dixiecapt's **FurstMate**. The host's dog, cat and booby are the crew's pets,
+in the same place for everyone. Petting, feeding, commands, calling a pet, buying the dog and
+taming the cat or the booby work from any crewmate and are applied by the host. A crewmate
+without FurstMate sees no pets, so it is not checked at join.
+
 ## Install
 
 Every player - host and guests - installs the mod, and **everyone needs the same version**.
@@ -232,7 +266,7 @@ MaxPlayers = 8
   session are not supported yet.
 - **Shared, host-authoritative wallet.** Money is one crew pool owned by the host; purchases
   by guests are validated against it.
-- Everyone must run the **same mod version and the same Sailwind version** (targets v0.40).
+- Everyone must run the **same mod version and the same Sailwind version** (targets v0.40.1).
 - Full list: **[KNOWN-ISSUES.md](KNOWN-ISSUES.md)**.
 
 ## Building from source

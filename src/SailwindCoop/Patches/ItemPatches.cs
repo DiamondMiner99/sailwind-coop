@@ -17,8 +17,9 @@ namespace SailwindCoop.Patches
         /// </summary>
         [HarmonyPatch(typeof(GoPointer), "PickUpItem")]
         [HarmonyPostfix]
-        public static void OnPickUpItem(GoPointer __instance, PickupableItem item)
+        public static void OnPickUpItem(GoPointer __instance, PickupableItem item, bool __runOriginal)
         {
+            if (!__runOriginal) return;
             if (!Plugin.IsMultiplayer) return;
             if (ItemSyncManager.Instance?.IsApplyingRemoteState == true) return;
 

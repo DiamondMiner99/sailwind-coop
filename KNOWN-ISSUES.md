@@ -17,9 +17,10 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 
 ## Open / deferred
 
-- 🟠 **Guests losing rest, food and water about three times as fast as the host.** Reported, with
-  no cause found in the code. Co-op writes a `[NEEDS]` line to `BepInEx/LogOutput.log` every 30 seconds
-  on every machine. The lines from both machines would show whether a real multiplier is involved.
+- 🟠 **Guests losing rest, food and water about three times as fast as the host.** v0.6.0 makes the
+  game's food-debt refill and its running and swimming costs independent of frame rate in co-op
+  sessions, which is the likely cause. Not yet confirmed in a live session. Co-op still writes a
+  `[NEEDS]` line to `BepInEx/LogOutput.log` every 30 seconds on every machine.
 
 - 🟡 **Randomized forage follows the host.** The host spawns it for the crew and only within 300 m of
   its own camera, so a guest alone on an island sees it only while the host is nearby.
@@ -70,7 +71,7 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 - 🟡 **Everyone must run the same mod build AND the same Sailwind version.** Since v0.2.28
   the host refuses joins from a mismatched mod version with a clear message on both screens
   (older builds still fail silently against each other).
-- 🟡 **Targets Sailwind v0.40.** Game updates can break the Harmony hooks; a new game patch
+- 🟡 **Targets Sailwind v0.40.1.** Game updates can break the Harmony hooks; a new game patch
   may need a mod update.
 - 🟡 **Heavy Harmony patching**: may conflict with other mods that patch the same systems.
 - 🟡 **No dedicated servers.** Co-op is host-authoritative over Steam P2P via friend invites

@@ -122,7 +122,15 @@ namespace SailwindCoop.Player
             byte m = (byte)PlayerAppearance.ColorSlotCount;
             w.Write(m);
             for (int i = 0; i < m; i++) w.Write(a.GetColor(i));
+            // Then the whole look as Player Model saves it, which carries what the bytes cannot: custom colors and parts
+            // painted on their own, and whatever Player Model adds later, with no change here. Keyed, so a receiver skips
+            // keys it does not know. The bytes above stay for a reader that stops before this.
+            string full = a.Serialize();
+            if (full != null && full.Length <= MaxLookLength) w.Write(full);
         }
+
+        // A full look is a few hundred characters; this leaves room for every part painted and then some.
+        private const int MaxLookLength = 4096;
 
         /// <summary>Receive path. Never throws; a bad appearance packet must not disturb a session.</summary>
         public static void OnReceived(SteamId sender, System.IO.BinaryReader reader)
@@ -148,6 +156,13 @@ namespace SailwindCoop.Player
                         byte v = reader.ReadByte();
                         if (i < PlayerAppearance.ColorSlotCount) a.SetColor(i, v);
                     }
+                }
+                // The full look, if the sender wrote one. It replaces the bytes read above, which it contains. Length-
+                // checked before it is parsed; Deserialize clamps every value and drops keys it does not know.
+                if (reader.BaseStream.Position < reader.BaseStream.Length)
+                {
+                    string full = reader.ReadString();
+                    if (!string.IsNullOrEmpty(full) && full.Length <= MaxLookLength) a = PlayerAppearance.Deserialize(full);
                 }
 
                 if (authorId == SteamClient.SteamId.Value) return;   // relay echo of our own

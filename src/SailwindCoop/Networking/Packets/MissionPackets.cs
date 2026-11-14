@@ -19,6 +19,9 @@ namespace SailwindCoop.Networking.Packets
         public float Distance;
         public int DueDay;
         public bool IsValid;            // false = empty slot
+        // Postal Expansion keeps what kind of mail a mission is beside it, not on it (PostalExpansionCompat).
+        public byte PostalKind;         // 0 none, 1 urgent, 2 golden, 3 registered letter, 4 anonymous letter
+        public string PostalLetterId;   // the letter's definition id (kinds 3 and 4)
     }
 
     /// <summary>
@@ -71,6 +74,10 @@ namespace SailwindCoop.Networking.Packets
         public int BoardSlot;           // 0-4 on the displayed board
         public int Page;                // Mission board page
         public bool IsWorldMission;     // Local vs world tab
+        // Postal Expansion: its boards are rebuilt for every look, so the host finds the offer by what it is.
+        public byte Tab;
+        public bool HasIdentity;
+        public NetworkMissionData Identity;
     }
 
     /// <summary>
@@ -91,6 +98,7 @@ namespace SailwindCoop.Networking.Packets
         public int PortIndex;
         public int Page;
         public bool IsWorldMission;
+        public byte Tab;                // Postal Expansion's tab: 0 local, 1 world, 2 mail
     }
 
     /// <summary>
@@ -130,6 +138,7 @@ namespace SailwindCoop.Networking.Packets
         public int ItemInstanceId;
         public int PrefabIndex;
         public int PortIndex;
+        public byte DeliveryKind;       // 0 at the post office, 1 at a Postal Expansion letter's own location
     }
 
     /// <summary>

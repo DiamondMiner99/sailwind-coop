@@ -797,6 +797,112 @@ namespace SailwindCoop.Networking.Packets
             };
         }
 
+        public static void WriteAnchorPose(BinaryWriter writer, AnchorPosePacket packet)
+        {
+            writer.Write(packet.BoatName ?? "");
+            writer.Write((byte)packet.State);
+            WriteVector3(writer, packet.Position);
+            WriteQuaternion(writer, packet.Rotation);
+            writer.Write(packet.RopeLength);
+        }
+
+        public static AnchorPosePacket ReadAnchorPose(BinaryReader reader)
+        {
+            return new AnchorPosePacket
+            {
+                BoatName = reader.ReadString(),
+                State = (AnchorPoseState)reader.ReadByte(),
+                Position = ReadVector3(reader),
+                Rotation = ReadQuaternion(reader),
+                RopeLength = reader.ReadSingle()
+            };
+        }
+
+        public static void WriteHookAttachment(BinaryWriter writer, HookAttachmentPacket packet)
+        {
+            writer.Write((byte)packet.Kind);
+            writer.Write(packet.Attached);
+            writer.Write(packet.HookInstanceId);
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.BoatName ?? "");
+        }
+
+        public static HookAttachmentPacket ReadHookAttachment(BinaryReader reader)
+        {
+            return new HookAttachmentPacket
+            {
+                Kind = (HookAttachmentKind)reader.ReadByte(),
+                Attached = reader.ReadBoolean(),
+                HookInstanceId = reader.ReadInt32(),
+                ItemInstanceId = reader.ReadInt32(),
+                BoatName = reader.ReadString()
+            };
+        }
+
+        public static void WriteInstrumentNote(BinaryWriter writer, InstrumentNotePacket packet)
+        {
+            writer.Write((byte)packet.Kind);
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.Playing);
+            writer.Write(packet.Note);
+        }
+
+        public static InstrumentNotePacket ReadInstrumentNote(BinaryReader reader)
+        {
+            return new InstrumentNotePacket
+            {
+                Kind = (InstrumentNoteKind)reader.ReadByte(),
+                ItemInstanceId = reader.ReadInt32(),
+                Playing = reader.ReadBoolean(),
+                Note = reader.ReadSByte()
+            };
+        }
+
+        public static void WriteSailDamage(BinaryWriter writer, SailDamagePacket packet)
+        {
+            writer.Write(packet.ReplaceAll);
+            int count = packet.Entries != null ? packet.Entries.Count : 0;
+            writer.Write(count);
+            for (int i = 0; i < count; i++)
+            {
+                var e = packet.Entries[i];
+                writer.Write(e.Key ?? "");
+                for (int v = 0; v < 6; v++)
+                    writer.Write(e.Values != null && v < e.Values.Length ? e.Values[v] : 0f);
+            }
+        }
+
+        public static SailDamagePacket ReadSailDamage(BinaryReader reader)
+        {
+            var packet = new SailDamagePacket { ReplaceAll = reader.ReadBoolean() };
+            int count = reader.ReadInt32();
+            if (count < 0 || count > 4096) throw new InvalidDataException($"SailDamage entry count {count}");
+            packet.Entries = new List<SailDamageEntry>(count);
+            for (int i = 0; i < count; i++)
+            {
+                var e = new SailDamageEntry { Key = reader.ReadString(), Values = new float[6] };
+                for (int v = 0; v < 6; v++)
+                    e.Values[v] = Mathf.Clamp01(reader.ReadSingle());
+                packet.Entries.Add(e);
+            }
+            return packet;
+        }
+
+        public static void WriteItemReleaseQuery(BinaryWriter writer, ItemReleaseQueryPacket packet)
+        {
+            writer.Write(packet.ItemInstanceId);
+            writer.Write(packet.CarrierSteamId);
+        }
+
+        public static ItemReleaseQueryPacket ReadItemReleaseQuery(BinaryReader reader)
+        {
+            return new ItemReleaseQueryPacket
+            {
+                ItemInstanceId = reader.ReadInt32(),
+                CarrierSteamId = reader.ReadUInt64()
+            };
+        }
+
         public static void WriteMooringState(BinaryWriter writer, MooringStatePacket packet)
         {
             writer.Write(packet.BoatName);
@@ -2027,6 +2133,8 @@ namespace SailwindCoop.Networking.Packets
                 writer.Write(data.InsuranceLevel);
                 writer.Write(data.Distance);
                 writer.Write(data.DueDay);
+                writer.Write(data.PostalKind);
+                writer.Write(data.PostalLetterId ?? "");
             }
         }
 
@@ -2048,6 +2156,8 @@ namespace SailwindCoop.Networking.Packets
                 data.InsuranceLevel = reader.ReadSingle();
                 data.Distance = reader.ReadSingle();
                 data.DueDay = reader.ReadInt32();
+                data.PostalKind = reader.ReadByte();
+                data.PostalLetterId = reader.ReadString();
             }
             return data;
         }
@@ -2126,17 +2236,24 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.BoardSlot);
             writer.Write(packet.Page);
             writer.Write(packet.IsWorldMission);
+            writer.Write(packet.Tab);
+            writer.Write(packet.HasIdentity);
+            if (packet.HasIdentity) WriteNetworkMissionData(writer, packet.Identity);
         }
 
         public static MissionAcceptRequestPacket ReadMissionAcceptRequest(BinaryReader reader)
         {
-            return new MissionAcceptRequestPacket
+            var packet = new MissionAcceptRequestPacket
             {
                 PortIndex = reader.ReadInt32(),
                 BoardSlot = reader.ReadInt32(),
                 Page = reader.ReadInt32(),
-                IsWorldMission = reader.ReadBoolean()
+                IsWorldMission = reader.ReadBoolean(),
+                Tab = reader.ReadByte(),
+                HasIdentity = reader.ReadBoolean()
             };
+            if (packet.HasIdentity) packet.Identity = ReadNetworkMissionData(reader);
+            return packet;
         }
 
         public static void WriteMissionAbandonRequest(BinaryWriter writer, MissionAbandonRequestPacket packet)
@@ -2157,6 +2274,7 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.PortIndex);
             writer.Write(packet.Page);
             writer.Write(packet.IsWorldMission);
+            writer.Write(packet.Tab);
         }
 
         public static MissionBoardRequestPacket ReadMissionBoardRequest(BinaryReader reader)
@@ -2165,7 +2283,8 @@ namespace SailwindCoop.Networking.Packets
             {
                 PortIndex = reader.ReadInt32(),
                 Page = reader.ReadInt32(),
-                IsWorldMission = reader.ReadBoolean()
+                IsWorldMission = reader.ReadBoolean(),
+                Tab = reader.ReadByte()
             };
         }
 
@@ -2246,6 +2365,7 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.ItemInstanceId);
             writer.Write(packet.PrefabIndex);
             writer.Write(packet.PortIndex);
+            writer.Write(packet.DeliveryKind);
         }
 
         public static DeliverGoodRequestPacket ReadDeliverGoodRequest(BinaryReader reader)
@@ -2254,7 +2374,8 @@ namespace SailwindCoop.Networking.Packets
             {
                 ItemInstanceId = reader.ReadInt32(),
                 PrefabIndex = reader.ReadInt32(),
-                PortIndex = reader.ReadInt32()
+                PortIndex = reader.ReadInt32(),
+                DeliveryKind = reader.ReadByte()
             };
         }
 

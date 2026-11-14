@@ -18,7 +18,6 @@ namespace SailwindCoop.UI
     {
         public const string Host      = "coop_pause_host";
         public const string Secondary = "coop_pause_secondary"; // Invite Friend (host) / Friends
-        public const string Invites   = "coop_pause_invites";   // not in a lobby: invites waiting for an answer
         const string RowPrefix = "coop_pause_player_";
 
         // The crew roster lives on its OWN small parchment scroll to the right of the main menu, rather than
@@ -88,24 +87,6 @@ namespace SailwindCoop.UI
                 },
             });
 
-            ModPauseMenu.Register(new ModPauseMenu.Entry
-            {
-                Id = Invites,
-                Order = 210,
-                // Invites only mean anything while not already aboard a voyage; the list empties on joining.
-                Visible = () => !Plugin.IsMultiplayer,
-                Label = () =>
-                {
-                    int n = Plugin.LobbyManager != null ? Plugin.LobbyManager.Invites.Count : 0;
-                    return n > 0 ? "Invites (" + n + ")" : "Invites";
-                },
-                OnClick = () =>
-                {
-                    if (!Plugin.EnsureCoopReady()) return;
-                    FriendsScreen.OpenInvites();
-                },
-            });
-
             // Only the captain may recover the SHARED boat. A guest running vanilla recovery would teleport
             // the shared boat locally and desync from the host. The button itself is the player model's.
             ModPauseMenu.SetVisible(ModPauseMenu.Recover, () => !(Plugin.IsMultiplayer && !Plugin.IsHost));
@@ -135,9 +116,13 @@ namespace SailwindCoop.UI
 
         static string SecondaryLabel()
         {
-            // Solo, this opens our friends screen, which is where "ask to join" lives. Invites have their own
-            // button beside it.
-            if (!Plugin.IsMultiplayer) return "Friends";
+            // Solo, this opens our friends screen, which is where "ask to join" lives. Invites are a tab on that
+            // screen (2026-11-14: one button, not two, to keep the pause menu short), so their count shows here.
+            if (!Plugin.IsMultiplayer)
+            {
+                int n = Plugin.LobbyManager != null ? Plugin.LobbyManager.Invites.Count : 0;
+                return n > 0 ? "Friends (" + n + ")" : "Friends";
+            }
             if (!Plugin.IsHost) return "Friends"; // a guest can neither invite nor go asking mid-voyage
 
             int members = Plugin.LobbyManager.GetMemberCount();

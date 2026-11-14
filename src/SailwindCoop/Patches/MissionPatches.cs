@@ -164,7 +164,8 @@ namespace SailwindCoop.Patches
                 if (!Plugin.IsMultiplayer || !Plugin.IsHost) return;
 
                 // Carry the good name + total count so guests show the SAME specific toast as the host.
-                string goodName = __instance.goodPrefab?.GetComponent<ShipItem>()?.name ?? "";
+                string goodName = Compat.PostalExpansionCompat.DisplayName(__instance)
+                                  ?? __instance.goodPrefab?.GetComponent<ShipItem>()?.name ?? "";
                 MissionSyncManager.Instance?.BroadcastMissionProgress(
                     __instance.missionIndex,
                     __instance.GetDeliveredCount(),
@@ -186,12 +187,24 @@ namespace SailwindCoop.Patches
         public static class GoodDeliverPatch
         {
             [HarmonyPrefix]
-            public static void Prefix(Good __instance, out int __state)
+            public static bool Prefix(Good __instance, out int __state)
             {
                 __state = -1;
-                if (!Plugin.IsMultiplayer || !Plugin.IsHost || __instance == null) return;
+                if (!Plugin.IsMultiplayer || __instance == null) return true;
                 var prefab = __instance.GetComponent<SaveablePrefab>();
+                if (!Plugin.IsHost)
+                {
+                    // A guest never completes mission cargo itself: the host pays and saves. The office is caught
+                    // earlier (PortDudeDeliveryPatch); this is any other caller, such as Postal Expansion's letter
+                    // drop-off places.
+                    var mission = __instance.GetAssignedMission();
+                    if (mission == null || prefab == null || mission.destinationPort == null) return true;
+                    MissionSyncManager.Instance?.RequestDeliverGood(prefab.instanceId, prefab.prefabIndex,
+                        mission.destinationPort.portIndex, Compat.PostalExpansionCompat.IsLetter(prefab) ? (byte)1 : (byte)0);
+                    return false;
+                }
                 if (prefab != null) __state = prefab.instanceId;
+                return true;
             }
 
             [HarmonyPostfix]
@@ -211,6 +224,7 @@ namespace SailwindCoop.Patches
         /// Intercept guest delivery and route to host.
         /// </summary>
         [HarmonyPatch(typeof(PortDude), "OnTriggerEnter")]
+        [HarmonyBefore(Compat.PostalExpansionCompat.Guid)]
         public static class PortDudeDeliveryPatch
         {
             [HarmonyPrefix]
@@ -228,6 +242,9 @@ namespace SailwindCoop.Patches
 
                 var mission = good.GetAssignedMission();
                 if (mission == null) return true;
+
+                // Postal Expansion's letters are never handed in at an office; its own prefix turns them away.
+                if (Compat.PostalExpansionCompat.IsLetter(other.GetComponent<SaveablePrefab>())) return true;
 
                 var port = __instance.GetPort();
                 if (mission.destinationPort != port)
@@ -338,6 +355,7 @@ namespace SailwindCoop.Patches
         /// Guest requests mission list from host instead of generating locally.
         /// </summary>
         [HarmonyPatch(typeof(MissionListUI), nameof(MissionListUI.EnablePortMissionUI))]
+        [HarmonyBefore(Compat.PostalExpansionCompat.Guid)]
         public static class MissionBoardUIPatch
         {
             [HarmonyPrefix]
@@ -367,6 +385,7 @@ namespace SailwindCoop.Patches
         /// Intercept page change for guest to request from host.
         /// </summary>
         [HarmonyPatch(typeof(MissionListUI), nameof(MissionListUI.ChangePage))]
+        [HarmonyBefore(Compat.PostalExpansionCompat.Guid)]
         public static class MissionBoardPageChangePatch
         {
             [HarmonyPrefix]
@@ -417,6 +436,7 @@ namespace SailwindCoop.Patches
         /// Intercept world/local mission toggle for guest to request from host.
         /// </summary>
         [HarmonyPatch(typeof(MissionListUI), nameof(MissionListUI.ResetPage))]
+        [HarmonyBefore(Compat.PostalExpansionCompat.Guid)]
         public static class MissionBoardResetPagePatch
         {
             [HarmonyPrefix]
