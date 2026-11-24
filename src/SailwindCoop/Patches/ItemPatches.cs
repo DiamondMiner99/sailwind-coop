@@ -115,9 +115,39 @@ namespace SailwindCoop.Patches
                 && Camera.main != null
                 && Vector3.Distance(Camera.main.transform.position, __instance.transform.position) > 300f)
             {
-                VerboseLogger.Log("ITEM", "LOCAL",
-                    $"Suppressed out-of-range auto-destroy of {__instance.name} (co-op: a local range-cull must not delete the shared crate for everyone)");
-                return false; // skip vanilla DestroyItem -> item persists locally, no ItemDestroyed broadcast
+                // 0.41 floating items found at sea are passing scenery to vanilla: never saved, culled once left
+                // behind. Kept alive here, vanilla would log and retry the cull every physics step for the rest
+                // of the session. An unsent one (no id), a crewmate's own roll, or a crewmate's copy of one the
+                // host shared is culled locally, the vanilla way, since the host owns the shared ones' lifetime.
+                // The host's shared ones skip the guard so the destroy reaches the crew and their copies go too.
+                // One someone is holding or carrying keeps the guard.
+                var lootPrefab = RandomFloatingItemSpawnerPatch.IsLoot(__instance) ? __instance.GetComponent<SaveablePrefab>() : null;
+                bool lootHeld = lootPrefab != null && (__instance.held != null
+                    || (lootPrefab.instanceId != 0 && ItemSyncManager.Instance?.IsItemHeld(lootPrefab.instanceId) == true));
+                if (lootPrefab != null && !lootHeld)
+                {
+                    bool localOnly = lootPrefab.instanceId == 0 || !Plugin.IsHost;
+                    // Host, while a crewmate joins: the joiner's snapshot already holds this item and the joiner
+                    // spawns its world items seconds later, so a destroy sent now would miss it and leave a
+                    // phantom there for the session. Vanilla retries the cull every physics step, so it goes
+                    // through, broadcast and all, once the join window closes.
+                    if (!localOnly && ItemSyncManager.Instance?.IgnoreRemoteItemDestruction == true)
+                        return false;
+                    RandomFloatingItemSpawnerPatch.Forget(__instance);
+                    if (localOnly)
+                    {
+                        ItemSyncManager.Instance?.NoteFloatingItemCulled(lootPrefab.instanceId);
+                        VerboseLogger.Log("ITEM", "LOCAL", $"Out-of-range cull of floating item {__instance.name}, local only");
+                        return true; // vanilla destroy, no ItemDestroyed broadcast
+                    }
+                    // Host, shared with the crew: fall through to the broadcast below.
+                }
+                else
+                {
+                    VerboseLogger.Log("ITEM", "LOCAL",
+                        $"Suppressed out-of-range auto-destroy of {__instance.name} (co-op: a local range-cull must not delete the shared crate for everyone)");
+                    return false; // skip vanilla DestroyItem -> item persists locally, no ItemDestroyed broadcast
+                }
             }
 
             // During a RECOVERY, vanilla's sink-teardown (BoatLocalItems.CacheItemsOnSinking

@@ -234,7 +234,10 @@ namespace SailwindCoop.Sync
                 IsOwned = boat.extraSetting,
 
                 // Cleaning
-                DirtTexture = dirtTexture
+                DirtTexture = dirtTexture,
+
+                // (0.41) Paint. GetData hands back a copy.
+                CustomColors = ShipyardSyncManager.PaintSyncOn ? customData?.customColors : null
             };
         }
 
@@ -471,6 +474,10 @@ namespace SailwindCoop.Sync
                 ExtraValue4 = saveData.extraValue4,
 
                 IsNailed = saveData.isNailed,
+
+                // (0.41) Floating item found at sea; not in the save data. The loot list, not ShipItem.farLod,
+                // which some food prefabs also carry.
+                FarLod = Patches.RandomFloatingItemSpawnerPatch.IsLoot(prefab.GetComponent<ShipItem>()),
 
                 HasChartData = saveData.chartData != null,
                 ChartData = ConvertChartData(saveData.chartData)

@@ -215,6 +215,7 @@ namespace SailwindCoop
             // needs for that session. So only mark _savedThisSession when the save will ACTUALLY run; if
             // not committable, return WITHOUT setting it so a later SaveCoopSession can retry.
             // (busy is a private field -> read via Traverse, the mod's established pattern.)
+            Patches.SaveGuard.ClearIfWedged(slm); // a save that died partway would otherwise defer this forever
             bool busy = false;
             try { busy = Traverse.Create(slm).Field("busy").GetValue<bool>(); }
             catch { busy = false; } // if reflection fails, don't block the save; worst case it no-ops harmlessly

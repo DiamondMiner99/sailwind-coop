@@ -9,6 +9,12 @@ namespace SailwindCoop.Networking.Packets
         public bool[] MastsEnabled;
         public NetworkSailData[] Sails;
         public int[] PartActiveOptions;
+        // (0.41) Boat paint, SaveBoatCustomizationData.customColors: one index into PrefabsDirectory.sailColors
+        // per paintable part, -1 unpainted. Null = no paint information, and the receiver keeps its own.
+        public int[] CustomColors;
+        // Only the paint changed since the sender's last packet: the receiver repaints without the full
+        // LoadData sail rebuild.
+        public bool ColorsOnly;
     }
 
     /// <summary>

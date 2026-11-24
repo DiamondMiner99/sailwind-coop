@@ -31,6 +31,11 @@ namespace SailwindCoop.Patches
     /// and floating is what players expect. Setting it OFF makes this postfix return on its first line
     /// for exact current-build (sinking) behavior. Either way the ItemSyncManager settle-terminal
     /// tolerance (~1490-1620) is untouched.
+    ///
+    /// Sailwind 0.41 made this moot: ToggleCollider now enables the floater with the collider again, and
+    /// the item's weight decides whether it floats or sinks. On 0.41 the postfix returns on its first line
+    /// whatever the setting says. It stays applied, rather than skipped through Prepare, so PatchVerifier
+    /// does not report it as a failed patch.
     /// </summary>
     [HarmonyPatch(typeof(ItemRigidbody), "ToggleCollider")]
     public static class ItemBuoyancyRestorePatch
@@ -46,9 +51,15 @@ namespace SailwindCoop.Patches
         private static readonly FieldInfo CurrentBoxField = AccessTools.Field(typeof(ItemRigidbody), "currentBox");
         private static readonly FieldInfo InvSlotField = AccessTools.Field(typeof(ItemRigidbody), "currentInventorySlot");
 
+        // ShipItem.buoyancy arrived in 0.41 together with the vanilla floater toggle, so it marks a build that
+        // floats items on its own.
+        private static readonly bool VanillaFloatsItems = AccessTools.Field(typeof(ShipItem), "buoyancy") != null;
+
         [HarmonyPostfix]
         public static void Postfix(ItemRigidbody __instance, bool state)
         {
+            if (VanillaFloatsItems) return;
+
             // Config gate FIRST: opted OUT (the non-default) = this postfix does nothing at all.
             if (Plugin.RestoreItemBuoyancyConfig == null || !Plugin.RestoreItemBuoyancyConfig.Value) return;
 

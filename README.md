@@ -7,8 +7,8 @@ ropes and dropping anchor, somebody below deck cooking or fishing while the navi
 the next leg. The host opens a lobby, friends join from a Steam invite, and everyone shares
 the same boat, the same world, and the same voyage.
 
-[![version](https://img.shields.io/badge/version-v0.6.0-blue)](../../releases)
-[![game](https://img.shields.io/badge/Sailwind-v0.40.1-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
+[![version](https://img.shields.io/badge/version-v0.6.1-blue)](../../releases)
+[![game](https://img.shields.io/badge/Sailwind-v0.41-1f6feb)](https://store.steampowered.com/app/1764530/Sailwind/)
 [![status](https://img.shields.io/badge/status-alpha-orange)](KNOWN-ISSUES.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -266,7 +266,7 @@ MaxPlayers = 8
   session are not supported yet.
 - **Shared, host-authoritative wallet.** Money is one crew pool owned by the host; purchases
   by guests are validated against it.
-- Everyone must run the **same mod version and the same Sailwind version** (targets v0.40.1).
+- Everyone must run the **same mod version and the same Sailwind version** (targets v0.41).
 - Full list: **[KNOWN-ISSUES.md](KNOWN-ISSUES.md)**.
 
 ## Building from source

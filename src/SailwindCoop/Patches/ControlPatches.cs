@@ -569,6 +569,51 @@ namespace SailwindCoop.Patches
             // "put down", which vanilla's own OnDrop guard already relies on.
             private static readonly AccessTools.FieldRef<PickupableBoatMooringRope, bool> ThrowingRef =
                 AccessTools.FieldRefAccess<PickupableBoatMooringRope, bool>("throwing");
+            private static readonly AccessTools.FieldRef<PickupableBoatMooringRope, Transform> InitialParentRef =
+                AccessTools.FieldRefAccess<PickupableBoatMooringRope, Transform>("initialParent");
+            private static readonly AccessTools.FieldRef<PickupableBoatMooringRope, Vector3> InitialPosRef =
+                AccessTools.FieldRefAccess<PickupableBoatMooringRope, Vector3>("initialPos");
+
+            // (0.41) The bollard this drop is about to auto-tie to, found by the prefix. OnDrop never nests.
+            private static GPButtonDockMooring _autoTieTarget;
+            private static Vector3 _autoTiePos;
+
+            // Ropes this machine just auto-tied, with the time, for MooringCleatTriggerGuardPatch.
+            private static readonly System.Collections.Generic.Dictionary<PickupableBoatMooringRope, float> _localAutoTie =
+                new System.Collections.Generic.Dictionary<PickupableBoatMooringRope, float>();
+            private const float AutoTieMarkerSeconds = 2f;
+
+            /// <summary>
+            /// True, once, when this rope is landing from an auto-tie this machine started in the last two
+            /// seconds and nobody has picked it up since. Leaves every other trigger event alone.
+            /// </summary>
+            internal static bool ConsumeRecentAutoTie(PickupableBoatMooringRope rope)
+            {
+                if (rope == null || !_localAutoTie.TryGetValue(rope, out float t)) return false;
+                _localAutoTie.Remove(rope);
+                return rope.held == null && Time.unscaledTime - t < AutoTieMarkerSeconds;
+            }
+
+            private static void MarkAutoTie(PickupableBoatMooringRope rope)
+            {
+                if (_localAutoTie.Count > 16)
+                {
+                    var stale = new System.Collections.Generic.List<PickupableBoatMooringRope>();
+                    foreach (var kv in _localAutoTie)
+                        if (kv.Key == null || Time.unscaledTime - kv.Value >= AutoTieMarkerSeconds) stale.Add(kv.Key);
+                    foreach (var r in stale) _localAutoTie.Remove(r);
+                }
+                _localAutoTie[rope] = Time.unscaledTime;
+            }
+
+            // A towing cleat on the rope's own boat: MooringCleatTriggerGuardPatch refuses that moor everywhere.
+            private static bool IsSelfTowCleat(PickupableBoatMooringRope rope, GPButtonDockMooring target)
+            {
+                if (!SailwindCoop.Compat.TowableBoatsCompat.IsTowingCleat(target)) return false;
+                var cleatBoat = target.GetComponentInParent<SaveableObject>();
+                var ropeBoat = rope.GetBoatRigidbody()?.GetComponent<SaveableObject>();
+                return cleatBoat != null && cleatBoat == ropeBoat;
+            }
 
             /// <summary>
             /// Read `throwing` BEFORE the body runs, because the body sets it.
@@ -584,13 +629,50 @@ namespace SailwindCoop.Patches
             public static void Prefix(PickupableBoatMooringRope __instance, out bool __state)
             {
                 __state = false;
+                _autoTieTarget = null;
                 try { __state = ThrowingRef(__instance); }
                 catch { /* field moved in a game update: treat as a normal drop, i.e. the old behavior */ }
+                if (__state) return;
+
+                // (0.41) A rope put down within 10 m of a bollard, and nearer to it than to its own hanger, now
+                // flies to that bollard and ties itself on (vanilla OnDrop), without going through ThrowRopeTo.
+                // Repeat vanilla's search here, in the same frame and physics state, so the postfix knows where.
+                try
+                {
+                    if (__instance.IsMoored()) return;
+                    Vector3 pos = __instance.transform.position;
+                    float best = Vector3.Distance(pos, InitialParentRef(__instance).TransformPoint(InitialPosRef(__instance)));
+                    foreach (var col in Physics.OverlapSphere(pos, 10f))
+                    {
+                        var mooring = col.GetComponent<GPButtonDockMooring>();
+                        if (mooring == null) continue;
+                        float d = Vector3.Distance(pos, col.transform.position);
+                        if (d < best)
+                        {
+                            best = d;
+                            _autoTieTarget = mooring;
+                            _autoTiePos = col.transform.position;
+                        }
+                    }
+                }
+                catch { _autoTieTarget = null; /* fields moved: announce a plain release, the old behavior */ }
             }
 
             [HarmonyPostfix]
             public static void Postfix(PickupableBoatMooringRope __instance, bool __state)
             {
+                var tieTarget = _autoTieTarget;
+                _autoTieTarget = null;
+                // Vanilla starts a flight either way (to the bollard or back to the hanger), so `throwing` set
+                // now only confirms that OnDrop really ran; the prefix's search says which flight it was.
+                bool autoTie = false;
+                try { autoTie = !__state && tieTarget != null && ThrowingRef(__instance); }
+                catch { }
+                bool selfTow = autoTie && IsSelfTowCleat(__instance, tieTarget);
+                // Solo too: the trigger guard refuses a tow to the rope's own boat and must then stow the rope,
+                // or it hangs at the cleat.
+                if (selfTow) MarkAutoTie(__instance);
+
                 if (!Plugin.IsMultiplayer) return;
                 if (TitleJoinManager.SuppressLoadErrors || BoatSyncManager.IsJoinInProgress
                     || (!Plugin.IsHost && !BoatSyncManager.HasReceivedWorldState)) return;
@@ -598,6 +680,17 @@ namespace SailwindCoop.Patches
                 // Already throwing on entry: MooringRopeThrowPatch announced this one and knows WHERE it is
                 // going, so a release here would stow it on every other screen mid-flight.
                 if (__state) return;
+
+                // The auto-tie is a throw, so announce it as one. A plain release would stow the rope on every
+                // other screen until the moor packet arrives, the same flicker MooringRopeThrowPatch exists to
+                // prevent. OnLocalThrow also arms the release for a throw that does not moor. A self-tow is
+                // refused everywhere and ends stowed, so it stays a release.
+                if (autoTie && !selfTow)
+                {
+                    Sync.MooringRopeHoldSync.OnLocalThrow(__instance, _autoTiePos);
+                    MarkAutoTie(__instance);
+                    return;
+                }
 
                 Sync.MooringRopeHoldSync.OnLocalHoldChanged(__instance, false);
             }
@@ -919,16 +1012,32 @@ namespace SailwindCoop.Patches
                 if (!SailwindCoop.Compat.TowableBoatsCompat.HasTowingCleat(other.gameObject)) return true;
 
                 // Self-tow guard (all machines, singleplayer included - it is a real mod bug).
+                // (0.41) A rope this machine just dropped near a towing cleat flew there by itself (vanilla
+                // OnDrop's auto-tie) and lands here. Refusing it is not enough on its own: nothing would send
+                // the rope home, and it would hang at the cleat. Only that recent local drop is treated
+                // differently; every other trigger event, including the load-time ones, is left as it was.
+                bool autoTie = MooringRopeDropPatch.ConsumeRecentAutoTie(__instance);
+
                 var cleatBoat = other.GetComponentInParent<SaveableObject>();
                 var ropeBoat = __instance.GetBoatRigidbody()?.GetComponent<SaveableObject>();
                 if (cleatBoat != null && cleatBoat == ropeBoat)
                 {
                     VerboseLogger.ControlLocal($"Blocked SELF-tow trigger moor on {cleatBoat.gameObject.name}");
+                    // The drop already told the crew the rope was put down, so stowing it here agrees with them.
+                    if (autoTie) BoatStateApplicator.StowRopeIfDisplaced(__instance, "auto-tie to own towing cleat refused");
                     return false;
                 }
 
                 if (!Plugin.IsMultiplayer) return true;
                 if (Plugin.IsHost) return true; // host is the tow authority
+
+                // A guest's own drop at another boat's towing cleat: let it tie, as a guest's click on a cleat
+                // already does. MooringAttachPatch sends the moor and the host creates the tow from it.
+                if (autoTie)
+                {
+                    VerboseLogger.ControlLocal($"Guest auto-tie to cleat {other.name} allowed");
+                    return true;
+                }
 
                 // Guest: never trigger-moor to a cleat locally; the host's broadcast re-creates real tows.
                 VerboseLogger.ControlLocal($"Suppressed guest trigger-moor to cleat {other.name}");

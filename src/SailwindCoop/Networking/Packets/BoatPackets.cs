@@ -92,6 +92,9 @@ namespace SailwindCoop.Networking.Packets
 
         public bool IsNailed;
 
+        // (0.41) Floating item found at sea (the spawner's loot list), as ItemSpawnedPacket.FarLod
+        public bool FarLod;
+
         // Chart/map data (null for non-maps)
         public bool HasChartData;
         public NetworkChartData ChartData;
@@ -149,6 +152,9 @@ namespace SailwindCoop.Networking.Packets
 
         // Dirt texture (PNG bytes)
         public byte[] DirtTexture;
+
+        // (0.41) Boat paint, as ShipyardCustomizationPacket.CustomColors. Null = keep the joiner's own.
+        public int[] CustomColors;
     }
 
     [Serializable]

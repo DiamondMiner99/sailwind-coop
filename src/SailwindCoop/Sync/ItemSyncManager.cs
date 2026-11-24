@@ -531,7 +531,8 @@ namespace SailwindCoop.Sync
                 LocalPosition = localPos,
                 // Same frame as LocalPosition: the receiver applies this as localRotation on a boat.
                 Rotation = isOnBoat ? item.transform.localRotation : item.transform.rotation,
-                MissionIndex = missionIndex
+                MissionIndex = missionIndex,
+                FloatingLoot = Patches.RandomFloatingItemSpawnerPatch.IsLoot(item)
             };
 
             VerboseLogger.ItemSend($"ItemResync, id={instanceId}, prefab={prefab.prefabIndex}, onBoat={isOnBoat}, mission={missionIndex}");
@@ -573,6 +574,7 @@ namespace SailwindCoop.Sync
             }
 
             var go = Object.Instantiate(prefabObj);
+            if (packet.FloatingLoot) Patches.RandomFloatingItemSpawnerPatch.RememberRemote(go); // (0.41) floating item
 
             // 3. Set instanceId
             var saveable = go.GetComponent<SaveablePrefab>();
@@ -1586,6 +1588,11 @@ namespace SailwindCoop.Sync
             _justLocallyDestroyed.Clear();
             _recentlyRemoteDestroyed.Clear();
             _unknownPickupDenyCounts.Clear(); // (v0.2.25) ghost-purge deny counters are per-session
+            _pendingCrateInserts.Clear();
+            _culledFloatingItems.Clear();
+            // Floating items are pruned, not cleared: a host who closes the lobby stays in the same world, and
+            // its live floating items must still be recognized if it hosts again.
+            Patches.RandomFloatingItemSpawnerPatch.Prune();
         }
 
         /// <summary>
@@ -4335,7 +4342,8 @@ namespace SailwindCoop.Sync
                 IsLocalPosition = isLocalPosition,
                 Health = item.health,
                 Amount = item.amount,
-                MissionIndex = missionIndex
+                MissionIndex = missionIndex,
+                FarLod = Patches.RandomFloatingItemSpawnerPatch.IsLoot(item)
             };
         }
 
@@ -4451,7 +4459,8 @@ namespace SailwindCoop.Sync
                 IsLocalPosition = isLocalPosition,
                 Health = item.health,
                 Amount = item.amount,
-                MissionIndex = missionIndex
+                MissionIndex = missionIndex,
+                FarLod = Patches.RandomFloatingItemSpawnerPatch.IsLoot(item)
             };
 
             VerboseLogger.ItemSend($"ItemSpawned (scene), id={prefab.instanceId}, prefab={prefab.prefabIndex}, pos={position}, mission={missionIndex}");
@@ -4475,6 +4484,20 @@ namespace SailwindCoop.Sync
         private readonly Dictionary<int, float> _recentlyRemoteDestroyed = new Dictionary<int, float>();
         private const float JustDestroyedDropSuppressWindow = 1f;
         private const float RemoteDestroyedDropSkipWindow = 2f;
+
+        // (0.41) Ids of the host's floating items this crewmate culled locally once it left them behind (see
+        // ItemPatches.OnDestroyItem). The host's own cull broadcast usually follows and finds nothing here, which
+        // is expected, so it is not worth a warning. Capped; an id whose broadcast never comes just ages out.
+        private readonly HashSet<int> _culledFloatingItems = new HashSet<int>();
+        private const int CulledFloatingItemsCap = 256;
+
+        /// <summary>Crewmate: note a floating item from the host that was culled here without a broadcast.</summary>
+        public void NoteFloatingItemCulled(int instanceId)
+        {
+            if (instanceId == 0 || Plugin.IsHost) return;
+            if (_culledFloatingItems.Count >= CulledFloatingItemsCap) _culledFloatingItems.Clear();
+            _culledFloatingItems.Add(instanceId);
+        }
 
         /// <summary>
         /// Called when an item is destroyed locally.
@@ -4670,6 +4693,7 @@ namespace SailwindCoop.Sync
                     ParentObject = 0,
                     DaysInStorage = 0,
                     ExtraValue0 = 0, ExtraValue1 = 0, ExtraValue2 = 0, ExtraValue3 = 0, ExtraValue4 = 0,
+                    FarLod = packet.FarLod,
                     HasChartData = false
                 };
 
@@ -4717,6 +4741,7 @@ namespace SailwindCoop.Sync
 
             // Instantiate at origin temporarily - Load() will set correct position
             var instance = Object.Instantiate(prefab, Vector3.zero, item.Rotation);
+            if (item.FarLod) Patches.RandomFloatingItemSpawnerPatch.RememberRemote(instance); // (0.41) floating item
             var saveable = instance.GetComponent<SaveablePrefab>();
 
             if (saveable != null)
@@ -4774,7 +4799,10 @@ namespace SailwindCoop.Sync
             var item = FindItemByInstanceId(packet.ItemInstanceId);
             if (item == null)
             {
-                Plugin.Log.LogWarning($"OnRemoteItemDestroyed: item {packet.ItemInstanceId} not found");
+                if (_culledFloatingItems.Remove(packet.ItemInstanceId))
+                    VerboseLogger.ItemApply($"ItemDestroyed for floating item {packet.ItemInstanceId}, already culled here");
+                else
+                    Plugin.Log.LogWarning($"OnRemoteItemDestroyed: item {packet.ItemInstanceId} not found");
                 return;
             }
 
@@ -4831,12 +4859,25 @@ namespace SailwindCoop.Sync
             {
                 item.amount = packet.NewAmount;
                 try { item.UpdateLookText(); } catch { } // refresh the displayed liquid/label
+                RefreshItemMass(item);
                 VerboseLogger.ItemApply($"Updated amount for item {packet.ItemInstanceId} to {packet.NewAmount}");
             }
             finally
             {
                 IsApplyingRemoteState = false;
             }
+        }
+
+        /// <summary>
+        /// (0.41) An item's weight now decides whether it floats or sinks, and vanilla recomputes it only on the
+        /// machine that filled, drank from or emptied it. Recompute it here after a crewmate's change too.
+        /// </summary>
+        internal static void RefreshItemMass(ShipItem item)
+        {
+            var body = item != null ? item.itemRigidbodyC : null;
+            if (body == null || body.GetBody() == null) return;
+            try { body.UpdateMass(); }
+            catch (System.Exception e) { VerboseLogger.ItemApply($"UpdateMass failed on {item.name}: {e.Message}"); }
         }
 
         #endregion
@@ -4913,6 +4954,7 @@ namespace SailwindCoop.Sync
             {
                 item.health = packet.NewHealth;
                 try { item.UpdateLookText(); } catch { } // refresh the displayed level (e.g. barrel %)
+                RefreshItemMass(item);
 
                 // K4: rod health IS its hook state (attach sets health=1, detach 0). Refresh the private
                 // hookVisuals via vanilla UpdateHook so a synced attach shows the hook on this machine
@@ -5492,10 +5534,12 @@ namespace SailwindCoop.Sync
                 if (wasRemoteHeld)
                     RearmRemoteHeldItemPhysics(item, packet.ItemInstanceId);
 
-                crate.InsertItem(item);
-                // Diag: capture scale after the crate insert (a crate item should be shrunk; full ~1.0 flags a scale desync).
-                VerboseLogger.ItemApply($"Inserted item {packet.ItemInstanceId} into crate {packet.CrateInstanceId} (scale={item.transform.localScale.x:F3})");
-                RefreshOpenCrateUI(crate);
+                if (InsertIntoCrateWhenReady(crate, item))
+                {
+                    // Diag: capture scale after the crate insert (a crate item should be shrunk; full ~1.0 flags a scale desync).
+                    VerboseLogger.ItemApply($"Inserted item {packet.ItemInstanceId} into crate {packet.CrateInstanceId} (scale={item.transform.localScale.x:F3})");
+                    RefreshOpenCrateUI(crate);
+                }
             }
             finally
             {
@@ -5524,6 +5568,14 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // An insert still waiting for this item's physics body never happened, so the withdraw only cancels it.
+            if (_pendingCrateInserts.Remove(item))
+            {
+                VerboseLogger.ItemApply($"Withdraw of item {packet.ItemInstanceId} canceled its pending insert into crate {packet.CrateInstanceId}");
+                RefreshOpenCrateUI(crate);
+                return;
+            }
+
             IsApplyingRemoteState = true;
             try
             {
@@ -5535,6 +5587,90 @@ namespace SailwindCoop.Sync
             finally
             {
                 IsApplyingRemoteState = false;
+            }
+        }
+
+        // (0.41) Remote crate inserts waiting for a physics body, item -> crate. See InsertIntoCrateWhenReady.
+        private readonly Dictionary<ShipItem, CrateInventory> _pendingCrateInserts = new Dictionary<ShipItem, CrateInventory>();
+        private const int CrateInsertWaitFrames = 10;
+
+        private static bool HasPhysicsBody(ShipItem item)
+        {
+            return item != null && item.itemRigidbodyC != null && item.itemRigidbodyC.GetBody() != null;
+        }
+
+        // The item and the crate's own item both need a body. A crate that is not an item at all is left to
+        // vanilla as before.
+        private static bool CanInsertNow(CrateInventory crate, ShipItem item)
+        {
+            var crateItem = crate.GetComponent<ShipItem>();
+            return HasPhysicsBody(item) && (crateItem == null || HasPhysicsBody(crateItem));
+        }
+
+        /// <summary>
+        /// (0.41) Insert an item into a crate for a remote change, now or as soon as it can take it. 0.41's
+        /// CrateInventory.InsertItem ends by recomputing the item's and the crate's mass, which reads the physics
+        /// body that ItemRigidbody.Start creates. An item spawned this frame has not run Start yet (and one whose
+        /// ItemRigidbody was disabled while it was remote-held waits until it is enabled again), so the insert
+        /// threw partway through. Vanilla's own unseal defers its inserts for the same reason. Returns true when
+        /// the insert ran now; the caller holds IsApplyingRemoteState for that case.
+        /// </summary>
+        private bool InsertIntoCrateWhenReady(CrateInventory crate, ShipItem item)
+        {
+            if (CanInsertNow(crate, item))
+            {
+                _pendingCrateInserts.Remove(item);
+                crate.InsertItem(item);
+                return true;
+            }
+
+            _pendingCrateInserts[item] = crate;
+            StartCoroutine(InsertIntoCrateWhenReadyRoutine(crate, item));
+            VerboseLogger.ItemApply($"Crate insert of {item.name} waits for its physics body");
+            return false;
+        }
+
+        private IEnumerator InsertIntoCrateWhenReadyRoutine(CrateInventory crate, ShipItem item)
+        {
+            for (int frame = 0; frame < CrateInsertWaitFrames; frame++)
+            {
+                yield return null;
+
+                // Canceled by a withdraw, or replaced by a newer insert of the same item.
+                if (!_pendingCrateInserts.TryGetValue(item, out var pending) || pending != crate) yield break;
+                if (item == null || crate == null)
+                {
+                    _pendingCrateInserts.Remove(item);
+                    yield break;
+                }
+                if (!CanInsertNow(crate, item)) continue;
+
+                _pendingCrateInserts.Remove(item);
+                // Someone picked it up meanwhile; their pickup is the newer state.
+                if (item.held != null || IsRemoteHeld(item)) yield break;
+
+                IsApplyingRemoteState = true;
+                try
+                {
+                    crate.InsertItem(item);
+                    VerboseLogger.ItemApply($"Inserted {item.name} into crate after waiting {frame + 1} frame(s) (scale={item.transform.localScale.x:F3})");
+                    RefreshOpenCrateUI(crate);
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"[ITEM] Deferred crate insert of {item.name} failed: {e.Message}");
+                }
+                finally
+                {
+                    IsApplyingRemoteState = false;
+                }
+                yield break;
+            }
+
+            if (_pendingCrateInserts.TryGetValue(item, out var stale) && stale == crate)
+            {
+                _pendingCrateInserts.Remove(item);
+                Plugin.Log.LogWarning($"[ITEM] Gave up a crate insert after {CrateInsertWaitFrames} frames: the item's physics body never appeared");
             }
         }
 
@@ -6164,9 +6300,10 @@ namespace SailwindCoop.Sync
                 crate.amount = 0;
                 crate.UpdateLookText();
 
-                // Update rigidbody mass to reflect empty crate
-                var itemRb = crate.GetComponent<ItemRigidbody>();
-                if (itemRb != null)
+                // Update rigidbody mass to reflect empty crate. The ItemRigidbody lives on its own GameObject,
+                // so it is reached through the item, never GetComponent on the crate.
+                var itemRb = crate.itemRigidbodyC;
+                if (itemRb != null && itemRb.GetBody() != null)
                 {
                     itemRb.UpdateMass();
                 }
@@ -6296,8 +6433,9 @@ namespace SailwindCoop.Sync
             var shipItem = instance.GetComponent<ShipItem>();
             if (shipItem != null)
             {
-                crateInventory.InsertItem(shipItem);
-                Plugin.Log.LogDebug($"[CRATE-UNSEAL] Inserted {instance.name} (id={itemData.InstanceId}) into crate, inventory now has {crateInventory.containedItems?.Count ?? 0} items, scale={shipItem.transform.localScale.x:F3}"); // diag: confirm crate items are shrunk on the guest
+                // Just instantiated, so its physics body does not exist yet and the insert waits a frame or two.
+                if (InsertIntoCrateWhenReady(crateInventory, shipItem))
+                    Plugin.Log.LogDebug($"[CRATE-UNSEAL] Inserted {instance.name} (id={itemData.InstanceId}) into crate, inventory now has {crateInventory.containedItems?.Count ?? 0} items, scale={shipItem.transform.localScale.x:F3}"); // diag: confirm crate items are shrunk on the guest
             }
             else
             {

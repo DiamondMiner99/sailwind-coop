@@ -187,6 +187,7 @@ namespace SailwindCoop.Networking.Packets
         public float Health;
         public float Amount;
         public int MissionIndex;  // -1 if not mission cargo, 0-4 for mission slot
+        public bool FarLod;       // (0.41) floating item found at sea (the spawner's loot list, not ShipItem.farLod): drawn from far away, culled locally when left behind
     }
 
     [Serializable]
@@ -275,6 +276,8 @@ namespace SailwindCoop.Networking.Packets
 
         // Mission link
         public int MissionIndex;      // -1 if not mission cargo, 0-4 for mission slot
+
+        public bool FloatingLoot;     // (0.41) the host's floating item found at sea; written last, read only if present
     }
 
     /// <summary>

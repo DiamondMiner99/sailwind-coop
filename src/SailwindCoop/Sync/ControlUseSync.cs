@@ -8,8 +8,9 @@ using SailwindCoop.Networking.Packets;
 namespace SailwindCoop.Sync
 {
     /// <summary>
-    /// Shows which crewmate is operating the ship's wheel, a rope winch, a bilge pump or a sail pusher, so
-    /// their body is posed on it for everyone else. The pose itself lives in the Sailwind Player Model mod;
+    /// Shows which crewmate is operating the ship's wheel, a rope winch, a bilge pump or a sail pusher, or hauling a
+    /// winch's rope by hand with the Hand Over Hand mod, so their body is posed on it for everyone else. The pose itself
+    /// lives in the Sailwind Player Model mod;
     /// this only tells each machine who is using what.
     ///
     /// WHY IT NEEDS ITS OWN PACKET. The rope, helm and push packets carry the control's STATE (length, angle,
@@ -25,7 +26,9 @@ namespace SailwindCoop.Sync
     /// </summary>
     public static class ControlUseSync
     {
-        private const byte TypeNone = 0, TypeWheel = 1, TypeWinch = 2, TypePump = 3, TypePusher = 4;
+        // TypeHaul: a winch's rope hauled by hand with the Hand Over Hand mod. A crewmate whose co-op does not know it
+        // resolves nothing and shows free hands.
+        private const byte TypeNone = 0, TypeWheel = 1, TypeWinch = 2, TypePump = 3, TypePusher = 4, TypeHaul = 5;
         private const float RefreshSeconds = 4f;
 
         private struct InUse
@@ -82,7 +85,7 @@ namespace SailwindCoop.Sync
             byte type = TypeNone;
             string boatName = "";
             int index = -1;
-            if (kind != InteractionKind.None && control != null && !Identify(control, out type, out boatName, out index))
+            if (kind != InteractionKind.None && control != null && !Identify(control, kind, out type, out boatName, out index))
                 type = TypeNone;
 
             bool changed = type != _sentType || index != _sentIndex || boatName != _sentBoat;
@@ -166,14 +169,18 @@ namespace SailwindCoop.Sync
 
         // ---- identity -----------------------------------------------------------------------------------
 
-        private static bool Identify(Transform control, out byte type, out string boatName, out int index)
+        private static bool Identify(Transform control, InteractionKind kind, out byte type, out string boatName, out int index)
         {
             type = TypeNone; boatName = ""; index = -1;
             var boat = control.GetComponentInParent<SaveableObject>();
             if (boat == null) return false;
 
             if (control.GetComponent<GPButtonSteeringWheel>() != null) { type = TypeWheel; index = IndexOf<GPButtonSteeringWheel>(boat, control); }
-            else if (control.GetComponent<GPButtonRopeWinch>() != null) { type = TypeWinch; index = IndexOf<GPButtonRopeWinch>(boat, control); }
+            else if (control.GetComponent<GPButtonRopeWinch>() != null)
+            {
+                type = kind == InteractionKind.Haul ? TypeHaul : TypeWinch;
+                index = IndexOf<GPButtonRopeWinch>(boat, control);
+            }
             else if (control.GetComponent<BilgePump>() != null) { type = TypePump; index = IndexOf<BilgePump>(boat, control); }
             else if (control.GetComponent<GPButtonSailPusher>() != null) { type = TypePusher; index = IndexOf<GPButtonSailPusher>(boat, control); }
 
@@ -198,7 +205,8 @@ namespace SailwindCoop.Sync
             switch (type)
             {
                 case TypeWheel: return At(boat.GetComponentsInChildren<GPButtonSteeringWheel>(true), index);
-                case TypeWinch: return At(boat.GetComponentsInChildren<GPButtonRopeWinch>(true), index);
+                case TypeWinch:
+                case TypeHaul: return At(boat.GetComponentsInChildren<GPButtonRopeWinch>(true), index);
                 case TypePump: return At(boat.GetComponentsInChildren<BilgePump>(true), index);
                 case TypePusher: return At(boat.GetComponentsInChildren<GPButtonSailPusher>(true), index);
                 default: return null;
@@ -210,6 +218,9 @@ namespace SailwindCoop.Sync
             return all != null && index < all.Length && all[index] != null ? all[index].transform : null;
         }
 
+        // A Player Model older than the hauling pose has no Haul in its enum; a crewmate hauling then shows cranking.
+        private static readonly bool HaulKnown = System.Enum.IsDefined(typeof(InteractionKind), InteractionKind.Haul);
+
         private static InteractionKind KindFor(byte type)
         {
             switch (type)
@@ -218,6 +229,7 @@ namespace SailwindCoop.Sync
                 case TypeWinch:
                 case TypePump: return InteractionKind.Crank;
                 case TypePusher: return InteractionKind.Push;
+                case TypeHaul: return HaulKnown ? InteractionKind.Haul : InteractionKind.Crank;
                 default: return InteractionKind.None;
             }
         }
@@ -230,6 +242,7 @@ namespace SailwindCoop.Sync
                 case TypeWinch: return "winch";
                 case TypePump: return "pump";
                 case TypePusher: return "sail pusher";
+                case TypeHaul: return "rope hauled from winch";
                 default: return "nothing";
             }
         }

@@ -328,6 +328,10 @@ namespace SailwindCoop.Networking.Packets
             {
                 writer.Write(false);  // no texture
             }
+
+            // (0.41) Paint. Mid-packet, so written and read unconditionally; the version handshake keeps
+            // both ends on the same build.
+            WriteIntArrayOrNull(writer, boat.CustomColors);
         }
 
         /// <summary>
@@ -423,6 +427,9 @@ namespace SailwindCoop.Networking.Packets
                 boat.DirtTexture = reader.ReadBytes(length);
             }
 
+            // (0.41) Paint
+            boat.CustomColors = ReadIntArrayOrNull(reader);
+
             return boat;
         }
 
@@ -494,6 +501,9 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(item.ExtraValue3);
             writer.Write(item.ExtraValue4);
             writer.Write(item.IsNailed);
+            // (0.41) Mid-record, so written and read unconditionally; the version handshake keeps both ends on
+            // the same build.
+            writer.Write(item.FarLod);
 
             // Chart data
             writer.Write(item.HasChartData);
@@ -537,6 +547,7 @@ namespace SailwindCoop.Networking.Packets
             item.ExtraValue3 = reader.ReadSingle();
             item.ExtraValue4 = reader.ReadSingle();
             item.IsNailed = reader.ReadBoolean();
+            item.FarLod = reader.ReadBoolean(); // (0.41)
 
             // Chart data
             item.HasChartData = reader.ReadBoolean();
@@ -1195,6 +1206,34 @@ namespace SailwindCoop.Networking.Packets
                 foreach (var option in packet.PartActiveOptions)
                     writer.Write(option);
             }
+
+            // (0.41) Paint: count (-1 = none), the colors, then the colors-only flag.
+            WriteIntArrayOrNull(writer, packet.CustomColors);
+            writer.Write(packet.ColorsOnly);
+        }
+
+        // (0.41) Boat paint arrays. -1 = null. Paint has five parts; anything far past that is not paint.
+        private const int MaxCustomColors = 64;
+
+        private static void WriteIntArrayOrNull(BinaryWriter writer, int[] values)
+        {
+            writer.Write(values?.Length ?? -1);
+            if (values != null)
+            {
+                foreach (var v in values)
+                    writer.Write(v);
+            }
+        }
+
+        private static int[] ReadIntArrayOrNull(BinaryReader reader)
+        {
+            int count = reader.ReadInt32();
+            if (count < 0) return null;
+            if (count > MaxCustomColors) throw new InvalidDataException($"paint array of {count} entries");
+            var values = new int[count];
+            for (int i = 0; i < count; i++)
+                values[i] = reader.ReadInt32();
+            return values;
         }
 
         public static ShipyardCustomizationPacket ReadShipyardCustomization(BinaryReader reader)
@@ -1233,6 +1272,14 @@ namespace SailwindCoop.Networking.Packets
             packet.PartActiveOptions = new int[partCount];
             for (int i = 0; i < partCount; i++)
                 packet.PartActiveOptions[i] = reader.ReadInt32();
+
+            // (0.41) Paint. Read tolerantly: absent means no paint information.
+            if (reader.BaseStream.Position < reader.BaseStream.Length)
+            {
+                packet.CustomColors = ReadIntArrayOrNull(reader);
+                if (reader.BaseStream.Position < reader.BaseStream.Length)
+                    packet.ColorsOnly = reader.ReadBoolean();
+            }
 
             return packet;
         }
@@ -1791,11 +1838,12 @@ namespace SailwindCoop.Networking.Packets
             writer.Write(packet.Health);
             writer.Write(packet.Amount);
             writer.Write(packet.MissionIndex);
+            writer.Write(packet.FarLod);
         }
 
         public static ItemSpawnedPacket ReadItemSpawned(BinaryReader reader)
         {
-            return new ItemSpawnedPacket
+            var packet = new ItemSpawnedPacket
             {
                 ItemInstanceId = reader.ReadInt32(),
                 PrefabIndex = reader.ReadInt32(),
@@ -1807,6 +1855,9 @@ namespace SailwindCoop.Networking.Packets
                 Amount = reader.ReadSingle(),
                 MissionIndex = reader.ReadInt32()
             };
+            // (0.41) Read tolerantly: absent means an ordinary item.
+            packet.FarLod = reader.BaseStream.Position < reader.BaseStream.Length && reader.ReadBoolean();
+            return packet;
         }
 
         public static void WriteItemDestroyed(BinaryWriter writer, ItemDestroyedPacket packet)
@@ -2032,11 +2083,12 @@ namespace SailwindCoop.Networking.Packets
             WriteVector3(writer, packet.LocalPosition);
             WriteQuaternion(writer, packet.Rotation);
             writer.Write(packet.MissionIndex);
+            writer.Write(packet.FloatingLoot); // (0.41)
         }
 
         public static ItemResyncPacket ReadItemResync(BinaryReader reader)
         {
-            return new ItemResyncPacket
+            var packet = new ItemResyncPacket
             {
                 InstanceId = reader.ReadInt32(),
                 PrefabIndex = reader.ReadInt32(),
@@ -2049,6 +2101,8 @@ namespace SailwindCoop.Networking.Packets
                 Rotation = ReadQuaternion(reader),
                 MissionIndex = reader.ReadInt32()
             };
+            packet.FloatingLoot = reader.BaseStream.Position < reader.BaseStream.Length && reader.ReadBoolean(); // (0.41)
+            return packet;
         }
 
         /// <summary>
@@ -3688,16 +3742,51 @@ namespace SailwindCoop.Networking.Packets
             w.Write(packet.BoatName ?? "");
             w.Write(packet.UVX);
             w.Write(packet.UVY);
+            w.Write(packet.ExtraIndex);
         }
 
         public static CleaningStrokePacket ReadCleaningStroke(BinaryReader r)
         {
-            return new CleaningStrokePacket
+            var packet = new CleaningStrokePacket
             {
                 BoatName = r.ReadString(),
                 UVX = r.ReadSingle(),
                 UVY = r.ReadSingle()
             };
+            // (0.41) Read tolerantly: absent means the main hull.
+            packet.ExtraIndex = r.BaseStream.Position < r.BaseStream.Length ? r.ReadSByte() : (sbyte)-1;
+            return packet;
+        }
+
+        public static void WriteBoatExtraDirt(BinaryWriter w, BoatExtraDirtPacket packet)
+        {
+            w.Write(packet.BoatName ?? "");
+            int count = packet.Indices?.Length ?? 0;
+            w.Write((byte)count);
+            for (int i = 0; i < count; i++)
+            {
+                var png = packet.Textures[i] ?? new byte[0];
+                w.Write(packet.Indices[i]);
+                w.Write(png.Length);
+                w.Write(png);
+            }
+        }
+
+        public static BoatExtraDirtPacket ReadBoatExtraDirt(BinaryReader r)
+        {
+            var packet = new BoatExtraDirtPacket { BoatName = r.ReadString() };
+            int count = r.ReadByte();
+            packet.Indices = new byte[count];
+            packet.Textures = new byte[count][];
+            for (int i = 0; i < count; i++)
+            {
+                packet.Indices[i] = r.ReadByte();
+                int length = r.ReadInt32();
+                if (length < 0 || length > r.BaseStream.Length - r.BaseStream.Position)
+                    throw new InvalidDataException($"BoatExtraDirt texture length {length}");
+                packet.Textures[i] = r.ReadBytes(length);
+            }
+            return packet;
         }
 
         public static void WriteCleanFully(BinaryWriter w, CleanFullyPacket packet)

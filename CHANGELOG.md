@@ -14,6 +14,41 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 > Where a release is marked **"all players must update"**, the network format changed:
 > every crew member must install that version (or newer) or sessions will fail/desync.
 
+## v0.6.1 - 2026-11-24
+
+> Built for Sailwind 0.41, and needs it. **Sailwind Player Model v0.2.1** is included in the zip and
+> installs alongside co-op. None of this release has been played in a live session yet.
+
+### Added
+
+- **Boat paint is shared.** Paint picked at a shipyard shows for the whole crew, and a joining player
+  sees every boat's current paint. Paint, sail and part changes that are not confirmed are undone for
+  the whole crew when the editor leaves the shipyard.
+- **Floating items at sea are the same for the whole crew.** The host's game spawns them for everyone,
+  any crewmate can pick one up and keep it, and one left far behind goes for everyone.
+- **Dirt and cleaning on every boat surface reach the crew.** Sweeping the cabin, the deck or any other
+  surface cleans that surface for everyone, a shipyard cleaning cleans every surface for everyone, and
+  a joining player sees the host's dirt on all of them.
+- New settings in the `[Coop]` section, all on by default: `HostFloatingLoot`, `SharedBoatPaint`,
+  `JoinExtraDirt` and `SaveGuard`. Each one turns off its part of this release if it causes trouble for
+  your crew.
+
+### Fixed
+
+- After one save failed partway through, the game saved nothing more until it was restarted. The
+  failure is now written to `BepInEx/LogOutput.log` and saving carries on.
+- A mooring rope put down near a bollard showed as flying back to the boat on crewmates' screens before
+  it appeared on the bollard.
+- With Towable Boats, a rope put down near a towing cleat could hang loose at the cleat. A rope put
+  down near its own boat's cleat goes back to its hanger, and a crewmate's rope put down near another
+  boat's cleat ties a tow.
+- Clicking Exit while the boat was still moving into the shipyard told the crew you had left.
+- Barrels, bottles and soup pots could float for one crewmate and sink for another after someone drank
+  from or filled them.
+- Unsealing a crate wrote errors to the log on every crewmate's machine.
+- After a co-op load gave up and returned to the title menu, the next load had no sound and no
+  crosshair.
+
 ## v0.6.0 - 2026-11-14
 
 > Built for Sailwind 0.40.1. **Sailwind Player Model v0.2.0** is included in the zip and installs

@@ -302,6 +302,8 @@ namespace SailwindCoop.Sync
                 soup.currentVitamins = state.CurrentVitamins;
                 soup.currentProtein = state.CurrentProtein;
                 soup.currentSalted = state.CurrentSalted;
+                // 0.41: the pot's contents weigh in, and weight decides whether it floats.
+                ItemSyncManager.RefreshItemMass(soup);
 
                 var cookable = soup.GetComponent<CookableFoodSoup>();
                 if (cookable != null)

@@ -22,6 +22,12 @@ namespace SailwindCoop.Networking.Packets
         /// UV texture coordinate Y (0-1).
         /// </summary>
         public float UVY;
+
+        /// <summary>
+        /// (0.41) Which surface was swept: -1 = the main hull, otherwise a position in the boat's
+        /// SaveableObject.extraCleanables.
+        /// </summary>
+        public sbyte ExtraIndex;
     }
 
     /// <summary>
@@ -34,5 +40,20 @@ namespace SailwindCoop.Networking.Packets
         /// Name of the boat that was fully cleaned.
         /// </summary>
         public string BoatName;
+    }
+
+    /// <summary>
+    /// (0.41) Host -> joiner: dirt textures of a boat's extra surfaces (PacketType.BoatExtraDirt).
+    /// </summary>
+    [Serializable]
+    public struct BoatExtraDirtPacket
+    {
+        public string BoatName;
+
+        /// <summary>Positions in the boat's SaveableObject.extraCleanables, one per texture.</summary>
+        public byte[] Indices;
+
+        /// <summary>PNG bytes, parallel to Indices.</summary>
+        public byte[][] Textures;
     }
 }

@@ -71,7 +71,7 @@ Status legend: 🔴 blocker · 🟠 needs live testing · 🟡 known limitation 
 - 🟡 **Everyone must run the same mod build AND the same Sailwind version.** Since v0.2.28
   the host refuses joins from a mismatched mod version with a clear message on both screens
   (older builds still fail silently against each other).
-- 🟡 **Targets Sailwind v0.40.1.** Game updates can break the Harmony hooks; a new game patch
+- 🟡 **Targets Sailwind v0.41.** Game updates can break the Harmony hooks; a new game patch
   may need a mod update.
 - 🟡 **Heavy Harmony patching**: may conflict with other mods that patch the same systems.
 - 🟡 **No dedicated servers.** Co-op is host-authoritative over Steam P2P via friend invites

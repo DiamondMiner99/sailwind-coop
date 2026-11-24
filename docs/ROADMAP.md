@@ -4,12 +4,14 @@ The one place that says where things stand, for Sailwind Co-op and the Sailwind 
 depends on. Update it at every release and whenever an item changes state. If this file and another
 doc disagree, this file wins; the older plan docs keep their design detail but not their status.
 
-Last updated: 2026-11-14.
+Last updated: 2026-11-24.
 
 ## Released
 
 | Mod | Version | Date | What |
 |-----|---------|------|------|
+| Co-op | v0.6.1 | 2026-11-24 | Sailwind 0.41: boat paint, floating items at sea, dirt and cleaning on every boat surface, and ropes auto-tied to a bollard reach the crew; save guard for the lost-saves report; crate unseal and load-timeout fixes. New packet 249, 239 to 248 still undefined. Never played. Bundles Player Model v0.2.1 |
+| Player Model | v0.2.1 | 2026-11-24 | Patterns from pictures in a folder (up to 16), Hand Over Hand haul pose (inactive without that mod), Sailwind 0.41. main and tag `b1d0ef9`, DLL md5 `b8a925c1`. Not played |
 | Co-op | v0.6.0 | 2026-11-14 | Postal Expansion, Sail Damage, MusicMod, Viking Horn, HooksHangMore and FurstMate compat, anchor carry sync, stale carry recovery, frame-rate independent needs, fishing bobber, invites in the Friends screen. Sailwind 0.40.1. Never played. Bundles Player Model v0.2.0 |
 | Player Model | v0.2.0 | 2026-11-14 | Character screen redesign, any color per part, 16 patterns with hover preview, stubble, paper pause menu, linear-space shaders, at-sea body, bed lying, faster body retry. main and tag `612ed27`, DLL md5 `efecc24f`, zip md5 `b45b0c63` 264658 bytes. Screen, colors and patterns checked in game; bed, at-sea, stubble and the menu not played |
 | Co-op | v0.5.0 | 2026-11-04 | Houses, Sailwind 0.39 and 0.40, shared sea, placement bucking, missing items, hooks, belt lanterns, stream-in with full state. Never played. Bundles Player Model v0.1.7 (GitHub zip repacked, only the model DLL changed) |
@@ -27,7 +29,14 @@ Last updated: 2026-11-14.
 Branch `crate-join-resync`: anchors and HooksHangMore `ba4e4ae`, mod compat `601b213`, frame-rate needs fix `7c82944`,
 fishing bobber `f83e22a`, Viking Horn `0c82d64`, Friends screen invites tab `c350c91`, review fixes `d84b002`. Code review
 done 2026-11-14 (always-on code, then each mod compat). Built for Sailwind 0.40.1 against Player Model v0.2.0 (DLL md5
-`efecc24f`), which the zip bundles. Never run in game. Thunderstore and Nexus listings come next, on the user's go.
+`efecc24f`), which the zip bundles. Never run in game.
+
+Listings (user's go 2026-11-15): v0.6.0 and Player Model v0.2.0 are listed as published, with no clash message (the
+user's call; it waits for the next release). Thunderstore packages built from the published release zips, namespace
+`DiamondMiner99`, Player Model a separate package that co-op depends on, BepInExPack `5.4.2305`. Package sources and
+`pack_thunderstore.py` in `packaging/` here and in the Player Model repo; notes in `packaging/PACKAGING.md`. Upload
+files and Nexus BBCode descriptions in `~/Downloads/sailwind-listings/`. Not uploaded yet: the user uploads, Player
+Model first. The Player Model icon is a crop of the co-op icon, a placeholder until there is a sharper screenshot.
 
 - **Review fixes** (`d84b002`). The food-debt refill used scaled time, so the sleep warp gave a sleeper ten times
   vanilla's rate; it now uses unscaled time and matches vanilla at 60 fps with or without the warp. Friends screen tab
@@ -232,6 +241,12 @@ the first grab of a session. The repo has uncommitted work in progress from anot
 ## Open bugs, blocked on logs from a real session
 
 - Fishing: two fish from one catch. Guarded and logged, cause unknown.
+- Lost saves (Amelia, 2026-11-15): twice, the last hour or more of a session was not saved. Vanilla `DoSaveGame` has no
+  try/finally, so one exception leaves `busy` set and every later save does nothing until a restart. A host-side audit
+  of co-op found no path that throws there. Suspects: another mod's `SaveModData` hook, a backup file that could not be
+  moved, or no failure at all (a different host next session). `SaveGuardPatches.cs` (config `Coop.SaveGuard`) logs
+  the exception with its stack, clears `busy` and cleans the save list. Built, deployed and committed 2026-11-15,
+  never run. Waiting on her log and on who hosted.
 - Grab collisions.
 - Guest boat vertical divergence, median 5.7 m. Now has a proven cause and a fix (shared sea, above); needs
   a guest's verbose log to confirm. 0.39 also removed the per-machine float mode that could offset a boat
@@ -243,6 +258,16 @@ the first grab of a session. The repo has uncommitted work in progress from anot
   verified that the capsule stops these rays.
 
 ## Next up, in order
+
+**Player Model: custom clothing and custom patterns (next item, asked 2026-11-14, not started).**
+- Custom clothing as separate expansion mods. Player Model needs a public API that finds installed packs and reads them:
+  new part variants per slot (hat, torso, legs and so on) that the Parts tab lists beside the game's own. Open questions
+  to settle before building: the pack format (an asset bundle of meshes skinned to the Synty rig, plus a manifest),
+  whether new meshes can use the game's palette and masks so colors and patterns work on them, how a look string names a
+  pack part so co-op crewmates without the pack fall back to a stock part, and what a pack author needs (a template Unity
+  project or a guide).
+- Custom patterns, probably first since it is smaller: a pattern from an image file in a folder, tiled the way the
+  built-in ones are placed. Same fallback question for crewmates who lack the image.
 
 Clash check against pander33's SailwindCoop, done 2026-11-04 by reading its source (v0.7.1, MIT). Not run together.
 It is already on Thunderstore as `pander33-SailwindCoop` (692 downloads), GUID `com.sailwind.coop`.
@@ -257,10 +282,10 @@ It is already on Thunderstore as `pander33-SailwindCoop` (692 downloads), GUID `
 Our name and install folder stay SailwindCoop (the user's decision, 2026-11-04). Theirs calls itself "Sailwind LAN Co-op" in
 its plugin name and release titles. Co-op now declares `BepInIncompatibility("com.sailwind.coop")`, so BepInEx skips ours when
 both are present, before either assembly loads; not run in game. The only trace is a line in the BepInEx log, because the
-plugin that would show a message is the one skipped. To do before listing: list Player Model first as a dependency, and have
-it show the on-screen message by reading `Chainloader.DependencyErrors`, since it still loads; say in the install notes that
-the two cannot share a manual install, since nothing can detect a DLL that was overwritten. Whether Sailwind has a Nexus game
-page is unconfirmed.
+plugin that would show a message is the one skipped. Done for the listings: Player Model is a dependency package, and the
+store README says the two cannot be used together or share a manual install. Still to do, next release: have Player Model
+show the on-screen message by reading `Chainloader.DependencyErrors`, since it still loads. pander33's 0.8.0 (on
+Thunderstore 2026-11-15) still uses GUID `com.sailwind.coop`. Whether Sailwind has a Nexus game page is unconfirmed.
 
 The next release is fixes and mod compatibility, with Thunderstore and Nexus listings (decided 2026-11-10). The table games
 are parked on branch `table-games` (commit `5c5b80f`, see Backburner). From a Discord thread, 2026-11-09: a modded crew found

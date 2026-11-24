@@ -22,6 +22,9 @@ namespace SailwindCoop.Sync
         private bool[] _lastMastsEnabled;
         private NetworkSailData[] _lastSails;
         private int[] _lastPartOptions;
+        // (0.41) Last boat paint seen, SaveBoatCustomizationData.customColors. Always a private copy: vanilla
+        // BoatCustomColors.LoadColors keeps the array it is handed and writes into it on later paint clicks.
+        private int[] _lastCustomColors;
         // (v0.2.31) Last Shipyard Expansion sail-extras blob observed for the boat being edited.
         // NULL means "no information" - NOT "the rig is empty". SECompat.GetRigBlob returns null for
         // FOUR distinct reasons: SE is absent, SE's data path is disabled (reflection failed or SE's own
@@ -289,10 +292,9 @@ namespace SailwindCoop.Sync
                 // is still alive) into a session that never asked for it.
                 //
                 // _wasAtShipyard is deliberately NOT cleared here. It also gates OnExitShipyard's rope-cache
-                // invalidate and ResendRopeForCurrentBoat, which run OUTSIDE the SE gate and must stay
-                // byte-for-byte identical without SE. Nulling _shipyardBoat alone is read only inside the
-                // IsInstalled gate, so this is an SE-path-only change: without SE, OnExitShipyard still fires
-                // and still does exactly what it always did.
+                // invalidate and ResendRopeForCurrentBoat. Nulling _shipyardBoat alone is enough: every
+                // per-boat send in OnExitShipyard (the final 43, the 215 and the rope re-seed) reads it, so an
+                // exit carried over from the previous session still fires but sends nothing.
                 if (_wasInSession)
                 {
                     _pendingRigBlobs.Clear();
@@ -414,37 +416,41 @@ namespace SailwindCoop.Sync
             // cover. It also nulls GameState.currentBoat in the same call, which is why we use the boat we
             // memorised rather than BoatUtility.GetCurrentBoat().
             //
-            // Off the hot path (once per shipyard visit) and a hard no-op without SE: IsInstalled is false,
-            // and GetRigBlob would return null on its first statement anyway.
+            // Off the hot path (once per shipyard visit). The SE half is a hard no-op without SE: IsInstalled
+            // is false, and GetRigBlob would return null on its first statement anyway.
             var edited = _shipyardBoat;
             _shipyardBoat = null;
-            if (edited != null && Compat.SECompat.IsInstalled)
+
+            // FINAL VANILLA PACKET (43), for every crew. This used to live inside the SE gate below, so the
+            // SE-absent exit sent nothing. That missed two things. Leaving the shipyard runs vanilla's
+            // CancelOrder, which rolls every unconfirmed preview (paint, sails, parts) back on THIS machine
+            // only, while the previews themselves had already gone to the crew at 5 Hz, so the crew kept an
+            // edit nobody paid for. And PollForChanges is rate limited to 5 Hz while the exit frame runs this
+            // branch instead of polling, so the last poll interval is blind to a vanilla edit. Moving it out
+            // of the gate is a deliberate behavior change for crews without SE.
+            bool vanillaChanged = false;
+            if (edited != null)
             {
-                // ORDER IS LOAD-BEARING - 43 FIRST, 215 SECOND, exactly as in PollForChanges, and this block
-                // mirrors that send guard deliberately rather than inventing a second one.
-                //
-                // The vanilla half is here for a reason, and it is NOT scope creep: PollForChanges is rate
-                // limited to 5 Hz and the exit frame runs THIS branch instead of polling, so the last poll
-                // interval is blind to a VANILLA edit too, not just an SE one. Sending the 215 alone in that
-                // window would be actively worse than the C4 bug it fixes: ApplyRigBlob rebuilds the receiver
-                // from the RECEIVER's OWN vanilla customization, so a blob describing a sail the receiver was
-                // never told about lands on a rig that cannot hold it - and SE does NOT throw on that, it
-                // SILENTLY MISAPPLIES. LoadSailConfig's inner loop is bounded by mast.sails.Count (SE decompile
-                // :501), so entries for sails the receiver lacks are ignored; a sail with no entry logs and
-                // breaks (:504-508); an unknown mast index is skipped (:496-499). Nothing rolls back, nothing
-                // warns, and the receiver's angles/flips/textures end up attached to the WRONG sails. Sending
-                // 43 first is what makes the 215 applicable.
-                //
-                // Everything here is inside the IsInstalled gate, so the SE-ABSENT path is untouched: without
-                // SE this whole block is skipped and the 5 Hz vanilla blind spot behaves exactly as it always
-                // has. This is deliberate - closing that for vanilla too would be a behavior change on a path
-                // that must stay byte-for-byte identical.
                 var customization = edited.GetComponent<SaveableBoatCustomization>();
                 var finalData = customization != null ? customization.GetData() : null;
 
-                bool vanillaChanged = finalData != null && HasCustomizationChanged(finalData);
+                vanillaChanged = finalData != null && HasCustomizationChanged(finalData);
                 if (vanillaChanged) SendCustomizationUpdate(edited, finalData);
+            }
 
+            if (edited != null && Compat.SECompat.IsInstalled)
+            {
+                // ORDER IS LOAD-BEARING - the 43 above goes FIRST, 215 SECOND, exactly as in PollForChanges,
+                // and this block mirrors that send guard deliberately rather than inventing a second one.
+                //
+                // Sending the 215 alone in the blind exit window would be actively worse than the C4 bug it
+                // fixes: ApplyRigBlob rebuilds the receiver from the RECEIVER's OWN vanilla customization, so a
+                // blob describing a sail the receiver was never told about lands on a rig that cannot hold it -
+                // and SE does NOT throw on that, it SILENTLY MISAPPLIES. LoadSailConfig's inner loop is bounded
+                // by mast.sails.Count (SE decompile :501), so entries for sails the receiver lacks are ignored;
+                // a sail with no entry logs and breaks (:504-508); an unknown mast index is skipped
+                // (:496-499). Nothing rolls back, nothing warns, and the receiver's angles/flips/textures end
+                // up attached to the WRONG sails. Sending 43 first is what makes the 215 applicable.
                 string finalBlob = Compat.SECompat.GetRigBlob(edited);
                 bool rigChanged = !string.IsNullOrEmpty(finalBlob) && finalBlob != _lastRigBlob;
 
@@ -469,6 +475,7 @@ namespace SailwindCoop.Sync
             _lastMastsEnabled = null;
             _lastSails = null;
             _lastPartOptions = null;
+            _lastCustomColors = null;
             _lastRigBlob = null;
 
             // Belt-and-braces for the phantom-furled-sails fix: a change landing in the same frame as the
@@ -634,7 +641,48 @@ namespace SailwindCoop.Sync
             }
         }
 
+        /// <summary>Coop.SharedBoatPaint: off = paint is neither sent nor applied, and each machine keeps its own.</summary>
+        internal static bool PaintSyncOn => Plugin.SharedBoatPaintConfig == null || Plugin.SharedBoatPaintConfig.Value;
+
+        /// <summary>
+        /// (0.41) A received paint array in a form vanilla can take, or null to leave the boat's paint alone.
+        /// BoatCustomColors.LoadColors indexes five parts and PrefabsDirectory.sailColors with no bounds checks,
+        /// and keeps the array it is given, so this always returns a fresh copy.
+        /// </summary>
+        internal static int[] SanitizeColors(int[] colors)
+        {
+            if (colors == null || colors.Length < 5) return null;
+            var palette = PrefabsDirectory.instance != null ? PrefabsDirectory.instance.sailColors : null;
+            if (palette == null) return null;
+            var copy = new int[5];
+            for (int i = 0; i < 5; i++)
+            {
+                if (colors[i] != -1 && (colors[i] < 0 || colors[i] >= palette.Length)) return null;
+                copy[i] = colors[i];
+            }
+            return copy;
+        }
+
         private bool HasCustomizationChanged(SaveBoatCustomizationData data)
+        {
+            return HasStructureChanged(data) || HaveColorsChanged(data);
+        }
+
+        // (0.41) Paint only. With paint sync off it never counts as a change, so paint is never sent.
+        private bool HaveColorsChanged(SaveBoatCustomizationData data)
+        {
+            if (!PaintSyncOn) return false;
+            var current = data.customColors;
+            if (current == null || _lastCustomColors == null) return (current == null) != (_lastCustomColors == null);
+            if (current.Length != _lastCustomColors.Length) return true;
+            for (int i = 0; i < current.Length; i++)
+            {
+                if (current[i] != _lastCustomColors[i]) return true;
+            }
+            return false;
+        }
+
+        private bool HasStructureChanged(SaveBoatCustomizationData data)
         {
             // First time - always changed
             if (_lastMastsEnabled == null) return true;
@@ -702,10 +750,14 @@ namespace SailwindCoop.Sync
                     ScaleY = s.scaleY,  // BS1-live
                     ScaleZ = s.scaleZ
                 }).ToArray() ?? new NetworkSailData[0],
-                PartActiveOptions = data.partActiveOptions?.ToArray() ?? new int[0]
+                PartActiveOptions = data.partActiveOptions?.ToArray() ?? new int[0],
+                CustomColors = PaintSyncOn ? (int[])data.customColors?.Clone() : null,
+                // Read before the caller's CacheState, so the cache still holds what was last sent.
+                ColorsOnly = _lastMastsEnabled != null && !HasStructureChanged(data)
             };
 
-            VerboseLogger.ShipyardSend($"boat={packet.BoatName}, masts={packet.MastsEnabled.Count(m => m)}, sails={packet.Sails.Length}, parts={packet.PartActiveOptions.Length}");
+            VerboseLogger.ShipyardSend($"boat={packet.BoatName}, masts={packet.MastsEnabled.Count(m => m)}, sails={packet.Sails.Length}, parts={packet.PartActiveOptions.Length}" +
+                $", paint={(packet.CustomColors != null ? string.Join(",", packet.CustomColors) : "none")}{(packet.ColorsOnly ? " (paint only)" : "")}");
 
             Plugin.NetworkManager.SendToAllReliable(PacketType.ShipyardCustomization, writer =>
             {
@@ -1201,6 +1253,7 @@ namespace SailwindCoop.Sync
                 ScaleZ = s.scaleZ
             }).ToArray() ?? new NetworkSailData[0];
             _lastPartOptions = data.partActiveOptions?.ToArray() ?? new int[0];
+            _lastCustomColors = (int[])data.customColors?.Clone();
         }
 
         /// <summary>
@@ -1230,8 +1283,10 @@ namespace SailwindCoop.Sync
 
             // Update our cache so we don't immediately re-send.
             //
-            // (F8) ALL FOUR cached fields are guarded on "the packet targets the boat WE are standing on".
-            // They describe that boat and nothing else, so folding a packet for a DIFFERENT boat into them
+            // (F8) EVERY cached field (masts, sails, parts, rig blob, and since 0.41 the paint) is guarded on
+            // "the packet targets the boat WE are standing on". A paint-only packet updates the paint cache and
+            // returns before the structure caches, because it rebuilt nothing. The caches describe that boat and
+            // nothing else, so folding a packet for a DIFFERENT boat into them
             // is not a stale-cache nuisance, it is an echo storm: peer A editing boat X at shipyard 1 would
             // have its cache overwritten with peer B's boat Y (shipyard 2), so A's next poll reads
             // vanillaChanged for X, re-broadcasts 43(X) AND (because the send guard forces a blob read on any
@@ -1240,6 +1295,12 @@ namespace SailwindCoop.Sync
             var localBoat = GameState.currentShipyard != null ? BoatUtility.GetCurrentBoat() : null;
             if (localBoat != null && localBoat.gameObject.name == packet.BoatName)
             {
+                // (0.41) Paint, as applied. A packet without usable paint left ours alone, so the cache stays.
+                var appliedColors = PaintSyncOn ? SanitizeColors(packet.CustomColors) : null;
+                if (appliedColors != null) _lastCustomColors = appliedColors;
+                // A paint-only packet rebuilt nothing, so the structure caches still describe this boat.
+                if (packet.ColorsOnly) return;
+
                 _lastMastsEnabled = (bool[])packet.MastsEnabled?.Clone() ?? new bool[48];
                 _lastSails = (NetworkSailData[])packet.Sails?.Clone() ?? new NetworkSailData[0];
                 _lastPartOptions = (int[])packet.PartActiveOptions?.Clone() ?? new int[0];
@@ -1271,6 +1332,29 @@ namespace SailwindCoop.Sync
                 return;
             }
 
+            // (0.41) Paint. Null leaves this boat's paint as it is (vanilla LoadData skips a null array).
+            var colors = PaintSyncOn ? SanitizeColors(packet.CustomColors) : null;
+            if (packet.CustomColors != null && PaintSyncOn && colors == null)
+                Plugin.Log.LogWarning($"ShipyardSync: ignoring paint for {boat.gameObject.name} that this machine cannot show ({string.Join(",", packet.CustomColors)})");
+
+            // Only the paint changed: repaint, and skip the LoadData that would rebuild every sail and rope.
+            if (packet.ColorsOnly)
+            {
+                if (colors == null) return;
+                var paint = customization.GetComponent<BoatCustomColors>();
+                if (paint == null) return;
+                try
+                {
+                    paint.LoadColors(colors);
+                    VerboseLogger.ShipyardApply($"boat={boat.gameObject.name}, applied paint {string.Join(",", colors)}");
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"ShipyardSync: could not apply paint to {boat.gameObject.name}: {e.Message}");
+                }
+                return;
+            }
+
             // Build SaveBoatCustomizationData from packet
             var saveData = new SaveBoatCustomizationData
             {
@@ -1287,7 +1371,8 @@ namespace SailwindCoop.Sync
                     scaleY = s.ScaleY,  // BS1-live: apply the resized sail scale (Mast.LoadSail gates on scaleY!=0)
                     scaleZ = s.ScaleZ
                 }).ToList() ?? new System.Collections.Generic.List<SaveSailData>(),
-                partActiveOptions = packet.PartActiveOptions?.ToList() ?? new System.Collections.Generic.List<int>()
+                partActiveOptions = packet.PartActiveOptions?.ToList() ?? new System.Collections.Generic.List<int>(),
+                customColors = colors
             };
 
             // (v0.3.1) SNAPSHOT THE TRIM BEFORE LoadData, AND PUT IT BACK AFTER.
@@ -1431,6 +1516,7 @@ namespace SailwindCoop.Sync
             _lastMastsEnabled = null;
             _lastSails = null;
             _lastPartOptions = null;
+            _lastCustomColors = null;
             _lastRigBlob = null;
             _rigPollCounter = 0;
             _wasAtShipyard = false;
@@ -1481,15 +1567,20 @@ namespace SailwindCoop.Sync
         }
 
         [HarmonyPostfix]
-        public static void Postfix(GameObject __state)
+        public static void Postfix(Shipyard __instance, GameObject __state)
         {
             if (!Plugin.IsMultiplayer) return; // solo shipyard use stays 100% vanilla (no velocity zeroing)
             if (__state == null) return;
 
-            // Vanilla MoveShip(instantMove: true) runs synchronously to completion inside DischargeShip
-            // (t starts at 1, the lerp loop never yields), so by this postfix the boat has already been
-            // teleported to shipReleasePosition and physics re-enabled. Zero the velocities NOW so the
-            // water/dock depenetration on the editing machine cannot register a >1.5 m/s BoatDamage.Impact.
+            // Since 0.41 DischargeShip does nothing while the admit lift into the cradle is still running
+            // (about 2 s), and the Exit button is live during it. The boat is still on the cradle then, and the
+            // still-set current ship is how to tell: a real discharge clears it.
+            if (__instance.GetCurrentBoat() != null) return;
+
+            // When the discharge does run, vanilla MoveShip(instantMove: true) still runs synchronously to
+            // completion inside it (t starts at 1, the lerp loop never yields), so by this postfix the boat has
+            // already been teleported to shipReleasePosition and physics re-enabled. Zero the velocities NOW so
+            // the water/dock depenetration on the editing machine cannot register a >1.5 m/s BoatDamage.Impact.
             var rb = __state.GetComponent<Rigidbody>();
             if (rb != null && !rb.isKinematic)
             {

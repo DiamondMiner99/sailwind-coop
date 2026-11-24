@@ -962,7 +962,9 @@ namespace SailwindCoop.Sync
                     scaleY = s.ScaleY,  // BS1: restore custom sail scale (Mast.LoadSail calls LoadScale when scaleY!=0)
                     scaleZ = s.ScaleZ
                 }).ToList(),
-                partActiveOptions = partOptions
+                partActiveOptions = partOptions,
+                // (0.41) The host's paint. Null (paint sync off, or nothing valid sent) keeps this machine's own.
+                customColors = ShipyardSyncManager.PaintSyncOn ? ShipyardSyncManager.SanitizeColors(data.CustomColors) : null
             };
 
             customization.LoadData(saveData);
@@ -1368,6 +1370,7 @@ namespace SailwindCoop.Sync
             // Instantiate at correct position, not Vector3.zero:
             // Items at (0,0,0) are underwater and ItemRigidbody.FixedUpdate destroys them before Load() runs
             var instance = Object.Instantiate(prefab, worldPos, item.Rotation);
+            if (item.FarLod) Patches.RandomFloatingItemSpawnerPatch.RememberRemote(instance); // (0.41) floating item
             var saveable = instance.GetComponent<SaveablePrefab>();
 
             if (saveable != null)
@@ -1504,6 +1507,7 @@ namespace SailwindCoop.Sync
             }
 
             var instance = Object.Instantiate(prefab, worldPos, item.Rotation);
+            if (item.FarLod) Patches.RandomFloatingItemSpawnerPatch.RememberRemote(instance); // (0.41) floating item
             var saveable = instance.GetComponent<SaveablePrefab>();
 
             if (saveable != null)

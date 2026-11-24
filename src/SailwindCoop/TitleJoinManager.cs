@@ -9,7 +9,8 @@ namespace SailwindCoop
     /// <summary>
     /// Lets a guest accept a co-op invite from the TITLE MENU. Sailwind uses a SINGLE world scene, so
     /// "loading a save" just deserializes data into the already-live scene - no region scene to pick. We
-    /// auto-load a save, satisfy the vanilla "press F to continue" disclaimer gate, then join the lobby.
+    /// auto-load a save, wait out the vanilla load sequence (before 0.41 that included satisfying the "press F
+    /// to continue" disclaimer gate), then join the lobby.
     /// Doing the load BEFORE joining means the proven in-game join flow (host sends boat world state ->
     /// guest is teleported to the host's boat) runs against a fully-loaded guest instead of racing one
     /// that's still at the title. The existing join already teleports across regions in one coordinate
@@ -93,9 +94,15 @@ namespace SailwindCoop
                 // Guard the deserialize: a single corrupt saveable in the guest's phantom must not abort the
                 // whole load (that left GameState.playing false -> our wait below timed out -> never joined).
                 SuppressLoadErrors = true;
+                // Since 0.41 the game's load sequence mutes the listener and hides the crosshair until it
+                // finishes, and the next load takes whatever it finds as the values to fade back to. A load
+                // abandoned below has to put both back.
+                float preLoadVolume = AudioListener.volume;
+                Color? preLoadCrosshair = Refs.mouseCrosshairMaterial != null ? Refs.mouseCrosshairMaterial.color : (Color?)null;
                 Traverse.Create(sm).Method("LoadGame", new object[] { 0 }).GetValue();
 
-                // LoadGameAnimation sets GameState.playing=true just before parking on the F-gate.
+                // LoadGameAnimation sets GameState.playing=true a frame before it lowers animsPlaying (before
+                // 0.41 it parked on the "press F" gate in between).
                 t0 = Time.realtimeSinceStartup;
                 while (!GameState.playing && Time.realtimeSinceStartup - t0 < 45f) yield return null;
                 if (!GameState.playing)
@@ -112,6 +119,13 @@ namespace SailwindCoop
                         Traverse.Create(sm).Method("EnableStartMenu").GetValue();
                     }
                     catch (System.Exception e) { Plugin.Log.LogWarning("[TitleJoin] could not restore the title menu: " + e.Message); }
+                    try
+                    {
+                        AudioListener.volume = preLoadVolume;
+                        if (preLoadCrosshair.HasValue && Refs.mouseCrosshairMaterial != null)
+                            Refs.mouseCrosshairMaterial.color = preLoadCrosshair.Value;
+                    }
+                    catch (System.Exception e) { Plugin.Log.LogWarning("[TitleJoin] could not restore the sound and crosshair: " + e.Message); }
                     // Drop the phantom context too, or the next thing this player saves goes to slot 99.
                     try { CoopSave.ClearContext(); } catch { }
 
@@ -125,7 +139,7 @@ namespace SailwindCoop
                 }
 
                 // (v0.3.0) The world is now on screen, and the join does not reach JoinLobby for another
-                // couple of seconds: the F-gate spin below, then a deliberate 1.5s settle. Raising the join
+                // couple of seconds: the animsPlaying wait below, then a deliberate 1.5s settle. Raising the join
                 // screen only at JoinLobby therefore left the player looking at their own freshly loaded
                 // world for that whole stretch before anything acknowledged the join, which is exactly the
                 // "I still saw my world load first" report. Begin is idempotent, so JoinLobby's own call
@@ -167,11 +181,12 @@ namespace SailwindCoop
                 // (Esc toggles it away). Vanilla LoadGameAnimation already hides 'logo', but never the startUI.
                 // Hide it the same way vanilla ultimately does, but with a DIRECT SetActive(false) (not
                 // FadeStartMenu, which increments/decrements animsPlaying and could unbalance that counter
-                // while our F-gate loop below is still spinning on animsPlaying).
+                // while our wait loop below is still spinning on animsPlaying).
                 HideStartUI(sm);
 
-                // Auto-satisfy the "press F to continue" disclaimer (the load coroutine spins on private
-                // fPressed). Keep setting it until the coroutine consumes it and animsPlaying drops to 0.
+                // Wait for the load coroutine to drop animsPlaying to 0. Before 0.41 it first spun on the
+                // "press F to continue" disclaimer (private fPressed), so this kept setting that field. 0.41
+                // removed the wait and nothing reads the field anymore, so setting it is now harmless.
                 t0 = Time.realtimeSinceStartup;
                 while (Anims(sm) > 0 && Time.realtimeSinceStartup - t0 < 20f)
                 {
@@ -231,7 +246,7 @@ namespace SailwindCoop
                 Plugin.Log.LogInfo($"[TitleJoin] neutralized {neutralized} SET anchor(s) loaded from the phantom save (stranded-anchor guard; host state re-applies on join)");
         }
 
-        // Non-throwing: if the reflected field can't be read, return 0 ("no anims") so the F-gate loop
+        // Non-throwing: if the reflected field can't be read, return 0 ("no anims") so the wait loop
         // EXITS and the coroutine still reaches JoinLobby. An unguarded throw here previously killed the
         // whole title-join coroutine before it could connect (guest loaded their own world, never joined).
         private static int Anims(StartMenu sm)

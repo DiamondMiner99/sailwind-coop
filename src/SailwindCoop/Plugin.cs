@@ -50,7 +50,7 @@ namespace SailwindCoop
         // invalid") and skip it entirely. The "alpha" status lives as prose in the README/INSTALL only.
         // Must be a valid System.Version (BepInPlugin parses it) - no "-dev"/suffix or the plugin fails to
         // load.
-        public const string PluginVersion = "0.6.0";
+        public const string PluginVersion = "0.6.1";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -74,16 +74,21 @@ namespace SailwindCoop
         // older game builds floated free items (ToggleCollider did `floater.enabled = state`); v0.38
         // regressed that to a hard-coded disable every fixed frame, so dropped items/crates sink even
         // in singleplayer despite their authored floaterHeight. Read by ItemBuoyancyPatches; default
-        // TRUE = restore the pre-0.38 floating players expect (set false for current-build sinking).
+        // TRUE = restore the pre-0.38 floating players expect. Sailwind 0.41 floats items by weight on its
+        // own, and the patch does nothing there.
         public static ConfigEntry<bool> RestoreItemBuoyancyConfig { get; private set; }
         // (v0.3.0) Kill switch for the guest hull-physics derivation - see the Config.Bind call for why a
         // feature that cannot be tested solo needs one. Read by DamagePatches every frame, so it is live.
         public static ConfigEntry<bool> GuestHullPhysicsConfig { get; private set; }
         public static ConfigEntry<bool> SharedSeaConfig { get; private set; }
         public static ConfigEntry<bool> JoinCacheGuardConfig { get; private set; }
+        public static ConfigEntry<bool> SaveGuardConfig { get; private set; }
         public static ConfigEntry<bool> HostItemsOnStreamInConfig { get; private set; }
         public static ConfigEntry<bool> RemoteHeldMassConfig { get; private set; }
         public static ConfigEntry<bool> BeltLanternLightConfig { get; private set; }
+        public static ConfigEntry<bool> HostFloatingLootConfig { get; private set; }
+        public static ConfigEntry<bool> SharedBoatPaintConfig { get; private set; }
+        public static ConfigEntry<bool> JoinExtraDirtConfig { get; private set; }
 
         // How a body stands, crouches and leans, and what it looks like, now live in the Sailwind Player
         // Model mod (BodyTuning / HeldToolPose / PlayerModel.LocalAppearance) - its own config file, its own
@@ -244,10 +249,11 @@ namespace SailwindCoop
             Log = Logger;
 
             Log.LogInfo($"{PluginName} v{PluginVersion} loading...");
-            // This build reads GameState.currentHouse, which Sailwind 0.39 added. On an older game the sleep
-            // code fails the first time it runs, with nothing to say why, so say it here.
-            if (typeof(GameState).GetField("currentHouse") == null)
-                Log.LogError($"{PluginName} v{PluginVersion} needs Sailwind 0.39 or newer; this game reports {Application.version}. Crew sleep will not work until the game is updated.");
+            // This build patches and reads members Sailwind 0.41 added (RandomFloatingItemSpawner, boat paint,
+            // extra dirt textures). On an older game patching stops partway and later code fails with nothing
+            // to say why, so say it here. ShipItem.buoyancy is new in 0.41.
+            if (typeof(ShipItem).GetField("buoyancy") == null)
+                Log.LogError($"{PluginName} v{PluginVersion} needs Sailwind 0.41 or newer; this game reports {Application.version}. Co-op will not work properly until the game is updated.");
 
             // (v0.2.32) Mod-compat soft-detect: every module must init in Awake so the composed
             // lobby-data / handshake token (CompatRegistry.ModSignature) is ready before any lobby
@@ -331,11 +337,13 @@ namespace SailwindCoop
             // default because it restores the floating players expect; the postfix re-enables the
             // floater for loose items only (not held, not resting on a boat, not stowed, not already
             // deep underwater). Purely local: no wire change, each machine floats or sinks its own items.
+            // Sailwind 0.41 floats items again by itself (by weight), so the patch stands down there; the
+            // key stays so existing config files keep loading.
             RestoreItemBuoyancyConfig = Config.Bind(
                 "Coop",
                 "RestoreItemBuoyancy",
                 true,
-                "Re-enable floating for dropped items. Older Sailwind builds floated free items; the current v0.38 build regressed this to a hard-coded floater disable every physics frame, so dropped items/crates sink even in singleplayer. Default on = restore the pre-0.38 floating everyone expects. Applies to THIS machine only; other crew members see their own local physics either way. Set false for exact current-build (sinking) behavior.");
+                "Re-enable floating for dropped items on Sailwind 0.38 to 0.40, which turned item floating off every physics frame. Sailwind 0.41 floats and sinks items by their weight on its own, so this setting does nothing there. Applies to THIS machine only.");
             Log.LogInfo($"RestoreItemBuoyancy: {RestoreItemBuoyancyConfig.Value}");
 
             // (v0.3.0) Kill switch for the guest hull-physics derivation. This exists because the feature
@@ -373,6 +381,14 @@ namespace SailwindCoop
                 "While joining, keep the game from packing away a boat's items because the boat still counts as " +
                 "out of range. Default on. Without it, a joiner whose own save left the boat more than 1 km from " +
                 "the crew can lose everything on board. Turn it off only if items duplicate when joining.");
+            SaveGuardConfig = Config.Bind(
+                "Coop",
+                "SaveGuard",
+                true,
+                "Keep saving working after a save fails partway. Default on. In the base game one failed save " +
+                "blocks every later save until you restart, with no message. With this on, the failure is written " +
+                "to the log, saving resumes on the next autosave or bed, and items that would make a save fail are " +
+                "cleaned off the save list first. Failures are logged either way.");
             HostItemsOnStreamInConfig = Config.Bind(
                 "Coop",
                 "HostItemsOnStreamIn",
@@ -393,6 +409,28 @@ namespace SailwindCoop
                 true,
                 "Show the light of a burning lantern on a crewmate's belt. Default on. Turn it off if it costs " +
                 "too much frame rate with a large crew.");
+            HostFloatingLootConfig = Config.Bind(
+                "Coop",
+                "HostFloatingLoot",
+                true,
+                "Let the host spawn the items found floating at sea for the whole crew. Default on. Without it " +
+                "every machine spawns its own, so crewmates see different items and a crewmate cannot keep one " +
+                "they fish out. The whole crew should use the same setting. Turn it off only if floating items " +
+                "misbehave for your crew.");
+            SharedBoatPaintConfig = Config.Bind(
+                "Coop",
+                "SharedBoatPaint",
+                true,
+                "Share boat paint with the crew: paint picked at a shipyard, and the paint every boat has when " +
+                "someone joins. Default on. Turn it off only if boats change color unexpectedly for your crew; " +
+                "each machine then shows the paint from its own save.");
+            JoinExtraDirtConfig = Config.Bind(
+                "Coop",
+                "JoinExtraDirt",
+                true,
+                "When someone joins, send them the dirt on every boat surface besides the main hull. Default on. " +
+                "Turn it off if joining fails on a crew with many boats; joiners then keep the dirt from their " +
+                "own save on those surfaces.");
             // The body's pose, held-tool and appearance config live in the Sailwind Player Model mod.
             RemoveRetiredSettings();
 
@@ -2714,6 +2752,13 @@ namespace SailwindCoop
                 var packet = PacketSerializer.ReadCleanFully(reader);
                 CleaningSyncManager?.OnRemoteCleanFully(packet, sender);
             });
+
+            // (0.41) Join: dirt on boat surfaces besides the main hull.
+            NetworkManager.RegisterHandler(PacketType.BoatExtraDirt, (sender, reader) =>
+            {
+                var packet = PacketSerializer.ReadBoatExtraDirt(reader);
+                CleaningSyncManager?.OnRemoteBoatExtraDirt(packet);
+            });
         }
 
         private void LateUpdate()
@@ -3267,6 +3312,9 @@ namespace SailwindCoop
             // customization rebuild and before the frame-wait that precedes the rope re-key. Hard no-op when
             // SE is not installed, so a vanilla crew sends nothing at all.
             RunJoinStep("SERigState", () => ShipyardSyncManager?.SendAllRigBlobsTo(friend.Id));
+            // (0.41) Dirt on boat surfaces besides the main hull, one packet per boat. The guest parks it
+            // until its join apply is over. Off with Coop.JoinExtraDirt.
+            RunJoinStep("BoatExtraDirt", () => CleaningSyncManager?.SendExtraDirtTo(friend.Id));
             // (v0.2.32) Authoritative door/hatch/gunport states: the guest's phantom load may have
             // restored ITS OWN door states (NAND Tweaks toggleDoors); the host's reliable sends win.
             RunJoinStep("TrapdoorStates", () => TrapdoorSyncManager?.SendAllStatesTo(friend.Id));

@@ -37,8 +37,22 @@ namespace SailwindCoop.Patches
                     return;
                 }
 
+                // (0.41) Boats have more sweepable surfaces than the main hull, each with its own texture and
+                // UVs. Name the surface by its position in extraCleanables, the order vanilla's save uses.
+                sbyte surface = -1;
+                if (paintedObject != boat.GetCleanable())
+                {
+                    int index = boat.extraCleanables != null ? System.Array.IndexOf(boat.extraCleanables, paintedObject) : -1;
+                    if (index < 0 || index > sbyte.MaxValue)
+                    {
+                        VerboseLogger.CleaningEvent($"PaintObject postfix: {paintedObject.name} is not a known surface of {boat.gameObject.name}; not sent");
+                        return;
+                    }
+                    surface = (sbyte)index;
+                }
+
                 // Send the cleaning stroke
-                CleaningSyncManager.Instance?.OnLocalCleaningStroke(boat.gameObject.name, offset);
+                CleaningSyncManager.Instance?.OnLocalCleaningStroke(boat.gameObject.name, offset, surface);
             }
         }
 
@@ -67,6 +81,10 @@ namespace SailwindCoop.Patches
                     VerboseLogger.CleaningEvent("CleanFully postfix: no boat found for CleanableObject");
                     return;
                 }
+
+                // (0.41) A shipyard clean cleans the main hull and then every extra surface, one call each. Send
+                // once, for the main hull; the receiver cleans the extras itself.
+                if (__instance != boat.GetCleanable()) return;
 
                 // Send the full clean event
                 CleaningSyncManager.Instance?.OnLocalCleanFully(boat.gameObject.name);

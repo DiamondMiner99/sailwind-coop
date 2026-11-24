@@ -368,5 +368,13 @@ namespace SailwindCoop.Networking.Packets
 
         // FurstMate's pets: host world, poses and events -> all; a guest's requests -> host. See FurstMateCompat.
         FurstMate = 238,
+
+        // 239 and 240 are reserved for planned packets. 241 to 248 must stay undefined: another mod takes the
+        // first free id in that range for its own packet.
+
+        // (0.41) Dirt on a boat's surfaces besides the main hull, which the join snapshot does not carry. Body:
+        // boatName (string), count (byte), then per surface: index into SaveableObject.extraCleanables (byte),
+        // PNG length (int), PNG bytes. A boat may take more than one packet.
+        BoatExtraDirt = 249,             // Host -> joiner
     }
 }
